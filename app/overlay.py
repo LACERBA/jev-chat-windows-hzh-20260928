@@ -393,7 +393,7 @@ class Overlay:
         self.autoKeyBox = ComboBox()
         self.autoKeyBox.addItems(["Enter 发送", "Ctrl+Enter 发送"])
         self.autoKeyBox.setAccessibleName("自动回复发送快捷键")
-        self.autoKeyBox.setToolTip("必须和微信中的发送快捷键设置一致；推荐概率低于 50% 时不会自动发送")
+        self.autoKeyBox.setToolTip("必须和微信中的发送快捷键设置一致；选出最佳回复后会自动发送")
         self.autoKeyBox.currentIndexChanged.connect(self._auto_key_changed)
         auto_row.addWidget(self.autoKeyBox, 1)
         self.autoReplySwitch = SwitchButton()

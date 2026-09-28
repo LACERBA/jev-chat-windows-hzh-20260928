@@ -146,13 +146,13 @@ def main() -> int:
     def demo_auto_reply_config(title):
         value = demo_settings["auto_reply_chats"].get(title, {})
         return {"enabled": bool(value.get("enabled", False)),
-                "send_key": value.get("send_key", "enter"), "min_score": 0.5,
+                "send_key": value.get("send_key", "enter"),
                 "confirmed": bool(value.get("confirmed", False))}
 
     def set_demo_auto_reply(title, enabled, send_key="enter", *, confirmed=None):
         current = demo_auto_reply_config(title)
         demo_settings["auto_reply_chats"][title] = {
-            "enabled": bool(enabled), "send_key": send_key, "min_score": 0.5,
+            "enabled": bool(enabled), "send_key": send_key,
             "confirmed": current["confirmed"] if confirmed is None else bool(confirmed),
         }
 

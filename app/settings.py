@@ -11,7 +11,6 @@ import ctypes
 import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
-from math import isfinite
 
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
 
@@ -23,7 +22,6 @@ _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
 _AUTO_REPLY_SEND_KEYS = ("enter", "ctrl_enter")
-_DEFAULT_AUTO_REPLY_SCORE = 0.5
 
 
 def _read(name: str, default=None):
@@ -102,14 +100,8 @@ def auto_reply_config(title: str) -> dict:
     send_key = value.get("send_key")
     if send_key not in _AUTO_REPLY_SEND_KEYS:
         send_key = "enter"
-    try:
-        min_score = float(value.get("min_score", _DEFAULT_AUTO_REPLY_SCORE))
-    except (TypeError, ValueError):
-        min_score = _DEFAULT_AUTO_REPLY_SCORE
-    if not isfinite(min_score):
-        min_score = _DEFAULT_AUTO_REPLY_SCORE
     return {"enabled": bool(value.get("enabled", False)), "send_key": send_key,
-            "min_score": max(0.0, min(1.0, min_score)), "confirmed": bool(value.get("confirmed", False))}
+            "confirmed": bool(value.get("confirmed", False))}
 
 def auto_reply_enabled(title: str) -> bool:
     return auto_reply_config(title)["enabled"]
@@ -125,7 +117,6 @@ def set_auto_reply(title: str, enabled: bool, send_key: str = "enter", *, confir
     configs[title] = {
         "enabled": bool(enabled),
         "send_key": send_key if send_key in _AUTO_REPLY_SEND_KEYS else "enter",
-        "min_score": current["min_score"],
         "confirmed": current["confirmed"] if confirmed is None else bool(confirmed),
     }
     save(auto_reply_chats_value=configs)

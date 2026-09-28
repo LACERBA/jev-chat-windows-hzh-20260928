@@ -87,23 +87,17 @@ def auto_send_reply(title, result, revision):
         return False
     candidates = result.get("candidates") or []
     best = result.get("best_index")
-    choice = ((result.get("answers") or {}).get("best_reply") or {}).get("choice")
-    expected = {"reply_a": 0, "reply_b": 1, "reply_c": 2}.get(choice)
-    if not isinstance(best, int) or best not in range(len(candidates)) or expected != best:
+    if not isinstance(best, int) or best not in range(len(candidates)):
         if title == ov.current_chat():
-            ov.set_status("自动回复已跳过：本次没有得到可靠的最佳回复排序", "warning")
+            ov.set_status("自动回复已跳过：本次没有选出最佳回复", "warning")
         return False
     scores = result.get("scores") or []
     try:
         score = float(scores[best])
     except (IndexError, TypeError, ValueError):
-        score = 0.0
-    if not isfinite(score) or not 0 <= score <= 1:
-        score = 0.0
-    if score < config["min_score"]:
-        if title == ov.current_chat():
-            ov.set_status(f"自动回复已跳过：推荐概率 {score:.0%} 低于 {config['min_score']:.0%}", "warning")
-        return False
+        score = None
+    if score is not None and (not isfinite(score) or not 0 <= score <= 1):
+        score = None
     text = reply_text(title, str(candidates[best]).strip())
     if not text:
         return False
@@ -119,7 +113,8 @@ def auto_send_reply(title, result, revision):
     chat["last_auto_sent_text"] = text
     if title == ov.current_chat():
         ov.invalidate_replies()
-        ov.set_status(f"已自动发送最佳回复（{score:.0%}）", "success")
+        suffix = f"（{score:.0%}）" if score is not None else ""
+        ov.set_status(f"已自动发送最佳回复{suffix}", "success")
     return True
 
 
