@@ -87,11 +87,12 @@ def run(q, hwnd, enabled, debug_on):
                         if name != title:
                             title = name
                             q.put(("chat", title))
+                    initial = title not in readers
                     reader = readers.setdefault(title, Reader())
                     lines = reader.read(full[y0:y1, x0:x1], bg)
                     new = reader.new_lines(lines)
                     if new:
-                        q.put(("lines", title, new, rect))
+                        q.put(("lines", title, new, rect, initial))
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines)))
         except Exception:

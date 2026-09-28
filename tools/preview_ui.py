@@ -118,7 +118,8 @@ def main() -> int:
                      "draft_provider": "deepseek", "draft_model": "deepseek-flash",
                      "draft_base_url": "", "reply_target": True,
                      "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
-                     "check_update": True, "debug_view": args.state == "debug"}
+                     "check_update": True, "debug_view": args.state == "debug",
+                     "auto_reply_chats": {}}
 
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
@@ -141,6 +142,19 @@ def main() -> int:
                             ("check_update", check_update_on), ("debug_view", debug_view_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
+
+    def demo_auto_reply_config(title):
+        value = demo_settings["auto_reply_chats"].get(title, {})
+        return {"enabled": bool(value.get("enabled", False)),
+                "send_key": value.get("send_key", "enter"), "min_score": 0.5,
+                "confirmed": bool(value.get("confirmed", False))}
+
+    def set_demo_auto_reply(title, enabled, send_key="enter", *, confirmed=None):
+        current = demo_auto_reply_config(title)
+        demo_settings["auto_reply_chats"][title] = {
+            "enabled": bool(enabled), "send_key": send_key, "min_score": 0.5,
+            "confirmed": current["confirmed"] if confirmed is None else bool(confirmed),
+        }
 
     def fake_jev_models(provider, key, timeout=10):
         """演示不联网：给一小撮假模型，让「获取模型」按钮在本地也走得通。"""
@@ -173,6 +187,9 @@ def main() -> int:
         thinking=lambda: demo_settings["thinking"],
         check_update=lambda: demo_settings["check_update"],
         debug_view=lambda: demo_settings["debug_view"],
+        auto_reply_config=demo_auto_reply_config,
+        auto_reply_enabled=lambda title: demo_auto_reply_config(title)["enabled"],
+        set_auto_reply=set_demo_auto_reply,
         save=save_demo_settings,
     ):
         from PySide6.QtCore import QTimer

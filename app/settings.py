@@ -11,6 +11,7 @@ import ctypes
 import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
+from math import isfinite
 
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
 
@@ -21,6 +22,8 @@ _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
+_AUTO_REPLY_SEND_KEYS = ("enter", "ctrl_enter")
+_DEFAULT_AUTO_REPLY_SCORE = 0.5
 
 
 def _read(name: str, default=None):
@@ -88,6 +91,45 @@ def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))
 
+def auto_reply_config(title: str) -> dict:
+    """按 OCR 会话名读取自动回复配置；脏数据一律回到关闭状态。"""
+    configs = _read("auto_reply_chats", {})
+    value = configs.get(title.strip()) if isinstance(configs, dict) and title.strip() else None
+    if value is True:
+        value = {"enabled": True}
+    if not isinstance(value, dict):
+        value = {}
+    send_key = value.get("send_key")
+    if send_key not in _AUTO_REPLY_SEND_KEYS:
+        send_key = "enter"
+    try:
+        min_score = float(value.get("min_score", _DEFAULT_AUTO_REPLY_SCORE))
+    except (TypeError, ValueError):
+        min_score = _DEFAULT_AUTO_REPLY_SCORE
+    if not isfinite(min_score):
+        min_score = _DEFAULT_AUTO_REPLY_SCORE
+    return {"enabled": bool(value.get("enabled", False)), "send_key": send_key,
+            "min_score": max(0.0, min(1.0, min_score)), "confirmed": bool(value.get("confirmed", False))}
+
+def auto_reply_enabled(title: str) -> bool:
+    return auto_reply_config(title)["enabled"]
+
+def set_auto_reply(title: str, enabled: bool, send_key: str = "enter", *, confirmed: bool | None = None) -> None:
+    """只更新一个会话的自动回复配置，其他设置和会话保持不变。"""
+    title = title.strip()
+    if not title:
+        return
+    configs = _read("auto_reply_chats", {})
+    configs = dict(configs) if isinstance(configs, dict) else {}
+    current = auto_reply_config(title)
+    configs[title] = {
+        "enabled": bool(enabled),
+        "send_key": send_key if send_key in _AUTO_REPLY_SEND_KEYS else "enter",
+        "min_score": current["min_score"],
+        "confirmed": current["confirmed"] if confirmed is None else bool(confirmed),
+    }
+    save(auto_reply_chats_value=configs)
+
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
@@ -153,7 +195,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
-         check_update_on: bool | None = None, debug_view_on: bool | None = None) -> None:
+         check_update_on: bool | None = None, debug_view_on: bool | None = None,
+         auto_reply_chats_value: dict | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -183,6 +226,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
+        "auto_reply_chats": (_read("auto_reply_chats", {}) if auto_reply_chats_value is None
+                              else auto_reply_chats_value),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

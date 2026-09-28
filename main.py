@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """父进程：只管界面。截图 + OCR 在 app/worker.py 的子进程里跑，队列里收新消息 →
-冒出新的对方消息才调 engine → 悬浮窗给 3 条候选 → 人点「填入」。发送永远手动。静默期零调用。
+冒出新的对方消息才调 engine → 悬浮窗给 3 条候选；明确开启的会话可自动发送最佳回复。静默期零调用。
 上下文、结果、聊天记录都按会话名（子进程 OCR 头部标题得来）分开存，切会话不串味。
 
     pip install rapidocr-onnxruntime numpy windows-capture PySide6-Fluent-Widgets
@@ -10,12 +10,15 @@ import ctypes
 import multiprocessing
 import queue
 import threading
+import time
 import traceback
 from collections import deque
+from math import isfinite
 
 from app import settings, update, worker
 from app.capture import find_wechat_hwnd
-from app.fill import fill
+from app.fill import fill, fill_and_send
+from app.ocr import similar
 from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
@@ -28,11 +31,16 @@ chats = {}
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": ""}
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
+_AUTO_REPLY_COOLDOWN = 8.0
+_AUTO_REPLY_ECHO_WINDOW = 12.0
+_AUTO_REPLY_SEND_DELAY_MS = 1200
 
 
 def chat_of(title):
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
-                                    "target": None, "senders": []})
+                                    "target": None, "senders": [], "auto_sent_rev": -1,
+                                    "auto_blocked_rev": -1, "last_auto_sent_at": 0.0,
+                                    "last_auto_sent_text": ""})
 
 
 def target_of(title):
@@ -43,16 +51,76 @@ def target_of(title):
     return chat["senders"][0] if chat["senders"] else None
 
 
+def reply_text(title, text):
+    if settings.reply_target() and ov.at_prefix_enabled():
+        target = target_of(title)
+        if target:
+            return f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
+    return text
+
+
 def fill_reply(text):
     if state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
         raise RuntimeError("未找到聊天窗口，请确认已经打开")
     if state["area"] is None:
         raise RuntimeError("输入区域尚不可用，请确认聊天窗口可见（不要最小化）")
-    if settings.reply_target() and ov.at_prefix_enabled():
-        target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
-        if target:
-            text = f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
-    fill(state["hwnd"], state["area"], text)
+    fill(state["hwnd"], state["area"], reply_text(ov.current_chat(), text))
+
+
+def auto_send_reply(title, result, revision):
+    config = settings.auto_reply_config(title)
+    chat = chat_of(title)
+    if not config["enabled"] or title != state["chat"] or revision != chat["rev"]:
+        return False
+    if state["hwnd"] is None or state["area"] is None or not capture_on.is_set():
+        return False
+    if chat["auto_sent_rev"] == revision:
+        return False
+    if revision <= chat["auto_blocked_rev"]:
+        if title == ov.current_chat():
+            ov.set_status("启动时已有的聊天记录只生成建议，不自动发送", "warning")
+        return False
+    elapsed = time.monotonic() - chat["last_auto_sent_at"]
+    if elapsed < _AUTO_REPLY_COOLDOWN:
+        if title == ov.current_chat():
+            ov.set_status(f"自动回复冷却中，已跳过本次发送（{_AUTO_REPLY_COOLDOWN:.0f} 秒保护）", "warning")
+        return False
+    candidates = result.get("candidates") or []
+    best = result.get("best_index")
+    choice = ((result.get("answers") or {}).get("best_reply") or {}).get("choice")
+    expected = {"reply_a": 0, "reply_b": 1, "reply_c": 2}.get(choice)
+    if not isinstance(best, int) or best not in range(len(candidates)) or expected != best:
+        if title == ov.current_chat():
+            ov.set_status("自动回复已跳过：本次没有得到可靠的最佳回复排序", "warning")
+        return False
+    scores = result.get("scores") or []
+    try:
+        score = float(scores[best])
+    except (IndexError, TypeError, ValueError):
+        score = 0.0
+    if not isfinite(score) or not 0 <= score <= 1:
+        score = 0.0
+    if score < config["min_score"]:
+        if title == ov.current_chat():
+            ov.set_status(f"自动回复已跳过：推荐概率 {score:.0%} 低于 {config['min_score']:.0%}", "warning")
+        return False
+    text = reply_text(title, str(candidates[best]).strip())
+    if not text:
+        return False
+    try:
+        fill_and_send(state["hwnd"], state["area"], text, config["send_key"])
+    except Exception as e:
+        if title == ov.current_chat():
+            ov.set_status("自动回复发送失败，请确认聊天窗口和发送快捷键设置。", "error")
+            ov.log(f"[自动回复失败] {type(e).__name__}: {e}")
+        return False
+    chat["auto_sent_rev"] = revision
+    chat["last_auto_sent_at"] = time.monotonic()
+    chat["last_auto_sent_text"] = text
+    if title == ov.current_chat():
+        ov.invalidate_replies()
+        ov.set_status(f"已自动发送最佳回复（{score:.0%}）", "success")
+    return True
 
 
 def spawn_worker():
@@ -197,13 +265,22 @@ def drain():
                 child.join()
                 child = None
             continue
-        _, title, new, area = msg
+        _, title, new, area, *meta = msg
         state["area"] = area
         chat = chat_of(title)
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
+        if meta and meta[0]:
+            chat["auto_blocked_rev"] = chat["rev"]  # 首帧是屏幕旧记录，只展示建议，绝不自动发送
         if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
             ov.invalidate_replies()
+        normalized = []
         for who, name, text in new:
+            auto_echo = (who == "her" and chat["last_auto_sent_text"]
+                         and time.monotonic() - chat["last_auto_sent_at"] <= _AUTO_REPLY_ECHO_WINDOW
+                         and similar(chat["last_auto_sent_text"], text))
+            if auto_echo:
+                who, name = "me", None
+            normalized.append((who, name, text))
             chat["history"].append((who, text, name))
             ov.log_message(who, text, name, chat=title)
             if who == "her" and name:  # 群里发过言的人，去重后最近的排最前
@@ -211,7 +288,7 @@ def drain():
                     chat["senders"].remove(name)
                 chat["senders"].insert(0, name)
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
-        if new[-1][0] == "her":  # 只有对方最新说话才值得分析
+        if normalized[-1][0] == "her":  # 只有对方最新说话才值得分析
             msgs = list(chat["history"])
             if state["busy"]:
                 state["rerun"] = (title, msgs)
@@ -246,6 +323,8 @@ def tick():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
+                ov.after(_AUTO_REPLY_SEND_DELAY_MS,
+                         lambda t=title, result=r, rev=revision: auto_send_reply(t, result, rev))
             else:
                 ov.set_busy(False)
                 ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")

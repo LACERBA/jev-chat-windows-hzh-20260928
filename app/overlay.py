@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""浅色置顶回复助手：回复建议和独立设置页。发送始终由用户确认。"""
+"""浅色置顶回复助手：回复建议、会话级自动回复和独立设置页。"""
 import os
 import sys
 import threading
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
+    QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSizeGrip, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
@@ -306,7 +306,7 @@ class Overlay:
         self._build_settings()
         footer = QHBoxLayout()
         footer.setContentsMargins(20, 9, 8, 8)
-        footer.addWidget(_label(f"仅填入输入框 · 发送由你确认 · v{VERSION}", 11, _MUTED), 1)
+        footer.addWidget(_label(f"手动填入不发送 · 自动回复按会话开启 · v{VERSION}", 11, _MUTED), 1)
         grip = QSizeGrip(self.win)
         grip.setFixedSize(16, 16)
         footer.addWidget(grip, 0, Qt.AlignBottom)
@@ -385,6 +385,26 @@ class Overlay:
         self.chatFollow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         chat_row.addWidget(self.chatFollow)
         body.addLayout(chat_row)
+        auto_row = QHBoxLayout()
+        auto_row.setSpacing(8)
+        auto_prefix = _label("自动回复", 12, _MUTED)
+        auto_prefix.setFixedWidth(56)
+        auto_row.addWidget(auto_prefix)
+        self.autoKeyBox = ComboBox()
+        self.autoKeyBox.addItems(["Enter 发送", "Ctrl+Enter 发送"])
+        self.autoKeyBox.setAccessibleName("自动回复发送快捷键")
+        self.autoKeyBox.setToolTip("必须和微信中的发送快捷键设置一致；推荐概率低于 50% 时不会自动发送")
+        self.autoKeyBox.currentIndexChanged.connect(self._auto_key_changed)
+        auto_row.addWidget(self.autoKeyBox, 1)
+        self.autoReplySwitch = SwitchButton()
+        self.autoReplySwitch.setOnText("开")
+        self.autoReplySwitch.setOffText("关")
+        self.autoReplySwitch.setAccessibleName("当前会话自动回复")
+        self.autoReplySwitch.setToolTip("只对当前显示的会话生效；开启后最佳回复会覆盖输入框并直接发送")
+        self.autoReplySwitch.checkedChanged.connect(self._auto_reply_toggled)
+        auto_row.addWidget(self.autoReplySwitch)
+        body.addLayout(auto_row)
+        self._render_auto_reply()
         self.targetRow = QWidget()  # 只有开了「群聊指定回复对象」且这个会话是群聊才露出来
         target_row = QHBoxLayout(self.targetRow)
         target_row.setContentsMargins(0, 0, 0, 0)
@@ -463,7 +483,7 @@ class Overlay:
         self.replyBox = QVBoxLayout()
         self.replyBox.setSpacing(10)
         body.addLayout(self.replyBox)
-        self.referenceNote = _label("AI 建议仅供参考，按你的语气调整后再发送。", 11, _MUTED)
+        self.referenceNote = _label("AI 建议可能有偏差；自动回复只为你明确开启的会话发送。", 11, _MUTED)
         self.referenceNote.hide()
         body.addWidget(self.referenceNote)
 
@@ -1008,6 +1028,57 @@ class Overlay:
         self.latest.setToolTip(text)
         self.context.show()
 
+    def _auto_send_key(self):
+        return "ctrl_enter" if self.autoKeyBox.currentIndex() == 1 else "enter"
+
+    def _render_auto_reply(self):
+        config = settings.auto_reply_config(self._shown)
+        enabled = bool(self._shown)
+        self.autoReplySwitch.blockSignals(True)
+        self.autoReplySwitch.setChecked(config["enabled"] if enabled else False)
+        self.autoReplySwitch.blockSignals(False)
+        self.autoKeyBox.blockSignals(True)
+        self.autoKeyBox.setCurrentIndex(1 if config["send_key"] == "ctrl_enter" else 0)
+        self.autoKeyBox.blockSignals(False)
+        self.autoReplySwitch.setEnabled(enabled)
+        self.autoKeyBox.setEnabled(enabled)
+
+    def _auto_reply_toggled(self, on):
+        title = self._shown
+        if not title:
+            self._render_auto_reply()
+            return
+        config = settings.auto_reply_config(title)
+        confirmed = None
+        if on and not config["confirmed"]:
+            answer = QMessageBox.warning(
+                self.win, "开启自动回复",
+                f"开启后，「{title}」生成的最佳回复会覆盖输入框已有文字并直接发送。\n\n"
+                "请确认发送快捷键与微信设置一致。是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self._render_auto_reply()
+                return
+            confirmed = True
+        try:
+            settings.set_auto_reply(title, on, self._auto_send_key(), confirmed=confirmed)
+        except Exception:
+            self.set_status("自动回复设置保存失败，请检查配置文件是否可写。", "error")
+            self._render_auto_reply()
+            return
+        self.set_status(f"「{title}」自动回复已{'开启' if on else '关闭'}",
+                        "warning" if on else "success")
+
+    def _auto_key_changed(self, _):
+        if not self._shown:
+            return
+        try:
+            settings.set_auto_reply(self._shown, self.autoReplySwitch.isChecked(), self._auto_send_key())
+        except Exception:
+            self.set_status("发送快捷键保存失败，请检查配置文件是否可写。", "error")
+            self._render_auto_reply()
+
     def current_chat(self):
         """界面上正在看的会话（不一定是微信当前开着的那个）。"""
         return self._shown
@@ -1053,6 +1124,7 @@ class Overlay:
             self.context.hide()
         self._history_title()
         self._follow_text()
+        self._render_auto_reply()
         self._render_targets()
         self.show_cached(self.result_of(title) if self.result_of else None)
 

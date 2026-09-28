@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把选中的候选填进微信输入框：写剪贴板 → 点输入框 → Ctrl+V。绝不发回车、绝不点发送。"""
+"""把候选填进微信输入框；会话明确开启自动回复时可继续模拟发送快捷键。"""
 import ctypes
 import ctypes.wintypes as w
 import time
@@ -46,8 +46,8 @@ def set_clipboard(text):
     raise RuntimeError("OpenClipboard 连续失败，剪贴板被其他程序占用")
 
 
-def fill(hwnd, area, text):
-    """area = 消息区 (x0, y0, x1, y1)；输入框就在底线 y1 下面。"""
+def fill(hwnd, area, text, *, replace=False):
+    """area = 消息区 (x0, y0, x1, y1)；replace=True 时覆盖输入框已有内容。"""
     from app.capture import unminimize
 
     set_clipboard(text)
@@ -77,15 +77,27 @@ def fill(hwnd, area, text):
     time.sleep(0.05)
     u32.SetCursorPos(old.x, old.y)
     time.sleep(0.05)
-    # 光标移到已有文本的绝对末尾：点击落在文字中间时 caret 会插在中间，
-    # 连续多次填入就串行错乱；Ctrl+End 保证新内容永远追加在最后
+    # 手动填入追加到末尾；自动回复覆盖已有草稿，避免把草稿和生成内容拼在一起发送
     u32.keybd_event(0x11, 0, 0, 0)  # Ctrl 按下
-    u32.keybd_event(0x23, 0, 0, 0)  # End 按下（VK_END）
-    u32.keybd_event(0x23, 0, 2, 0)  # End 抬起
+    u32.keybd_event(0x41 if replace else 0x23, 0, 0, 0)  # A / End 按下
+    u32.keybd_event(0x41 if replace else 0x23, 0, 2, 0)  # A / End 抬起
     u32.keybd_event(0x11, 0, 2, 0)  # Ctrl 抬起
     time.sleep(0.05)
     u32.keybd_event(0x11, 0, 0, 0)  # Ctrl
     u32.keybd_event(0x56, 0, 0, 0)  # V
     u32.keybd_event(0x56, 0, 2, 0)
     u32.keybd_event(0x11, 0, 2, 0)
-    # 到此为止。发不发、改不改，人来。
+
+
+def fill_and_send(hwnd, area, text, send_key="enter"):
+    """覆盖输入框后按当前微信设置对应的发送快捷键。"""
+    if send_key not in ("enter", "ctrl_enter"):
+        raise ValueError("不支持的发送快捷键")
+    fill(hwnd, area, text, replace=True)
+    time.sleep(0.2)
+    if send_key == "ctrl_enter":
+        u32.keybd_event(0x11, 0, 0, 0)
+    u32.keybd_event(0x0D, 0, 0, 0)
+    u32.keybd_event(0x0D, 0, 2, 0)
+    if send_key == "ctrl_enter":
+        u32.keybd_event(0x11, 0, 2, 0)
