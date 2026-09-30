@@ -221,7 +221,7 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None):
+                 on_toggle_debug=None, app_key_of=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -232,6 +232,7 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
+        self.app_key_of = app_key_of or (lambda: "wechat")
         self.result_of = result_of
         self.cands = []
         self.cards = []
@@ -1032,8 +1033,9 @@ class Overlay:
         return "ctrl_enter" if self.autoKeyBox.currentIndex() == 1 else "enter"
 
     def _render_auto_reply(self):
-        config = settings.auto_reply_config(self._shown)
-        enabled = bool(self._shown)
+        app_key = self.app_key_of()
+        config = settings.auto_reply_config(self._shown, app_key)
+        enabled = bool(self._shown) and app_key == "wechat"
         self.autoReplySwitch.blockSignals(True)
         self.autoReplySwitch.setChecked(config["enabled"] if enabled else False)
         self.autoReplySwitch.blockSignals(False)
@@ -1042,13 +1044,21 @@ class Overlay:
         self.autoKeyBox.blockSignals(False)
         self.autoReplySwitch.setEnabled(enabled)
         self.autoKeyBox.setEnabled(enabled)
+        tooltip = ("只对当前显示的会话生效；开启后最佳回复会覆盖输入框并直接发送"
+                   if app_key == "wechat" else "当前聊天软件暂未开放自动发送，请先使用手动填入")
+        self.autoReplySwitch.setToolTip(tooltip)
+        self.autoKeyBox.setToolTip("必须和微信中的发送快捷键设置一致；选出最佳回复后会自动发送"
+                                   if app_key == "wechat" else tooltip)
 
     def _auto_reply_toggled(self, on):
         title = self._shown
-        if not title:
+        app_key = self.app_key_of()
+        if not title or app_key != "wechat":
             self._render_auto_reply()
+            if title and app_key != "wechat":
+                self.set_status("当前聊天软件暂未开放自动发送，请先使用手动填入", "warning")
             return
-        config = settings.auto_reply_config(title)
+        config = settings.auto_reply_config(title, app_key)
         confirmed = None
         if on and not config["confirmed"]:
             answer = QMessageBox.warning(
@@ -1062,7 +1072,7 @@ class Overlay:
                 return
             confirmed = True
         try:
-            settings.set_auto_reply(title, on, self._auto_send_key(), confirmed=confirmed)
+            settings.set_auto_reply(title, on, self._auto_send_key(), app_key, confirmed=confirmed)
         except Exception:
             self.set_status("自动回复设置保存失败，请检查配置文件是否可写。", "error")
             self._render_auto_reply()
@@ -1071,10 +1081,12 @@ class Overlay:
                         "warning" if on else "success")
 
     def _auto_key_changed(self, _):
-        if not self._shown:
+        app_key = self.app_key_of()
+        if not self._shown or app_key != "wechat":
             return
         try:
-            settings.set_auto_reply(self._shown, self.autoReplySwitch.isChecked(), self._auto_send_key())
+            settings.set_auto_reply(self._shown, self.autoReplySwitch.isChecked(),
+                                    self._auto_send_key(), app_key)
         except Exception:
             self.set_status("发送快捷键保存失败，请检查配置文件是否可写。", "error")
             self._render_auto_reply()

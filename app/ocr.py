@@ -7,24 +7,38 @@ import time
 import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 
+from app.chatapps import DEFAULT, ChatApp
 
-_ENGINE = None
+_ENGINE: dict = {}
+_FELL_BACK = set()
 
 
-def _engine():
+def _engine(app: ChatApp = DEFAULT):
     """OCR 引擎全进程共用：一个实例 ~40MB，每个会话一个 Reader，不能各带一个。
-    det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。"""
-    global _ENGINE
-    if _ENGINE is None:
-        _ENGINE = RapidOCR(intra_op_num_threads=4, det_limit_type="max", det_limit_side_len=4000)
-    return _ENGINE
+    det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。
+
+    RapidOCR 的内置模型只有中英文，韩日文界面走 Windows 自带 OCR；没有对应识别器时
+    回退到 RapidOCR，并且本进程不再重复尝试失败的后端。"""
+    want = app.ocr if app.ocr not in _FELL_BACK else "rapidocr"
+    if want not in _ENGINE:
+        if want == "windows":
+            try:
+                from app.ocr_windows import WindowsOcr
+                _ENGINE[want] = WindowsOcr()
+            except Exception:
+                _FELL_BACK.add("windows")
+                return _engine(app)
+        else:
+            _ENGINE[want] = RapidOCR(intra_op_num_threads=4, det_limit_type="max",
+                                     det_limit_side_len=4000)
+    return _ENGINE[want]
 
 
-def read_title(header):
+def read_title(header, app: ChatApp = DEFAULT):
     """面板头部那一条截图 → 会话名（numpy RGB）。取最靠上的一行，同一行里取最左的
     （右边是图标按钮，OCR 不出字；下面那行是公告）。群聊的成员数「(422)」去掉，只留名字当 key。
     认不出返回 ""。一次约 60ms，所以调用方只在头部像素变了时才问。"""
-    res, _ = _engine()(header, use_cls=False)
+    res, _ = _engine(app)(header, use_cls=False)
     if not res:
         return ""
     first = min(res, key=lambda r: r[0][0][1])
@@ -33,7 +47,7 @@ def read_title(header):
     return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text.strip())
 
 
-def who_said(chat, box):
+def who_said(chat, box, app: ChatApp = DEFAULT):
     """按 OCR 框里的颜色分类，不看 x 坐标。返回 (谁, 底色, 墨高)：
     先看底色平不平：框里众数颜色占比 <45% 就是图片（头像/照片/表情包）里的字 → None 丢掉。
     绿底 → me；非绿且文字对底色对比度 ≥150 → her；其余（引用块、群里的发言人名、时间戳、系统提示、
@@ -56,7 +70,7 @@ def who_said(chat, box):
     for r in (diff > 60).any(axis=1):
         best = best + 1 if r else 0
         ink_h = max(ink_h, best)
-    if bg[1] > bg[0] + 40 and bg[1] > bg[2] + 40:
+    if app.is_me(bg):
         return "me", bg, ink_h
     return ("her" if diff.max() >= 150 else "gray"), bg, ink_h
 
@@ -71,8 +85,9 @@ def similar(a, b):
 class Reader:
     """一个会话一个 Reader：lh/seen 各自算各自的，切走再切回来不会把旧消息当新的重报一遍。"""
 
-    def __init__(self):
-        self.ocr = _engine()
+    def __init__(self, app: ChatApp = DEFAULT):
+        self.app = app
+        self.ocr = _engine(app)
         self.lh = None  # 正常气泡字高，头一帧定
         self.seen = []  # [(who, name, text)]，累计，封顶 500
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
@@ -81,6 +96,9 @@ class Reader:
     def read(self, chat, pane_bg):
         """→ [(who, name, text, y)]，同一气泡的多行已合并。who ∈ me/her；name 群聊里是发言人，单聊 None。
         顺带把每个框的分类记进 self.last_boxes（调试视图画框用，几十个 tuple，不开也不亏）。"""
+        skip = self.app.trim_top(chat)
+        if skip:
+            chat = chat[skip:]
         t0 = time.perf_counter()
         res, _ = self.ocr(chat, use_cls=False)
         self.last_ms = int((time.perf_counter() - t0) * 1000)
@@ -91,11 +109,11 @@ class Reader:
         # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
         name, raw = None, []
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
-            kind, bg, h = who_said(chat, box)
+            kind, bg, h = who_said(chat, box, self.app)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-            if kind == "gray":
-                on_pane = np.abs(bg - pane_bg).sum() <= 6
+            on_pane = bg is not None and np.abs(bg - pane_bg).sum() <= 6
+            if kind == "gray" or (on_pane and kind == "her"):
                 taken = bool(on_pane and box[0][0] < 0.25 * W and len(text) <= 16
                              and not re.search("[:：]", text))
                 if taken:
@@ -114,7 +132,7 @@ class Reader:
         lines = []
         for who, nm, text, top, bottom, h in raw:
             if lines and lines[-1][0] == who and lines[-1][1] == nm and top - lines[-1][4] < 0.6 * (self.lh or h):
-                lines[-1][2] += text
+                lines[-1][2] += self.app.join + text
                 lines[-1][4] = bottom
             else:
                 lines.append([who, nm, text, top, bottom])

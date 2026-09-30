@@ -143,15 +143,17 @@ def main() -> int:
             if value is not None:
                 demo_settings[name] = bool(value)
 
-    def demo_auto_reply_config(title):
-        value = demo_settings["auto_reply_chats"].get(title, {})
+    def demo_auto_reply_config(title, app_key=None):
+        key = f"{app_key or 'wechat'}:{title}"
+        value = demo_settings["auto_reply_chats"].get(key, {})
         return {"enabled": bool(value.get("enabled", False)),
                 "send_key": value.get("send_key", "enter"),
                 "confirmed": bool(value.get("confirmed", False))}
 
-    def set_demo_auto_reply(title, enabled, send_key="enter", *, confirmed=None):
-        current = demo_auto_reply_config(title)
-        demo_settings["auto_reply_chats"][title] = {
+    def set_demo_auto_reply(title, enabled, send_key="enter", app_key=None, *, confirmed=None):
+        current = demo_auto_reply_config(title, app_key)
+        key = f"{app_key or 'wechat'}:{title}"
+        demo_settings["auto_reply_chats"][key] = {
             "enabled": bool(enabled), "send_key": send_key,
             "confirmed": current["confirmed"] if confirmed is None else bool(confirmed),
         }
@@ -188,7 +190,7 @@ def main() -> int:
         check_update=lambda: demo_settings["check_update"],
         debug_view=lambda: demo_settings["debug_view"],
         auto_reply_config=demo_auto_reply_config,
-        auto_reply_enabled=lambda title: demo_auto_reply_config(title)["enabled"],
+        auto_reply_enabled=lambda title, app_key=None: demo_auto_reply_config(title, app_key)["enabled"],
         set_auto_reply=set_demo_auto_reply,
         save=save_demo_settings,
     ):

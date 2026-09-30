@@ -10,6 +10,7 @@ openai                        # OpenAI Chat Completions: DeepSeek, OpenRouter, M
 typesafe-sdk                  # Jev judging over TypeSafe direct (api.typesafe.ai)
 anthropic                     # Anthropic Messages
 google-genai                  # Google Gemini
+winsdk==1.0.0b10             # Windows.Media.Ocr for Korean and other system language packs
 
 # optional, only for the two old UIA probes (already disproved; install to reproduce)
 # uiautomation                # probe_win.py / probe_win2.py

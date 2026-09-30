@@ -89,10 +89,17 @@ def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))
 
-def auto_reply_config(title: str) -> dict:
-    """按 OCR 会话名读取自动回复配置；脏数据一律回到关闭状态。"""
+def _auto_reply_key(title: str, app_key: str | None = None) -> str:
+    return f"{(app_key or 'wechat').strip().lower()}:{title.strip()}"
+
+def auto_reply_config(title: str, app_key: str | None = None) -> dict:
+    """按聊天软件和 OCR 会话名读取自动回复配置；旧配置只归入微信。"""
+    title = title.strip()
+    app_key = (app_key or "wechat").strip().lower()
     configs = _read("auto_reply_chats", {})
-    value = configs.get(title.strip()) if isinstance(configs, dict) and title.strip() else None
+    value = configs.get(_auto_reply_key(title, app_key)) if isinstance(configs, dict) and title else None
+    if value is None and app_key == "wechat" and isinstance(configs, dict):
+        value = configs.get(title)
     if value is True:
         value = {"enabled": True}
     if not isinstance(value, dict):
@@ -103,18 +110,19 @@ def auto_reply_config(title: str) -> dict:
     return {"enabled": bool(value.get("enabled", False)), "send_key": send_key,
             "confirmed": bool(value.get("confirmed", False))}
 
-def auto_reply_enabled(title: str) -> bool:
-    return auto_reply_config(title)["enabled"]
+def auto_reply_enabled(title: str, app_key: str | None = None) -> bool:
+    return auto_reply_config(title, app_key)["enabled"]
 
-def set_auto_reply(title: str, enabled: bool, send_key: str = "enter", *, confirmed: bool | None = None) -> None:
-    """只更新一个会话的自动回复配置，其他设置和会话保持不变。"""
+def set_auto_reply(title: str, enabled: bool, send_key: str = "enter", app_key: str | None = None,
+                   *, confirmed: bool | None = None) -> None:
+    """只更新一个聊天软件中的一个会话配置，其他设置和会话保持不变。"""
     title = title.strip()
     if not title:
         return
     configs = _read("auto_reply_chats", {})
     configs = dict(configs) if isinstance(configs, dict) else {}
-    current = auto_reply_config(title)
-    configs[title] = {
+    current = auto_reply_config(title, app_key)
+    configs[_auto_reply_key(title, app_key)] = {
         "enabled": bool(enabled),
         "send_key": send_key if send_key in _AUTO_REPLY_SEND_KEYS else "enter",
         "confirmed": current["confirmed"] if confirmed is None else bool(confirmed),

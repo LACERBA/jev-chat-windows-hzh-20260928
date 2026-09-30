@@ -16,7 +16,7 @@ from collections import deque
 from math import isfinite
 
 from app import settings, update, worker
-from app.capture import find_wechat_hwnd
+from app.capture import find_chat_hwnd
 from app.fill import fill, fill_and_send
 from app.ocr import similar
 from app.overlay import Overlay
@@ -68,7 +68,9 @@ def fill_reply(text):
 
 
 def auto_send_reply(title, result, revision):
-    config = settings.auto_reply_config(title)
+    if state.get("app") != "wechat":
+        return False
+    config = settings.auto_reply_config(title, state.get("app"))
     chat = chat_of(title)
     if not config["enabled"] or title != state["chat"] or revision != chat["rev"]:
         return False
@@ -121,7 +123,8 @@ def auto_send_reply(title, result, revision):
 def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
     p = multiprocessing.Process(target=worker.run,
-                                args=(q, state["hwnd"], capture_on, debug_on), daemon=True)
+                                args=(q, state["hwnd"], capture_on, debug_on, state.get("app")),
+                                daemon=True)
     p.start()
     return p
 
@@ -150,14 +153,15 @@ def on_debug_closed():
 
 
 def on_toggle_capture(on):
-    """标题栏开关。启动时没找到微信就没有子进程，这会儿再找一次，找到了才真开得起来。"""
+    """标题栏开关。启动时没找到聊天软件就没有子进程，这会儿再找一次，找到了才真开得起来。"""
     global child
     if not on:
         capture_on.clear()
         return
     if child is None:
         try:
-            state["hwnd"] = find_wechat_hwnd()
+            state["hwnd"], found = find_chat_hwnd()
+            state["app"] = found.key
         except RuntimeError:
             ov.set_capture(False, "未找到聊天窗口，打开后再开启采集")
             return
@@ -337,12 +341,14 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     debug_on = multiprocessing.Event()  # 同上，置位=子进程往队列里送整帧给调试窗
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
+                 app_key_of=lambda: state.get("app", "wechat"),
                  result_of=lambda t: chats.get(t, {}).get("result"))
     child = dbg = None
     try:
-        state["hwnd"] = find_wechat_hwnd()
+        state["hwnd"], found = find_chat_hwnd()
+        state["app"] = found.key
     except RuntimeError:
-            ov.set_capture(False, "未找到聊天窗口，打开后再开启采集")
+        ov.set_capture(False, "未找到聊天窗口，打开后再开启采集")
     else:
         capture_on.set()
         child = spawn_worker()
