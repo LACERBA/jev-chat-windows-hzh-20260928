@@ -46,6 +46,38 @@ def set_clipboard(text):
     raise RuntimeError("OpenClipboard 连续失败，剪贴板被其他程序占用")
 
 
+def click(hwnd, x, y):
+    from app.capture import unminimize
+
+    r = w.RECT()
+    if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
+        u32.GetWindowRect(hwnd, ctypes.byref(r))
+    unminimize(hwnd)
+    fg = u32.GetForegroundWindow()
+    if fg != hwnd:
+        fg_tid = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        our_tid = k32.GetCurrentThreadId()
+        if fg_tid:
+            u32.AttachThreadInput(our_tid, fg_tid, True)
+        activated = u32.SetForegroundWindow(hwnd)
+        if fg_tid:
+            u32.AttachThreadInput(our_tid, fg_tid, False)
+        if not activated:
+            raise RuntimeError("无法激活聊天窗口")
+        time.sleep(0.15)
+    old = w.POINT()
+    u32.GetCursorPos(ctypes.byref(old))
+    if not u32.SetCursorPos(r.left + int(x), r.top + int(y)):
+        raise RuntimeError("无法移动鼠标到目标会话")
+    try:
+        time.sleep(0.05)
+        u32.mouse_event(0x2, 0, 0, 0, 0)
+        u32.mouse_event(0x4, 0, 0, 0, 0)
+        time.sleep(0.05)
+    finally:
+        u32.SetCursorPos(old.x, old.y)
+
+
 def fill(hwnd, area, text, *, replace=False):
     """area = 消息区 (x0, y0, x1, y1)；replace=True 时覆盖输入框已有内容。"""
     from app.capture import unminimize

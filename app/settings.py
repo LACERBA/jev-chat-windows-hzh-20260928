@@ -89,6 +89,9 @@ def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))
 
+def auto_switch() -> bool:
+    return bool(_read("auto_switch", False))
+
 def _auto_reply_key(title: str, app_key: str | None = None) -> str:
     return f"{(app_key or 'wechat').strip().lower()}:{title.strip()}"
 
@@ -195,7 +198,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
-         auto_reply_chats_value: dict | None = None) -> None:
+         auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -225,6 +228,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
+        "auto_switch": flag(auto_switch_on, auto_switch),
         "auto_reply_chats": (_read("auto_reply_chats", {}) if auto_reply_chats_value is None
                               else auto_reply_chats_value),
     }

@@ -559,6 +559,17 @@ class Overlay:
         box.addWidget(self._hint(
             "开了以后群聊里可以选回复给谁，候选会针对 TA 写，填入时可带 @。关了就正常回复。"
         ))
+        auto_switch_row = QHBoxLayout()
+        auto_switch_row.addWidget(_label("自动切换新消息会话", 13), 1)
+        self.autoSwitch = SwitchButton()
+        self.autoSwitch.setOnText("开")
+        self.autoSwitch.setOffText("关")
+        self.autoSwitch.setAccessibleName("自动切换新消息会话")
+        auto_switch_row.addWidget(self.autoSwitch)
+        box.addLayout(auto_switch_row)
+        box.addWidget(self._hint(
+            "检测到运行期间的新未读后串行切换；未开启自动回复的会话不会调用模型。"
+        ))
         update_row = QHBoxLayout()
         update_row.addWidget(_label("启动时检查更新", 13), 1)
         self.updateSwitch = SwitchButton()
@@ -580,7 +591,7 @@ class Overlay:
         debug_row.addWidget(self.debugSwitch)
         box.addLayout(debug_row)
         box.addWidget(self._hint(
-            "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
+            "另开一个窗口实时显示截到的画面和识别框：粉 = 未读候选、绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
             "红 = 当成图片丢掉、黄 = 小字丢掉。只在内存里画，不存图。"
         ))
         body.addWidget(preference)
@@ -799,6 +810,7 @@ class Overlay:
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.baseEdit.setText(settings.draft_base_url())
         self.thinkingSwitch.setChecked(settings.thinking())
+        self.autoSwitch.setChecked(settings.auto_switch())
         self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
@@ -840,7 +852,8 @@ class Overlay:
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
-                          check_update_on=self.updateSwitch.isChecked())
+                          check_update_on=self.updateSwitch.isChecked(),
+                          auto_switch_on=self.autoSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return

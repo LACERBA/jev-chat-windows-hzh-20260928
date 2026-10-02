@@ -9,7 +9,7 @@ import traceback
 import numpy as np
 
 from app import chatapps
-from app.capture import Capture, chat_area, unminimize
+from app.capture import Capture, UnreadTracker, chat_area, unminimize
 from app.ocr import Reader, read_title, similar
 
 
@@ -18,7 +18,7 @@ def _err(q):
     q.put(("status", " ".join(traceback.format_exc().split())[-200:]))
 
 
-def _packet(full, area, title, reader, lines):
+def _packet(full, area, title, reader, lines, unread):
     """调试视图的一帧：整帧缩到长边 ≤1100 再走队列（原帧 2560 宽裸传要 20MB），只在内存里传，不落盘。
     整数步长切片够用，不引新依赖；框和坐标照发原始值，画的那边按 scale 折算。"""
     k = max(1, -(-max(full.shape[:2]) // 1100))
@@ -27,6 +27,7 @@ def _packet(full, area, title, reader, lines):
             "area": tuple(int(v) for v in area[:4]) if area else None,
             "pane_top": int(area[5]) if area else 0, "title": title,
             "boxes": reader.last_boxes if reader else [],
+            "unread": [item["box"] for item in unread],
             "lines": [(w, n, t) for w, n, t, _ in lines],
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
@@ -39,8 +40,10 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
     app = chatapps.get(app_key)
     cap = None
     readers = {}  # {会话名: Reader}，一个会话一套去重状态
-    title, head = "", None  # 当前会话名 / 上一帧的头部像素
+    title, raw_title, head = "", "", None  # 当前会话名 / 上一帧的头部像素
+    unread_tracker = UnreadTracker()
     last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
+    last_chat = None
     warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
     while True:
         if not enabled.is_set():
@@ -64,7 +67,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
             unminimize(hwnd)
             full = cap.settled()
             if full is not None:
-                reader, lines = None, []  # 调试视图要用，消息区没认出来时就是空的
+                reader, lines, unread = None, [], []  # 调试视图要用，消息区没认出来时就是空的
                 area = chat_area(full)  # 每次停稳都重算：拖完窗口微信布局会晚一拍才铺好，只按尺寸变化算一次会锁死
                 if area is None:
                     if not warned:
@@ -77,26 +80,37 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                     rect = (x0, y0, x1, y1)
                     if rect != last_area:
                         q.put(("area", rect))
-                        last_area = rect
+                        last_area, last_chat = rect, None
+                        unread_tracker = UnreadTracker()
+                    if app.key == "wechat":
+                        unread, events = unread_tracker.update(full, area)
+                        q.put(("unread_state", unread))
+                        for event in events:
+                            q.put(("unread", event))
                     crop = full[y_pane:y0, x0:x1]  # 头部：会话名在这里
                     if head is None or not np.array_equal(crop, head):  # 名字没动就别白跑一次 OCR
                         head = crop
-                        name = read_title(crop, app)
+                        raw_name = read_title(crop, app)
                         # OCR 抖一下（「小分队」↔「小分认」）不能分裂出一个新会话
-                        name = next((k for k in readers if similar(k, name)), name) if name else ""
+                        name = next((k for k in readers if similar(k, raw_name)), raw_name) if raw_name else ""
                         # ponytail: 认不出就沿用上次；开头就认不出给个占位名，总比把消息全丢了强
                         name = name or title or "当前会话"
-                        if name != title:
-                            title = name
-                            q.put(("chat", title))
+                        next_raw = raw_name or raw_title or name
+                        if name != title or next_raw != raw_title:
+                            title, raw_title = name, next_raw
+                            last_chat = None
+                            q.put(("chat", title, raw_title))
                     initial = title not in readers
                     reader = readers.setdefault(title, Reader(app))
-                    lines = reader.read(full[y0:y1, x0:x1], bg)
-                    new = reader.new_lines(lines)
-                    if new:
-                        q.put(("lines", title, new, rect, initial))
+                    chat_pixels = full[y0:y1, x0:x1]
+                    if last_chat is None or not np.array_equal(chat_pixels, last_chat):
+                        last_chat = chat_pixels
+                        lines = reader.read(chat_pixels, bg)
+                        new = reader.new_lines(lines)
+                        if new:
+                            q.put(("lines", title, new, rect, initial, raw_title))
                 if debug_on.is_set():
-                    q.put(("debug", _packet(full, area, title, reader, lines)))
+                    q.put(("debug", _packet(full, area, title, reader, lines, unread)))
         except Exception:
             _err(q)  # 一帧出错不退出
         time.sleep(0.05)

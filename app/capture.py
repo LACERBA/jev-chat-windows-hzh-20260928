@@ -3,6 +3,7 @@
 import ctypes
 import os
 import time
+import zlib
 from ctypes import wintypes
 
 import numpy as np
@@ -111,6 +112,96 @@ def chat_area(full, header_h=60):
     return x0, y_top, x1, y_in, bg, y0
 
 
+def _components(mask):
+    remaining = {tuple(p) for p in np.argwhere(mask)}
+    out = []
+    while remaining:
+        seed = remaining.pop()
+        stack, points = [seed], [seed]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dx and not dy:
+                        continue
+                    point = (y + dy, x + dx)
+                    if point in remaining:
+                        remaining.remove(point)
+                        stack.append(point)
+                        points.append(point)
+        out.append(points)
+    return out
+
+
+def unread_badges(full, area):
+    if area is None:
+        return []
+    H = full.shape[0]
+    x0, _, _, _, _, y_pane = area
+    left = max(48, min(x0 - 40, int(x0 * 0.16)))
+    top = max(40, y_pane + 44)
+    if x0 - left < 60 or H - top < 40:
+        return []
+    reg = full[top:H - 6, left:x0]
+    r, g, b = reg[:, :, 0], reg[:, :, 1], reg[:, :, 2]
+    mask = ((r >= 210) & (g >= 30) & (g <= 145) & (b >= 30) & (b <= 145)
+            & (r.astype(int) - g.astype(int) >= 70)
+            & (r.astype(int) - b.astype(int) >= 70))
+    badges = []
+    for points in _components(mask):
+        ys = np.fromiter((p[0] for p in points), int)
+        xs = np.fromiter((p[1] for p in points), int)
+        y0, y1, bx0, bx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        h, width, size = y1 - y0, bx1 - bx0, len(points)
+        if not (4 <= h <= 40 and 4 <= width <= 40 and 10 <= size <= 600):
+            continue
+        if not 0.55 <= width / h <= 1.8 or size / (width * h) < 0.2:
+            continue
+        colors = reg[ys, xs].astype(float)
+        mean = colors.mean(axis=0)
+        if (colors.std(axis=0).max() > 35 or mean[0] < 235 or not 45 <= mean[1] <= 120
+                or not 45 <= mean[2] <= 120 or abs(mean[1] - mean[2]) > 24):
+            continue
+        box = (left + int(bx0), top + int(y0), left + int(bx1), top + int(y1))
+        cy = (box[1] + box[3]) // 2
+        row = full[max(top, cy - 30):min(H - 6, cy + 42), left:x0]
+        bg = np.median(row.reshape(-1, 3), axis=0)
+        ink = np.abs(row.astype(int) - bg.astype(int)).sum(axis=2) > 30
+        normalized = np.where(ink[:, :, None], row, 0)
+        digest = zlib.crc32(np.ascontiguousarray(normalized[::2, ::2]).tobytes())
+        badges.append({"base": f"{digest:08x}:{width}:{h}", "box": box,
+                       "x": left + int((x0 - left) * 0.62), "y": cy})
+    grouped = []
+    for badge in sorted(badges, key=lambda item: (item["y"], item["box"][0])):
+        hit = next((i for i, item in enumerate(grouped) if abs(item["y"] - badge["y"]) <= 24), None)
+        if hit is None:
+            grouped.append(badge)
+        elif badge["box"][0] > grouped[hit]["box"][0]:
+            grouped[hit] = badge
+    return grouped
+
+
+class UnreadTracker:
+    def __init__(self):
+        self.armed = False
+        self.previous = set()
+        self.sequence = 0
+
+    def update(self, full, area):
+        badges = unread_badges(full, area)
+        current = {badge["base"] for badge in badges}
+        if not self.armed:
+            self.armed, self.previous = True, current
+            return badges, []
+        added = [badge for badge in badges if badge["base"] not in self.previous]
+        self.previous = current
+        events = []
+        for badge in sorted(added, key=lambda item: item["y"], reverse=True):
+            self.sequence += 1
+            events.append({**badge, "id": f"{badge['base']}:{self.sequence}", "at": time.monotonic()})
+        return badges, events
+
+
 class Capture:
     """WGC 盯窗口。采集线程只做「跟上一帧比」；settled() 在画面停稳后交出整帧，中间帧（滚动动画、
     新消息滑入的半截气泡）全跳过。动图表情永远停不稳，所以最多等 max_wait 秒照样交。"""
@@ -119,7 +210,7 @@ class Capture:
         from windows_capture import WindowsCapture
 
         self.settle, self.max_wait = settle, max_wait
-        self.shape = self.area = self.last = self.pending = None
+        self.shape = self.area = self.last = self.last_sidebar = self.pending = None
         self.t = self.t0 = 0.0
         # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
         # 这个属性要 Win10 2004（build 19041）才有，1909 及更早直接抛 CursorConfigUnsupported。
@@ -135,14 +226,18 @@ class Capture:
             return
         if self.area is None or full.shape != self.shape:
             self.shape, self.area = full.shape, chat_area(full)
+            self.last = self.last_sidebar = None
         if self.area is None:
             return
         x0, y0, x1, y1 = self.area[:4]  # 拿上一次的消息区做 diff 就够了，光标闪烁在输入框里，不算变化
         # ponytail: diff 不含头部——公告条会滚动，带上它就永远停不稳。切会话时消息区必然也变，照样出帧。
         chat = full[y0:y1, x0:x1]
-        if self.last is not None and np.array_equal(chat, self.last):
+        sidebar = full[self.area[5]:, :x0]
+        chat_changed = self.last is None or not np.array_equal(chat, self.last)
+        sidebar_changed = self.last_sidebar is None or not np.array_equal(sidebar, self.last_sidebar)
+        if not chat_changed and not sidebar_changed:
             return
-        self.last = chat
+        self.last, self.last_sidebar = chat, sidebar
         if self.pending is None:
             self.t0 = time.perf_counter()
         self.pending, self.t = full, time.perf_counter()

@@ -16,6 +16,7 @@ _COLOR = {k: c for k, c, _, _ in _KINDS}
 _NAME = {k: n for k, _, _, n in _KINDS}
 _AREA = "#1f6fd0"  # 消息区
 _HEAD = "#8b5cf6"  # 头部（会话名那条）
+_UNREAD = "#ff2d55"
 
 
 class _Canvas(QWidget):
@@ -53,6 +54,9 @@ class _Canvas(QWidget):
                           (x1 - x0) * s / k, (y0 - self.pkt.get("pane_top", 0)) * s / k))
         p.setPen(QPen(QColor(_AREA), 2))
         p.drawRect(QRectF(*f(x0, y0), (x1 - x0) * s / k, (y1 - y0) * s / k))
+        p.setPen(QPen(QColor(_UNREAD), 2))
+        for ux0, uy0, ux1, uy1 in self.pkt.get("unread", ()):
+            p.drawRect(QRectF(*f(ux0, uy0), (ux1 - ux0) * s / k, (uy1 - uy0) * s / k))
         tag = QFont(self.font())
         tag.setPointSizeF(7.5)
         p.setFont(tag)
@@ -111,6 +115,7 @@ class DebugWindow(QWidget):
             f"头部顶：y {pkt.get('pane_top', 0)}",
             f"OCR 耗时：{pkt.get('ocr_ms', 0)} ms",
             f"帧：{pkt['w']}×{pkt['h']}（原帧缩了 1/{pkt.get('scale', 1)} 再过队列）",
+            f"未读候选：{len(pkt.get('unread', ()))}",
             "框：" + ("、".join(f"{_NAME.get(k, k)} {v}" for k, v in counts.items()) or "无"),
             "",
             f"本帧 {len(pkt.get('lines', ()))} 行",
@@ -129,5 +134,5 @@ class DebugWindow(QWidget):
 
 
 def _legend():
-    return ("图例（蓝粗框 = 消息区，紫细框 = 头部会话名）\n"
+    return ("图例（蓝粗框 = 消息区，紫细框 = 头部会话名，粉框 = 未读候选）\n"
             + "\n".join(f"  {word} = {what}（{k}）" for k, _, word, what in _KINDS))
