@@ -2,6 +2,15 @@
 
 本仓库只维护当前这一套识别。有能力的人可以 Fork 后自行适配别的聊天窗口，作者不提供这项适配，也不对 Fork 出去的改动负责。
 
+```bash
+git clone https://github.com/jev-chat/jev-chat-windows.git
+cd jev-chat-windows
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+
 ## 公众号
 
 反馈和合作走公众号「恸码奇点」。扫左边的码，或者搜一搜这个名字。
