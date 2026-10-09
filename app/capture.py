@@ -182,23 +182,39 @@ def unread_badges(full, area):
 
 
 class UnreadTracker:
-    def __init__(self):
+    def __init__(self, read_name=None):
         self.armed = False
         self.previous = set()
         self.sequence = 0
+        self.read_name = read_name
+        self.names = {}
+        self.deferred = {}
 
     def update(self, full, area):
         badges = unread_badges(full, area)
         current = {badge["base"] for badge in badges}
+        self.names = {key: name for key, name in self.names.items() if key in current}
+        self.deferred = {key: event for key, event in self.deferred.items() if key in current}
         if not self.armed:
             self.armed, self.previous = True, current
             return badges, []
         added = [badge for badge in badges if badge["base"] not in self.previous]
         self.previous = current
-        events = []
         for badge in sorted(added, key=lambda item: item["y"], reverse=True):
             self.sequence += 1
-            events.append({**badge, "id": f"{badge['base']}:{self.sequence}", "at": time.monotonic()})
+            self.deferred[badge["base"]] = {"id": f"{badge['base']}:{self.sequence}",
+                                            "at": time.monotonic()}
+        events = []
+        for badge in badges:
+            base = badge["base"]
+            if base in self.deferred and base not in self.names and self.read_name:
+                name = self.read_name(full, area, badge)
+                if name:
+                    self.names[base] = name
+            badge["name"] = self.names.get(base, "")
+            # 名称暂未识别时保留事件，等下一次稳定画面再读，绝不盲点未知会话。
+            if base in self.deferred and (badge["name"] or self.read_name is None):
+                events.append({**badge, **self.deferred.pop(base)})
         return badges, events
 
 

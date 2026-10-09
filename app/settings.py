@@ -22,6 +22,7 @@ _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
 _AUTO_REPLY_SEND_KEYS = ("enter", "ctrl_enter")
+WECHAT_IGNORED_CHATS = ("公众号", "订阅号", "服务号")
 
 
 def _read(name: str, default=None):
@@ -91,6 +92,24 @@ def debug_view() -> bool:
 
 def auto_switch() -> bool:
     return bool(_read("auto_switch", False))
+
+def normalize_chat_title(title: str) -> str:
+    return " ".join(title.split())
+
+def ignored_chats(app_key: str | None = None) -> list[str]:
+    configs = _read("ignored_chats", {})
+    values = configs.get((app_key or "wechat").strip().lower(), []) if isinstance(configs, dict) else []
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(normalize_chat_title(value) for value in values
+                              if isinstance(value, str) and value.strip()))
+
+def is_ignored_chat(title: str, app_key: str | None = None) -> bool:
+    """只匹配完整会话名；内置微信入口容忍 OCR 字间空白，不做相似度或子串匹配。"""
+    app_key = (app_key or "wechat").strip().lower()
+    name = normalize_chat_title(title)
+    return (app_key == "wechat" and name.replace(" ", "") in WECHAT_IGNORED_CHATS
+            or name in ignored_chats(app_key))
 
 def _auto_reply_key(title: str, app_key: str | None = None) -> str:
     return f"{(app_key or 'wechat').strip().lower()}:{title.strip()}"
@@ -198,7 +217,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
-         auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None) -> None:
+         auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None,
+         ignored_chats_value: list[str] | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -215,6 +235,11 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
     keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
     flag = lambda new, now: now() if new is None else bool(new)
+    ignored = _read("ignored_chats", {})
+    ignored = dict(ignored) if isinstance(ignored, dict) else {}
+    if ignored_chats_value is not None:
+        ignored["wechat"] = list(dict.fromkeys(normalize_chat_title(value) for value in ignored_chats_value
+                                              if isinstance(value, str) and value.strip()))
     # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
     # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
     data = {
@@ -229,6 +254,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
         "auto_switch": flag(auto_switch_on, auto_switch),
+        "ignored_chats": ignored,
         "auto_reply_chats": (_read("auto_reply_chats", {}) if auto_reply_chats_value is None
                               else auto_reply_chats_value),
     }

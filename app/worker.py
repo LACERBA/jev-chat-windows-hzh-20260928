@@ -8,9 +8,9 @@ import traceback
 
 import numpy as np
 
-from app import chatapps
+from app import chatapps, settings
 from app.capture import Capture, UnreadTracker, chat_area, unminimize
-from app.ocr import Reader, read_title, similar
+from app.ocr import Reader, read_session_name, read_title, similar
 
 
 def _err(q):
@@ -41,7 +41,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
     cap = None
     readers = {}  # {会话名: Reader}，一个会话一套去重状态
     title, raw_title, head = "", "", None  # 当前会话名 / 上一帧的头部像素
-    unread_tracker = UnreadTracker()
+    unread_tracker = UnreadTracker(read_name=lambda full, area, badge: read_session_name(full, area, badge, app))
     last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
     last_chat = None
     warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
@@ -81,7 +81,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                     if rect != last_area:
                         q.put(("area", rect))
                         last_area, last_chat = rect, None
-                        unread_tracker = UnreadTracker()
+                        unread_tracker = UnreadTracker(read_name=lambda full, area, badge: read_session_name(full, area, badge, app))
                     if app.key == "wechat":
                         unread, events = unread_tracker.update(full, area)
                         q.put(("unread_state", unread))
@@ -92,7 +92,8 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                         head = crop
                         raw_name = read_title(crop, app)
                         # OCR 抖一下（「小分队」↔「小分认」）不能分裂出一个新会话
-                        name = next((k for k in readers if similar(k, raw_name)), raw_name) if raw_name else ""
+                        name = (raw_name if settings.is_ignored_chat(raw_name, app.key)
+                                else next((k for k in readers if similar(k, raw_name)), raw_name)) if raw_name else ""
                         # ponytail: 认不出就沿用上次；开头就认不出给个占位名，总比把消息全丢了强
                         name = name or title or "当前会话"
                         next_raw = raw_name or raw_title or name
@@ -100,6 +101,11 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                             title, raw_title = name, next_raw
                             last_chat = None
                             q.put(("chat", title, raw_title))
+                    if (settings.is_ignored_chat(raw_title, app.key)
+                            or settings.is_ignored_chat(title, app.key)):
+                        if debug_on.is_set():
+                            q.put(("debug", _packet(full, area, title, reader, lines, unread)))
+                        continue
                     initial = title not in readers
                     reader = readers.setdefault(title, Reader(app))
                     chat_pixels = full[y0:y1, x0:x1]

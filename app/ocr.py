@@ -47,6 +47,28 @@ def read_title(header, app: ChatApp = DEFAULT):
     return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text.strip())
 
 
+def read_session_name(full, area, badge, app: ChatApp = DEFAULT):
+    """只读新未读所在行的名称；低置信度或被省略的名称不用于自动点击。"""
+    left, top, right, bottom = badge["box"]
+    height = max(12, bottom - top)
+    crop = full[max(area[5], top - height // 2):min(full.shape[0], bottom + height),
+                right + 1:area[0] - 8]
+    if crop.shape[0] < 8 or crop.shape[1] < 20:
+        return ""
+    res, _ = _engine(app)(crop, use_cls=False)
+    res = [item for item in res or [] if item[0][0][0] < crop.shape[1] * 0.7]
+    if not res:
+        return ""
+    first = min(res, key=lambda item: item[0][0][1])
+    row = first[0][2][1]
+    box, text, confidence = min((item for item in res if item[0][0][1] < row),
+                                key=lambda item: item[0][0][0])
+    text = text.strip()
+    if confidence < 0.8 or not text or "…" in text or "..." in text:
+        return ""
+    return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text)
+
+
 def who_said(chat, box, app: ChatApp = DEFAULT):
     """按 OCR 框里的颜色分类，不看 x 坐标。返回 (谁, 底色, 墨高)：
     先看底色平不平：框里众数颜色占比 <45% 就是图片（头像/照片/表情包）里的字 → None 丢掉。

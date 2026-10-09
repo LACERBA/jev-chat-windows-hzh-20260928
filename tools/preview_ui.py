@@ -119,13 +119,15 @@ def main() -> int:
                      "draft_base_url": "", "reply_target": True,
                      "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
                      "check_update": True, "debug_view": args.state == "debug",
+                     "auto_switch": False, "ignored_chats": {"wechat": []},
                      "auto_reply_chats": {}}
 
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
                            llm_key_text=None, draft_model_text=None, draft_base_url_text=None,
                            reply_target_on=None, style_text=None, thinking_on=None,
-                           check_update_on=None, debug_view_on=None):
+                           check_update_on=None, debug_view_on=None, auto_switch_on=None,
+                           ignored_chats_value=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
@@ -139,9 +141,13 @@ def main() -> int:
             if key:
                 demo_settings[name] = key
         for name, value in (("reply_target", reply_target_on), ("thinking", thinking_on),
-                            ("check_update", check_update_on), ("debug_view", debug_view_on)):
+                            ("check_update", check_update_on), ("debug_view", debug_view_on),
+                            ("auto_switch", auto_switch_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
+        if ignored_chats_value is not None:
+            demo_settings["ignored_chats"]["wechat"] = [value.strip() for value in ignored_chats_value
+                                                       if value.strip()]
 
     def demo_auto_reply_config(title, app_key=None):
         key = f"{app_key or 'wechat'}:{title}"
@@ -172,6 +178,7 @@ def main() -> int:
     with patch("core.jev_client.list_models", fake_jev_models), patch(
             "core.llm.list_models", fake_llm_models), patch.multiple(
         settings,
+        _read=lambda name, default=None: demo_settings.get(name, default),
         has_key=lambda: bool(demo_settings["jev_key"]),
         has_jev_key=lambda: bool(demo_settings["jev_key"]),
         has_llm_key=lambda: bool(demo_settings["llm_key"]),

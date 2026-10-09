@@ -570,6 +570,18 @@ class Overlay:
         box.addWidget(self._hint(
             "检测到运行期间的新未读后串行切换；未开启自动回复的会话不会调用模型。"
         ))
+        ignored_label = _label("忽略微信会话（可选，每行一个完整名称）", 13)
+        box.addWidget(ignored_label)
+        self.ignoredChatsEdit = PlainTextEdit()
+        self.ignoredChatsEdit.setFixedHeight(88)
+        self.ignoredChatsEdit.setPlaceholderText("例如：某银行服务号\n营销通知群\n文件传输助手")
+        self.ignoredChatsEdit.setAccessibleName("忽略微信会话，每行一个完整名称")
+        ignored_label.setBuddy(self.ignoredChatsEdit)
+        box.addWidget(self.ignoredChatsEdit)
+        box.addWidget(self._hint(
+            "公众号、订阅号、服务号入口默认忽略。名单中的会话不自动切换、不生成建议、不自动发送；"
+            "只匹配完整名称，不影响你在微信里手动浏览。"
+        ))
         update_row = QHBoxLayout()
         update_row.addWidget(_label("启动时检查更新", 13), 1)
         self.updateSwitch = SwitchButton()
@@ -811,6 +823,7 @@ class Overlay:
         self.baseEdit.setText(settings.draft_base_url())
         self.thinkingSwitch.setChecked(settings.thinking())
         self.autoSwitch.setChecked(settings.auto_switch())
+        self.ignoredChatsEdit.setPlainText("\n".join(settings.ignored_chats("wechat")))
         self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
@@ -853,15 +866,22 @@ class Overlay:
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
                           check_update_on=self.updateSwitch.isChecked(),
-                          auto_switch_on=self.autoSwitch.isChecked())
+                          auto_switch_on=self.autoSwitch.isChecked(),
+                          ignored_chats_value=self.ignoredChatsEdit.toPlainText().splitlines())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
         self._load_settings()
+        self._render_auto_reply()
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
+        ignored = settings.is_ignored_chat(self._shown, self.app_key_of())
+        if ignored:
+            self.show_cached(None)
+            self.set_busy(False)
+            self.set_status("当前会话已忽略，不参与自动处理", "idle")
         self._settings_feedback("设置已保存，将用于下一次回复。")
         self.setupButton.hide()
-        if not self.cands and not self._busy:
+        if not ignored and not self.cands and not self._busy:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
 
@@ -974,6 +994,11 @@ class Overlay:
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""
+        if settings.is_ignored_chat(self._shown, self.app_key_of()):
+            self.emptyTitle.setText("当前会话已忽略")
+            self.emptyHint.setText("不自动切换、不生成回复建议、不自动发送。\n你仍可以在微信中手动浏览。")
+            self.setupButton.hide()
+            return
         configured = settings.has_key()
         self.emptyTitle.setText("等待对方的新消息" if configured else "先设置，再开始")
         self.emptyHint.setText("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
@@ -1048,7 +1073,8 @@ class Overlay:
     def _render_auto_reply(self):
         app_key = self.app_key_of()
         config = settings.auto_reply_config(self._shown, app_key)
-        enabled = bool(self._shown) and app_key == "wechat"
+        ignored = settings.is_ignored_chat(self._shown, app_key)
+        enabled = bool(self._shown) and app_key == "wechat" and not ignored
         self.autoReplySwitch.blockSignals(True)
         self.autoReplySwitch.setChecked(config["enabled"] if enabled else False)
         self.autoReplySwitch.blockSignals(False)
@@ -1057,18 +1083,21 @@ class Overlay:
         self.autoKeyBox.blockSignals(False)
         self.autoReplySwitch.setEnabled(enabled)
         self.autoKeyBox.setEnabled(enabled)
-        tooltip = ("只对当前显示的会话生效；开启后最佳回复会覆盖输入框并直接发送"
+        tooltip = ("当前会话已忽略，不参与自动处理" if ignored
+                   else "只对当前显示的会话生效；开启后最佳回复会覆盖输入框并直接发送"
                    if app_key == "wechat" else "当前聊天软件暂未开放自动发送，请先使用手动填入")
         self.autoReplySwitch.setToolTip(tooltip)
         self.autoKeyBox.setToolTip("必须和微信中的发送快捷键设置一致；选出最佳回复后会自动发送"
-                                   if app_key == "wechat" else tooltip)
+                                   if app_key == "wechat" and not ignored else tooltip)
 
     def _auto_reply_toggled(self, on):
         title = self._shown
         app_key = self.app_key_of()
-        if not title or app_key != "wechat":
+        if not title or app_key != "wechat" or settings.is_ignored_chat(title, app_key):
             self._render_auto_reply()
-            if title and app_key != "wechat":
+            if settings.is_ignored_chat(title, app_key):
+                self.set_status("当前会话已忽略，不参与自动处理", "idle")
+            elif title and app_key != "wechat":
                 self.set_status("当前聊天软件暂未开放自动发送，请先使用手动填入", "warning")
             return
         config = settings.auto_reply_config(title, app_key)
@@ -1095,7 +1124,7 @@ class Overlay:
 
     def _auto_key_changed(self, _):
         app_key = self.app_key_of()
-        if not self._shown or app_key != "wechat":
+        if not self._shown or app_key != "wechat" or settings.is_ignored_chat(self._shown, app_key):
             return
         try:
             settings.set_auto_reply(self._shown, self.autoReplySwitch.isChecked(),
@@ -1194,7 +1223,8 @@ class Overlay:
     def show_cached(self, result):
         """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——
         微信当前开着的不是它，填进去就串会话了。"""
-        if result:
+        ignored = settings.is_ignored_chat(self._shown, self.app_key_of())
+        if result and not ignored:
             self.show(result)
         else:
             self.cands = []
@@ -1204,12 +1234,20 @@ class Overlay:
             self.empty.show()
             self.updated.setText("")
             self._empty_text()
-        if self._shown != self._chat:
+        if ignored:
+            self.context.hide()
+            self.targetRow.hide()
+            self.set_status("当前会话已忽略，不参与自动处理", "idle")
+        elif self._shown != self._chat:
             self.invalidate_replies()
             self.set_status(f"正在浏览「{self._shown}」，只看不填；切回这个会话才能用。")
 
     def show(self, result):
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""
+        if settings.is_ignored_chat(self._shown, self.app_key_of()):
+            self.show_cached(None)
+            self.set_busy(False)
+            return
         self.cands = result["candidates"]
         self.set_busy(False)
         self._current = bool(self.cands)

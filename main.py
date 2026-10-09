@@ -36,6 +36,12 @@ _AUTO_REPLY_ECHO_WINDOW = 12.0
 _AUTO_REPLY_SEND_DELAY_MS = 1200
 
 
+def chat_is_ignored(title, raw_title=""):
+    app_key = state.get("app", "wechat")
+    return (settings.is_ignored_chat(title, app_key)
+            or settings.is_ignored_chat(raw_title, app_key))
+
+
 class ConversationController:
     def __init__(self):
         self.phase = "listening"
@@ -63,6 +69,9 @@ class ConversationController:
     def on_unread(self, event):
         if not self.mode_enabled() or event["id"] in self.processed_set:
             return
+        if not event.get("name") or chat_is_ignored(event["name"]):
+            self._remember(event["id"])
+            return
         if self.active and self.active.get("id") == event["id"]:
             return
         self.pending[event["id"]] = event
@@ -71,6 +80,10 @@ class ConversationController:
             self.pending.pop(oldest, None)
 
     def on_chat(self, title, raw_title):
+        if chat_is_ignored(title, raw_title):
+            if self.active:
+                self.release("当前会话已忽略，继续监听其他新消息", "idle")
+            return
         if self.phase == "switching" and self.active:
             if title == self.active["previous_title"] and raw_title == self.active["previous_raw"]:
                 return
@@ -82,6 +95,8 @@ class ConversationController:
                 self.release("会话被手动切换，本次自动处理已取消", "warning")
 
     def route_lines(self, title, raw_title, revision, initial, latest_who):
+        if chat_is_ignored(title, raw_title):
+            return "skip"
         if self.phase == "waiting_lines" and self._matches(title, raw_title):
             if not self.active["authorized"]:
                 self.release(f"「{raw_title}」未开启自动回复，已跳过分析", "idle")
@@ -106,10 +121,10 @@ class ConversationController:
             return "skip"
         if self.phase != "listening" or not settings.auto_switch() or state.get("app") != "wechat":
             return "normal"
-        if initial:
-            return "normal"
         if not settings.auto_reply_config(raw_title, "wechat")["enabled"]:
             return "skip"
+        if initial:
+            return "normal"
         self.active = {"id": f"current:{raw_title}:{revision}", "title": title, "raw": raw_title,
                        "authorized": True, "revision": revision}
         self.phase = "analyzing"
@@ -160,6 +175,7 @@ class ConversationController:
             self.pending_current = None
             if (title == state["chat"] and raw_title == state["raw_chat"]
                     and revision == chat_of(title)["rev"]
+                    and not chat_is_ignored(title, raw_title)
                     and settings.auto_reply_config(raw_title, "wechat")["enabled"]):
                 self.active = {"id": f"current:{raw_title}:{revision}", "title": title,
                                "raw": raw_title, "authorized": True, "revision": revision}
@@ -167,7 +183,16 @@ class ConversationController:
                 if not start_analyze(title, list(chat_of(title)["history"])):
                     self.release("模型尚未配置，已跳过自动分析", "warning")
                 return
-        candidates = [event for event in self.pending.values() if event["base"] in self.badges]
+        candidates = []
+        for event_id, event in list(self.pending.items()):
+            target = self.badges.get(event["base"])
+            name = target.get("name", "") if target else ""
+            if (not name or chat_is_ignored(name) or chat_is_ignored(event.get("name", ""))
+                    or settings.normalize_chat_title(name) != settings.normalize_chat_title(event.get("name", ""))):
+                self.pending.pop(event_id, None)
+                self._remember(event_id)
+                continue
+            candidates.append(event)
         if not candidates:
             return
         event = max(candidates, key=lambda item: (item["at"], item["id"]))
@@ -218,6 +243,10 @@ class ConversationController:
                 or self.active["base"] in self.badges):
             return
         title, raw_title = self.active.pop("candidate_title"), self.active.pop("candidate_raw")
+        if (chat_is_ignored(title, raw_title)
+                or settings.normalize_chat_title(raw_title) != settings.normalize_chat_title(self.active["name"])):
+            self.release("切换后的会话与目标不符，已跳过自动处理", "warning")
+            return
         self.active.update(title=title, raw=raw_title,
                            authorized=settings.auto_reply_config(raw_title, "wechat")["enabled"])
         if not self.active["authorized"]:
@@ -275,6 +304,8 @@ def fill_reply(text):
 
 
 def auto_send_reply(title, result, revision, announce=True):
+    if chat_is_ignored(title, state.get("raw_chat", "")):
+        return False
     if state.get("app") != "wechat":
         return False
     config = settings.auto_reply_config(title, state.get("app"))
@@ -410,6 +441,12 @@ def check_update_bg():
 
 
 def start_analyze(title, msgs):
+    raw_title = state.get("raw_chat", "") if title == state.get("chat") else ""
+    if chat_is_ignored(title, raw_title):
+        ov.invalidate_replies()
+        ov.set_busy(False)
+        ov.set_status("当前会话已忽略，不参与自动处理", "idle")
+        return False
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
         return False
@@ -461,6 +498,11 @@ def drain():
             state["raw_chat"] = msg[2] if len(msg) > 2 else msg[1]
             ov.set_chat(msg[1])
             conversation_controller.on_chat(state["chat"], state["raw_chat"])
+            if chat_is_ignored(state["chat"], state["raw_chat"]):
+                state["rerun"] = None
+                ov.show_cached(None)
+                ov.set_busy(False)
+                ov.set_status("当前会话已忽略，不参与自动处理", "idle")
             continue
         if kind == "debug":  # 调试视图的一帧；窗口不在就直接丢掉
             if dbg is not None:
@@ -495,6 +537,12 @@ def drain():
         state["area"] = area
         initial = bool(meta and meta[0])
         raw_title = meta[1] if len(meta) > 1 and meta[1] else state.get("raw_chat") or title
+        if chat_is_ignored(title, raw_title):
+            conversation_controller.on_chat(title, raw_title)
+            if title == ov.current_chat():
+                ov.invalidate_replies()
+                ov.set_status("当前会话已忽略，不参与自动处理", "idle")
+            continue
         chat = chat_of(title)
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
         if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
@@ -551,6 +599,11 @@ def tick():
                 (t, msgs), state["rerun"] = state["rerun"], None
                 if not start_analyze(t, msgs):
                     conversation_controller.result_abandoned(t)
+                continue
+            raw_title = state.get("raw_chat", "") if title == state.get("chat") else ""
+            if chat_is_ignored(title, raw_title):
+                ov.set_busy(False)
+                conversation_controller.on_chat(title, raw_title)
                 continue
             if revision != chat_of(title)["rev"]:  # 这个会话后来又说话了，这份结果过期了
                 ov.set_busy(False)
