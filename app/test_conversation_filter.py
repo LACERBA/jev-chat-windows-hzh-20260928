@@ -70,25 +70,50 @@ class ConversationFilterTests(unittest.TestCase):
         import time
 
         now = time.monotonic()
-        for base, name, at in (("normal", "月仔", now), ("public", "公众号", now + 1)):
+        for base, name, at in (("normal", "其他人", now), ("public", "公众号", now + 1)):
             event = {"base": base, "id": base + ":1", "name": name, "at": at}
             self.controller.pending[event["id"]] = event
             self.controller.badges[base] = {**event, "x": 120, "y": 90}
         with patch.object(main, "click") as click:
             self.controller.advance()
         click.assert_called_once_with(1, 120, 90)
-        self.assertEqual(self.controller.active["name"], "月仔")
+        self.assertEqual(self.controller.active["name"], "其他人")
         self.assertNotIn("public:1", self.controller.pending)
 
+    def test_unread_for_current_chat_does_not_click_or_enter_switching_phase(self):
+        event = {"base": "current", "id": "current:1", "name": "月仔", "at": 1}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"current": {**event, "x": 120, "y": 90}}
+        with patch.object(main, "click") as click:
+            self.controller.advance()
+        click.assert_not_called()
+        self.assertNotIn(event["id"], self.controller.pending)
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertEqual(self.controller.processed[-1], event["id"])
+
+    def test_current_chat_unread_is_skipped_before_choosing_other_pending_chat(self):
+        current = {"base": "current", "id": "current:1", "name": "月仔", "at": 2}
+        other = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.pending = {current["id"]: current, other["id"]: other}
+        self.controller.badges = {
+            "current": {**current, "x": 120, "y": 90},
+            "other": {**other, "x": 120, "y": 180},
+        }
+        with patch.object(main, "click") as click:
+            self.controller.advance()
+        click.assert_called_once_with(1, 120, 180)
+        self.assertNotIn(current["id"], self.controller.pending)
+        self.assertEqual(self.controller.active["name"], "其他人")
+
     def test_same_snapshot_prioritizes_top_conversation_not_hash_order(self):
-        for base, name, y in (("a-friend", "月仔", 100), ("z-other", "其他人", 300)):
+        for base, name, y in (("a-friend", "阿梅", 100), ("z-other", "其他人", 300)):
             event = {"base": base, "id": base + ":1", "name": name, "at": 1}
             self.controller.pending[event["id"]] = event
             self.controller.badges[base] = {**event, "x": 120, "y": y}
         with patch.object(main, "click") as click:
             self.controller.advance()
         click.assert_called_once_with(1, 120, 100)
-        self.assertEqual(self.controller.active["name"], "月仔")
+        self.assertEqual(self.controller.active["name"], "阿梅")
 
     def test_unknown_or_changed_target_is_not_clicked(self):
         for name in ("", "银行通知"):

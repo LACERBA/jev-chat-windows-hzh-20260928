@@ -207,9 +207,18 @@ class ConversationController:
                     self.release("模型尚未配置，已跳过自动分析", "warning")
                 return
         candidates = []
+        skipped_current = False
+        current_names = {settings.normalize_chat_title(value) for value in
+                         (state.get("chat", ""), state.get("raw_chat", "")) if value}
         for event_id, event in list(self.pending.items()):
             target = self.badges.get(event["base"])
             name = target.get("name", "") if target else ""
+            if name and settings.normalize_chat_title(name) in current_names:
+                self.pending.pop(event_id, None)
+                self._remember(event_id)
+                skipped_current = True
+                switch_debug("current_chat_unread_skipped", name=name, event_id=event_id)
+                continue
             if (not name or chat_is_ignored(name) or chat_is_ignored(event.get("name", ""))
                     or settings.normalize_chat_title(name) != settings.normalize_chat_title(event.get("name", ""))):
                 self.pending.pop(event_id, None)
@@ -217,6 +226,8 @@ class ConversationController:
                 continue
             candidates.append(event)
         if not candidates:
+            if skipped_current:
+                ov.set_status("新消息已在当前会话，无需切换", "idle")
             return
         event = max(candidates, key=lambda item: (item["at"], -self.badges[item["base"]]["y"], item["id"]))
         self.pending.pop(event["id"], None)
