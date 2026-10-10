@@ -83,10 +83,11 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                 _add_usage(usage, first.get("usage"))
                 warnings.append("Jev 暂时不可用，本次已使用通用判断模型")
             except JevError as fallback_error:
-                generic_available = False
                 if fallback_error.status in _CONFIG_STATUSES:
                     raise
-                warnings.append("判断服务暂时不可用，本次仅生成手动候选")
+                warnings.append("通用判断未成功，继续尝试从候选中直接选择")
+        elif judge_mode == "llm_only" and _can_fallback(error):
+            warnings.append("通用判断未成功，继续尝试从候选中直接选择")
         else:
             generic_available = False
             warnings.append("判断服务暂时不可用，本次仅生成手动候选")
@@ -100,6 +101,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 
     ranking_valid = len(candidates) == 1 and bool(judge_backend)
     ranking_backend = judge_backend if ranking_valid else ""
+    final_selector_attempted = False
     if len(candidates) >= 2 and judge_backend:
         rank_question = build_rank_question(candidates)
         ranked = None
@@ -117,6 +119,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                 ranking_backend = "jev"
         except JevError as error:
             if use_generic:
+                final_selector_attempted = True
                 try:
                     ranked = final_select(candidates)
                     ranking_backend = "llm"
@@ -130,6 +133,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                     ranking_backend = "llm"
                     warnings.append("Jev 排序暂时不可用，本次已使用通用判断模型排序")
                 except JevError:
+                    final_selector_attempted = True
                     try:
                         ranked = final_select(candidates)
                         ranking_backend = "llm"
@@ -144,6 +148,18 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             ranking_valid = True
         elif not warnings or "候选排序不可用，请手动选择；本次不会自动发送" not in warnings:
             warnings.append("候选排序不可用，请手动选择；本次不会自动发送")
+    if (len(candidates) >= 2 and not ranking_valid and not final_selector_attempted
+            and generic_available and judge_mode in ("jev_fallback", "llm_only")):
+        try:
+            ranked = final_select(candidates)
+            answers = {**answers, **ranked["answers"]}
+            _add_usage(usage, ranked.get("usage"))
+            ranking_backend = "llm"
+            ranking_valid = True
+            fallback_used = fallback_used or judge_mode == "jev_fallback"
+            warnings.append("已由通用模型直接从候选中选择最佳回答")
+        except JevError:
+            warnings.append("通用模型未能选出候选；本次不会自动发送")
     if not ranking_valid and "候选排序不可用，请手动选择；本次不会自动发送" not in warnings:
         warnings.append("候选排序不可用，请手动选择；本次不会自动发送")
 

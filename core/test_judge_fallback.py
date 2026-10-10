@@ -104,6 +104,37 @@ class EngineFallbackTests(unittest.TestCase):
         self.assertTrue(result["ranking_valid"])
         self.assertTrue(result["fallback_used"])
 
+    def test_jev_and_strict_llm_judgment_failure_still_uses_final_selector(self):
+        with patch.object(engine, "ask_jev", side_effect=JevError("offline", 529)) as jev, \
+                patch.object(engine, "ask_llm_judge", side_effect=JevError("invalid judgment JSON")) as generic, \
+                patch.object(engine, "select_best", return_value={
+                    "answers": {"best_reply": {"type": "choice", "choice": "reply_b"}},
+                    "usage": {}}) as selector, \
+                patch.object(engine, "draft_candidates", return_value=CANDIDATES):
+            result = self._analyze(judge_mode="jev_fallback")
+        jev.assert_called_once()
+        generic.assert_called_once()
+        selector.assert_called_once_with(
+            engine.build_state([("her", "你好")], "friends", keep=10), CANDIDATES,
+            timeout=30, provider="deepseek", model="deepseek-chat", base_url=None,
+            api_key="judge-key")
+        self.assertEqual(result["best_index"], 1)
+        self.assertTrue(result["ranking_valid"])
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["ranking_backend"], "llm")
+
+    def test_llm_only_strict_judgment_failure_still_uses_final_selector(self):
+        with patch.object(engine, "ask_jev") as jev, \
+                patch.object(engine, "ask_llm_judge", side_effect=JevError("invalid judgment JSON")), \
+                patch.object(engine, "select_best", return_value={
+                    "answers": {"best_reply": {"type": "choice", "choice": "reply_c"}},
+                    "usage": {}}), \
+                patch.object(engine, "draft_candidates", return_value=CANDIDATES):
+            result = self._analyze(judge_mode="llm_only")
+        jev.assert_not_called()
+        self.assertEqual(result["best_index"], 2)
+        self.assertTrue(result["ranking_valid"])
+
     def test_auth_error_is_not_hidden_by_fallback(self):
         with patch.object(engine, "ask_jev", side_effect=JevError("bad key", 401)), \
                 patch.object(engine, "ask_llm_judge") as generic, \
@@ -127,15 +158,20 @@ class EngineFallbackTests(unittest.TestCase):
         self.assertFalse(result["fallback_used"])
         self.assertEqual(result["judge_backend"], "llm")
 
-    def test_both_initial_judges_down_does_not_retry_or_auto_rank(self):
+    def test_both_initial_judges_down_but_final_selector_can_choose(self):
         with patch.object(engine, "ask_jev", side_effect=JevError("offline", 529)) as jev, \
                 patch.object(engine, "ask_llm_judge", side_effect=JevError("offline")) as generic, \
+                patch.object(engine, "select_best", return_value={
+                    "answers": {"best_reply": {"type": "choice", "choice": "reply_a"}},
+                    "usage": {}}) as selector, \
                 patch.object(engine, "draft_candidates", return_value=CANDIDATES):
             result = self._analyze(judge_mode="jev_fallback")
         jev.assert_called_once()
         generic.assert_called_once()
-        self.assertFalse(result["ranking_valid"])
-        self.assertEqual(result["judge_backend"], "")
+        selector.assert_called_once()
+        self.assertEqual(result["best_index"], 0)
+        self.assertTrue(result["ranking_valid"])
+        self.assertTrue(result["fallback_used"])
 
     def test_strict_rank_failure_uses_final_selector(self):
         with patch.object(engine, "ask_jev", side_effect=[
