@@ -38,6 +38,21 @@ class LlmJudgeTests(unittest.TestCase):
             with self.subTest(answers=answers), self.assertRaises(JevError):
                 llm_judge.validate_answers(answers, questions)
 
+    def test_final_selector_accepts_plain_or_json_choice(self):
+        for content, expected in (("reply_b", "reply_b"),
+                                  ('{"choice":"reply_c"}', "reply_c"),
+                                  ("我选择 reply_a", "reply_a")):
+            with self.subTest(content=content), patch.object(llm_judge, "chat", return_value=content):
+                result = llm_judge.select_best({"chat": {}}, CANDIDATES, provider="deepseek",
+                                               model="deepseek-chat", api_key="judge-key")
+            self.assertEqual(result["answers"]["best_reply"]["choice"], expected)
+
+    def test_final_selector_rejects_ambiguous_choice(self):
+        with patch.object(llm_judge, "chat", return_value="reply_a 或 reply_b"):
+            with self.assertRaises(JevError):
+                llm_judge.select_best({"chat": {}}, CANDIDATES, provider="deepseek",
+                                      model="deepseek-chat", api_key="judge-key")
+
     def test_parses_fenced_json_and_uses_judgment_operation(self):
         content = "```json\n" + json.dumps({"answers": JUDGMENT}, ensure_ascii=False) + "\n```"
         with patch.object(llm_judge, "chat", return_value=content) as chat:
@@ -122,10 +137,24 @@ class EngineFallbackTests(unittest.TestCase):
         self.assertFalse(result["ranking_valid"])
         self.assertEqual(result["judge_backend"], "")
 
+    def test_strict_rank_failure_uses_final_selector(self):
+        with patch.object(engine, "ask_jev", side_effect=[
+                    {"answers": JUDGMENT, "usage": {}}, JevError("offline", 529)]), \
+                patch.object(engine, "ask_llm_judge", side_effect=JevError("invalid JSON")), \
+                patch.object(engine, "select_best", return_value={
+                    "answers": {"best_reply": {"type": "choice", "choice": "reply_c"}},
+                    "usage": {}}), \
+                patch.object(engine, "draft_candidates", return_value=CANDIDATES):
+            result = self._analyze(judge_mode="jev_fallback")
+        self.assertTrue(result["ranking_valid"])
+        self.assertEqual(result["best_index"], 2)
+        self.assertEqual(result["ranking_backend"], "llm")
+
     def test_failed_ranking_keeps_manual_candidates_but_blocks_auto_send(self):
         with patch.object(engine, "ask_jev", side_effect=[
                     {"answers": JUDGMENT, "usage": {}}, JevError("offline", 529)]), \
                 patch.object(engine, "ask_llm_judge", side_effect=JevError("offline")), \
+                patch.object(engine, "select_best", side_effect=JevError("offline")), \
                 patch.object(engine, "draft_candidates", return_value=CANDIDATES):
             result = self._analyze(judge_mode="jev_fallback")
         self.assertEqual(result["candidates"], CANDIDATES)

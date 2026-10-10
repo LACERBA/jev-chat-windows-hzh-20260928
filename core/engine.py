@@ -8,12 +8,12 @@ from __future__ import annotations
 try:
     from .draft import draft_candidates
     from .jev_client import JevError, ask as ask_jev
-    from .llm_judge import ask as ask_llm_judge, validate_answers
+    from .llm_judge import ask as ask_llm_judge, select_best, validate_answers
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
     from draft import draft_candidates
     from jev_client import JevError, ask as ask_jev
-    from llm_judge import ask as ask_llm_judge, validate_answers
+    from llm_judge import ask as ask_llm_judge, select_best, validate_answers
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
@@ -52,6 +52,11 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         return ask_llm_judge(state, questions, timeout=timeout, provider=llm_judge_provider,
                              model=llm_judge_model, base_url=llm_judge_base_url,
                              api_key=llm_judge_api_key)
+
+    def final_select(candidates):
+        return select_best(state, candidates, timeout=timeout, provider=llm_judge_provider,
+                           model=llm_judge_model, base_url=llm_judge_base_url,
+                           api_key=llm_judge_api_key)
 
     try:
         if judge_mode == "llm_only":
@@ -111,14 +116,26 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                 ranked["answers"] = validate_answers(ranked.get("answers"), rank_question)
                 ranking_backend = "jev"
         except JevError as error:
-            if (judge_mode == "jev_fallback" and not use_generic and _can_fallback(error)):
+            if use_generic:
+                try:
+                    ranked = final_select(candidates)
+                    ranking_backend = "llm"
+                    warnings.append("严格排序不可用，通用模型已完成最终候选选择")
+                except JevError:
+                    ranked = None
+            elif judge_mode == "jev_fallback" and _can_fallback(error):
                 fallback_used = True
                 try:
                     ranked = generic(rank_question)
                     ranking_backend = "llm"
                     warnings.append("Jev 排序暂时不可用，本次已使用通用判断模型排序")
                 except JevError:
-                    ranked = None
+                    try:
+                        ranked = final_select(candidates)
+                        ranking_backend = "llm"
+                        warnings.append("Jev 排序暂时不可用，通用模型已完成最终候选选择")
+                    except JevError:
+                        ranked = None
             if ranked is None:
                 warnings.append("候选排序不可用，请手动选择；本次不会自动发送")
         if ranked:
