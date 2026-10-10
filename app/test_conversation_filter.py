@@ -160,6 +160,23 @@ class ConversationFilterTests(unittest.TestCase):
                          {"wechat": ["营销群", "Ann a"], "kakaotalk": ["通知"]})
         self.assertEqual(self.config["ignored_chats"]["wechat"], ["银行通知", "营销群"])
 
+    def test_each_timeout_names_the_stage_that_stalled(self):
+        phases = {
+            "switching": "微信会话切换确认超时，继续监听新消息",
+            "waiting_lines": "切换后的会话尚未读到新消息，继续监听",
+            "waiting_send": "等待自动回复执行超时，继续监听新消息",
+            "verifying": "发送状态未确认，已停止重试",
+        }
+        for phase, expected in phases.items():
+            with self.subTest(phase=phase):
+                self.controller.phase = phase
+                self.controller.active = {"id": phase, "title": "月仔", "name": "月仔"}
+                self.controller.deadline = 1
+                with patch.object(main.time, "monotonic", return_value=2):
+                    self.controller.tick()
+                self.overlay.set_status.assert_called_with(expected, "warning")
+                self.assertEqual(self.controller.phase, "listening")
+
     def test_switch_confirmation_rejects_wrong_chat(self):
         self.controller.phase = "switching"
         self.controller.active = {"id": "normal:1", "base": "normal", "name": "月仔",
@@ -176,6 +193,84 @@ class ConversationFilterTests(unittest.TestCase):
         self.controller._confirm_switch()
         self.assertEqual(self.controller.phase, "waiting_lines")
         self.assertEqual(self.controller.route_lines("月仔", "月仔", 1, True, "her"), "analyze_fresh")
+
+    def test_message_arriving_before_switch_confirmation_is_replayed_once(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.state.update(chat="月仔", raw_chat="月仔")
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "previous_title": "群聊", "previous_raw": "群聊"}
+        self.controller.badges = {"person": {"name": "月仔"}}
+        with patch.object(main, "start_analyze", return_value=True) as analyze:
+            self.controller.on_chat("月仔", "月仔")
+            self.assertEqual(self.controller.route_lines("月仔", "月仔", 1, True, "her"), "skip")
+            chat = main.chat_of("月仔")
+            chat["history"].append(("her", "刚发来的消息", None))
+            chat["rev"] = 1
+            self.controller.on_unread_state([])
+        analyze.assert_called_once_with("月仔", [("her", "刚发来的消息", None)])
+        self.assertEqual(self.controller.phase, "analyzing")
+        self.assertEqual(self.controller.active["revision"], 1)
+        self.assertNotIn("early_lines", self.controller.active)
+
+    def test_drain_replays_buffered_message_once_after_target_confirmation(self):
+        import queue as queue_module
+
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.state.update(chat="群聊", raw_chat="群聊")
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "previous_title": "群聊", "previous_raw": "群聊"}
+        messages = [
+            ("unread_state", [{"base": "person", "name": "月仔", "x": 120, "y": 90}]),
+            ("chat", "月仔", "月仔"),
+            ("lines", "月仔", [("her", None, "刚发来的消息")], self.state["area"], True, "月仔"),
+            ("unread_state", []),
+            queue_module.Empty,
+        ]
+        q = Mock()
+        q.get_nowait.side_effect = messages
+        with patch.object(main, "q", q, create=True), \
+                patch.object(main, "start_analyze", return_value=True) as analyze:
+            main.drain()
+        analyze.assert_called_once_with("月仔", [("her", "刚发来的消息", None)])
+        self.assertEqual(self.controller.phase, "analyzing")
+        self.assertEqual(main.chat_of("月仔")["auto_blocked_rev"], -1)
+
+    def test_buffered_message_is_discarded_after_newer_reply(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.state.update(chat="月仔", raw_chat="月仔")
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "previous_title": "群聊", "previous_raw": "群聊"}
+        self.controller.badges = {"person": {"name": "月仔"}}
+        self.controller.on_chat("月仔", "月仔")
+        self.controller.route_lines("月仔", "月仔", 1, True, "her")
+        chat = main.chat_of("月仔")
+        chat["history"].extend([("her", "新问题", None), ("me", "已回复", None)])
+        chat["rev"] = 2
+        with patch.object(main, "start_analyze") as analyze:
+            self.controller.on_unread_state([])
+        analyze.assert_not_called()
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertIsNone(self.controller.active)
+
+    def test_early_message_from_wrong_session_is_not_replayed(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.state.update(chat="月仔", raw_chat="月仔")
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "previous_title": "群聊", "previous_raw": "群聊"}
+        self.controller.badges = {"person": {"name": "月仔"}}
+        with patch.object(main, "start_analyze", return_value=True) as analyze:
+            self.controller.route_lines("另一个会话", "另一个会话", 1, False, "her")
+            chat = main.chat_of("月仔")
+            chat["history"].append(("her", "其他会话的消息", None))
+            chat["rev"] = 1
+            self.controller.on_chat("月仔", "月仔")
+            self.controller.on_unread_state([])
+        analyze.assert_not_called()
+        self.assertEqual(self.controller.phase, "waiting_lines")
 
     def test_ignored_lines_are_not_stored_or_analyzed(self):
         queue = Mock()

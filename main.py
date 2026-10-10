@@ -55,6 +55,7 @@ class ConversationController:
         self.send_revision = None
         self.expected_text = ""
         self.pending_current = None
+        self.early_lines = None
 
     def mode_enabled(self):
         return (settings.auto_switch() and state.get("app") == "wechat"
@@ -104,6 +105,12 @@ class ConversationController:
     def route_lines(self, title, raw_title, revision, initial, latest_who):
         if chat_is_ignored(title, raw_title):
             return "skip"
+        if self.phase == "switching":
+            if self._matches_switch_target(title, raw_title):
+                self.early_lines = (title, raw_title, revision, initial, latest_who)
+                switch_debug("lines_buffered", title=title, revision=revision,
+                             initial=initial, latest_who=latest_who)
+            return "skip"
         if self.phase == "waiting_lines" and self._matches(title, raw_title):
             if not self.active["authorized"]:
                 self.release(f"「{raw_title}」未开启自动回复，已跳过分析", "idle")
@@ -124,8 +131,6 @@ class ConversationController:
             if latest_who == "her":
                 self.pending_current = (title, raw_title, revision)
             return "verify"
-        if self.phase == "switching":
-            return "skip"
         if self.phase != "listening" or not settings.auto_switch() or state.get("app") != "wechat":
             return "normal"
         if not settings.auto_reply_config(raw_title, "wechat")["enabled"]:
@@ -223,10 +228,25 @@ class ConversationController:
     def tick(self):
         if self.phase in ("switching", "waiting_lines", "waiting_send", "verifying"):
             if self.deadline and time.monotonic() >= self.deadline:
-                text = ("发送状态未确认，已停止重试" if self.phase == "verifying"
-                        else "自动会话处理超时，继续监听新消息")
+                text = {
+                    "switching": "微信会话切换确认超时，继续监听新消息",
+                    "waiting_lines": "切换后的会话尚未读到新消息，继续监听",
+                    "waiting_send": "等待自动回复执行超时，继续监听新消息",
+                    "verifying": "发送状态未确认，已停止重试",
+                }[self.phase]
+                switch_debug("conversation_timeout", phase=self.phase,
+                             title=self.active.get("title") if self.active else None,
+                             expected=self.active.get("name") if self.active else None)
                 self.release(text, "warning")
         self.advance()
+
+    def buffers_fresh_message(self, title, raw_title, revision):
+        return (self.phase == "switching" and self.active is not None and self.early_lines is not None
+                and self.early_lines[0] == title and self.early_lines[1] == raw_title
+                and self.early_lines[2] == revision and self.early_lines[4] == "her"
+                and title == state["chat"] and raw_title == state["raw_chat"]
+                and revision == chat_of(title)["rev"]
+                and self._matches_switch_target(title, raw_title))
 
     def reset(self):
         self.phase = "listening"
@@ -237,12 +257,14 @@ class ConversationController:
         self.send_revision = None
         self.expected_text = ""
         self.pending_current = None
+        self.early_lines = None
 
     def release(self, text=None, kind="idle"):
         if self.active:
             self._remember(self.active.get("id"))
         self.phase = "listening"
         self.active = None
+        self.early_lines = None
         self.deadline = 0.0
         self.send_revision = None
         self.expected_text = ""
@@ -265,7 +287,33 @@ class ConversationController:
             return
         self.phase = "waiting_lines"
         self.deadline = time.monotonic() + 4.0
+        early = self.early_lines
+        self.early_lines = None
+        if early:
+            early_title, early_raw, revision, _, latest_who = early
+            if (early_title != title or early_raw != raw_title
+                    or state["chat"] != title or state["raw_chat"] != raw_title
+                    or revision != chat_of(title)["rev"]):
+                self.release("切换期间会话或消息已变化，本次自动处理已取消", "warning")
+                return
+            if latest_who != "her":
+                self.release("切换期间你已回复，等待对方的新消息", "idle")
+                return
+            self.phase = "analyzing"
+            self.deadline = 0.0
+            self.active["revision"] = revision
+            switch_debug("replay_buffered_message", title=title, revision=revision)
+            if not start_analyze(title, list(chat_of(title)["history"])):
+                self.release("模型尚未配置，已跳过自动分析", "warning")
+            return
         ov.set_status(f"已切换到「{raw_title}」，正在读取新消息", "busy")
+
+    def _matches_switch_target(self, title, raw_title):
+        if not self.active or not self.active.get("name"):
+            return False
+        expected = settings.normalize_chat_title(self.active["name"])
+        return (settings.normalize_chat_title(raw_title) == expected
+                and not chat_is_ignored(title, raw_title))
 
     def _matches(self, title, raw_title):
         return (self.active is not None and self.active.get("title") == title
@@ -585,7 +633,8 @@ def drain():
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         action = conversation_controller.route_lines(
             title, raw_title, chat["rev"], initial, normalized[-1][0])
-        if initial and action != "analyze_fresh":
+        if (initial and action != "analyze_fresh"
+                and not conversation_controller.buffers_fresh_message(title, raw_title, chat["rev"])):
             chat["auto_blocked_rev"] = chat["rev"]  # 首帧是屏幕旧记录，只展示建议，绝不自动发送
         if conversation_controller.observe(title, normalized):
             state["rerun"] = None
