@@ -4,8 +4,8 @@
 表里只有协议、地址和默认模型，**绝不出现 key**（KICKOFF 硬约束 #6）——
 key 一律由调用方从环境变量/注册表取了再传进来。协议具体怎么调见 core/llm.py。
 
-全程只有两把 key：判断一把 JEV_API_KEY、起草一把 LLM_API_KEY，跟选哪家来源无关，
-换来源就是换同一个槽里的值。
+Jev、独立通用判断、起草分别使用 JEV_API_KEY、JUDGE_API_KEY、LLM_API_KEY；
+通用判断复用起草配置时不会读取第三把 key。
 """
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ OPENROUTER_DECISIONS = "https://openrouter.ai/api/alpha/decisions"
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/auth/key"
 TYPESAFE_BASE = "https://api.typesafe.ai"
 
-JEV_ENV = "JEV_API_KEY"    # 判断那把，不管选 OpenRouter 还是 TypeSafe
-LLM_ENV = "LLM_API_KEY"    # 起草那把，不管选哪家语言模型
+JEV_ENV = "JEV_API_KEY"       # Jev 判断，不管选 OpenRouter 还是 TypeSafe
+JUDGE_ENV = "JUDGE_API_KEY"   # 独立通用判断；复用起草配置时不用
+LLM_ENV = "LLM_API_KEY"       # 起草，不管选哪家语言模型
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
 
@@ -69,8 +70,8 @@ DRAFT_PROVIDERS = {  # 第一个就是默认：DeepSeek 官网直连
 CUSTOM = ("custom_openai", "custom_anthropic")
 # 起草时认思考开关的来源，设置页那句提示照着这里写
 THINKING = ("DeepSeek", "OpenRouter", "Anthropic", "Gemini")
-# 所有可能存 key 的环境变量（新两把 + 两个老名字），脱敏时一次全过一遍（jev_client.redact_secrets）
-ENV_VARS = sorted({JEV_ENV, LLM_ENV, *LEGACY.values()})
+# 所有可能存 key 的环境变量，脱敏时一次全过一遍（jev_client.redact_secrets）
+ENV_VARS = sorted({JEV_ENV, JUDGE_ENV, LLM_ENV, *LEGACY.values()})
 
 
 if __name__ == "__main__":
@@ -93,6 +94,6 @@ if __name__ == "__main__":
     assert go.keep("deepseek-v4.1-flash") and go.keep("glm-5.3") and go.keep("hy3")
     assert not any(go.keep(m) for m in (
         "minimax-m3", "qwen3.8-max", "grok-4.7", "gpt-6-luna", "muse-spark-1.2-contributor"))
-    # 全程只有两把 key，脱敏还得管老名字
-    assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "LLM_API_KEY", "OPENROUTER_API_KEY"]
+    assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "JUDGE_API_KEY", "LLM_API_KEY",
+                        "OPENROUTER_API_KEY"]
     print("providers ok")

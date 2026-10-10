@@ -2,7 +2,7 @@
 """设置持久化。key 硬约束（docs/KICKOFF.md #6）：只进环境变量，绝不落文件；其余设置落 config.json。
 
 key 的持久化走 Windows 用户环境变量（注册表 HKCU\\Environment，跟 setx 写的是同一个地方）。
-全程只有两把：判断 JEV_API_KEY、起草 LLM_API_KEY，跟选哪家来源无关。
+Jev、独立通用判断、起草密钥分别使用 JEV_API_KEY、JUDGE_API_KEY、LLM_API_KEY。
 读的时候先看进程环境，没有就直接读注册表——IDE 启动时把环境快照拿走了，之后再 Run 继承的还是旧环境，
 只靠 os.environ 会「保存了下次打开还是没有」。"""
 from __future__ import annotations
@@ -12,7 +12,8 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
-from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
+from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, JUDGE_ENV,
+                            LEGACY, LLM_ENV)
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,6 +22,8 @@ _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
+_DEFAULT_JUDGE_MODE = "jev_fallback"
+_JUDGE_MODES = ("jev_fallback", "jev_only", "llm_only")
 _AUTO_REPLY_SEND_KEYS = ("enter", "ctrl_enter")
 WECHAT_IGNORED_CHATS = ("公众号", "订阅号", "服务号")
 
@@ -57,6 +60,23 @@ def jev_provider() -> str:
 def jev_model() -> str:
     """判断模型 id；空 = 用该来源的默认模型。"""
     return str(_read("jev_model") or "") or JEV_PROVIDERS[jev_provider()].default
+
+def judge_mode() -> str:
+    value = str(_read("judge_mode") or _DEFAULT_JUDGE_MODE)
+    return value if value in _JUDGE_MODES else _DEFAULT_JUDGE_MODE
+
+def judge_reuse_draft() -> bool:
+    return bool(_read("judge_reuse_draft", True))
+
+def judge_provider() -> str:
+    value = _read("judge_provider")
+    return value if value in DRAFT_PROVIDERS else _DEFAULT_DRAFT
+
+def judge_model() -> str:
+    return str(_read("judge_model") or "") or DRAFT_PROVIDERS[judge_provider()].default
+
+def judge_base_url() -> str:
+    return str(_read("judge_base_url") or "") if judge_provider() in CUSTOM else ""
 
 def draft_provider() -> str:
     """起草走哪家（见 core/providers.DRAFT_PROVIDERS）。老配置里的 openrouter/deepseek 照样认。"""
@@ -167,8 +187,9 @@ def _read_env(env_name: str) -> str:
     return v
 
 def _get_key(env_name: str) -> str:
-    """两把 key 之一。新名字空着就退回老版本按来源存的变量（下次保存会抄进新名字）。"""
-    return _read_env(env_name) or _read_env(LEGACY[env_name])
+    """新名字空着就退回老版本按来源存的变量（下次保存会抄进新的）。"""
+    legacy = LEGACY.get(env_name)
+    return _read_env(env_name) or (_read_env(legacy) if legacy else "")
 
 def _set_key(env_name: str, value: str) -> None:
     """只写进程环境 + HKCU\\Environment，不写任何文件。"""
@@ -201,6 +222,12 @@ def jev_key() -> str:
 def has_jev_key() -> bool:
     return bool(jev_key())
 
+def judge_key() -> str:
+    return _get_key(JUDGE_ENV)
+
+def has_judge_key() -> bool:
+    return bool(judge_key())
+
 def llm_key() -> str:
     """起草那把 key，所有语言模型来源共用。"""
     return _get_key(LLM_ENV)
@@ -208,23 +235,46 @@ def llm_key() -> str:
 def has_llm_key() -> bool:
     return bool(llm_key())
 
-has_key = has_jev_key  # 旧名字：界面上「配没配好」问的就是判断模型这把 key
+def general_judge_config() -> dict:
+    if judge_reuse_draft():
+        return {"provider": draft_provider(), "model": draft_model(),
+                "base_url": draft_base_url(), "api_key": llm_key()}
+    return {"provider": judge_provider(), "model": judge_model(),
+            "base_url": judge_base_url(), "api_key": judge_key()}
+
+def models_ready() -> bool:
+    if not has_llm_key() or not draft_model():
+        return False
+    mode = judge_mode()
+    jev_ready = has_jev_key() and bool(jev_model())
+    generic = general_judge_config()
+    generic_ready = bool(generic["api_key"] and generic["model"])
+    return ((mode == "jev_only" and jev_ready)
+            or (mode == "llm_only" and generic_ready)
+            or (mode == "jev_fallback" and jev_ready and generic_ready))
+
+has_key = models_ready
 
 def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
-         jev_model_text: str | None = None, draft_provider_text: str | None = None,
+         jev_model_text: str | None = None, judge_mode_text: str | None = None,
+         judge_reuse_draft_on: bool | None = None, judge_provider_text: str | None = None,
+         judge_key_text: str | None = None, judge_model_text: str | None = None,
+         judge_base_url_text: str | None = None, draft_provider_text: str | None = None,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None,
          ignored_chats_value: list[str] | None = None) -> None:
-    """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
+    """每个参数为空/None = 保留当前值。密钥只写进程环境 + HKCU\\Environment。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
+    judge = judge_provider_text if judge_provider_text in DRAFT_PROVIDERS else judge_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
     # 没重填就把老变量里的值抄进新名字，迁移一次性做完（_get_key 已经退回读过老的了）
     wrote_key = False
-    for env, typed in ((JEV_ENV, jev_key_text), (LLM_ENV, llm_key_text)):
+    for env, typed in ((JEV_ENV, jev_key_text), (JUDGE_ENV, judge_key_text),
+                       (LLM_ENV, llm_key_text)):
         value = typed or ("" if _read_env(env) else _get_key(env))
         if value:
             _set_key(env, value)
@@ -247,6 +297,10 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "relationship": relationship_text or relationship(), "context": n,
         "style": keep(style_text, "style"),
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
+        "judge_mode": (judge_mode_text if judge_mode_text in _JUDGE_MODES else judge_mode()),
+        "judge_reuse_draft": flag(judge_reuse_draft_on, judge_reuse_draft),
+        "judge_provider": judge, "judge_model": keep(judge_model_text, "judge_model"),
+        "judge_base_url": keep(judge_base_url_text, "judge_base_url"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
         "reply_target": flag(reply_target_on, reply_target),

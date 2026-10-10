@@ -27,7 +27,7 @@ def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
 def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: str,
          user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
          thinking: bool = False, extra_body: dict | None = None,
-         headers: dict | None = None, timeout: float = 30) -> str:
+         headers: dict | None = None, timeout: float = 30, what: str = "起草") -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
@@ -36,16 +36,16 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
     """
     if protocol == "anthropic":
         return _anthropic(base_url, api_key, model, system, user_turns,
-                          temperature, max_tokens, thinking, timeout)
+                          temperature, max_tokens, thinking, timeout, what)
     if protocol == "gemini":
         return _gemini(base_url, api_key, model, system, user_turns,
-                       temperature, max_tokens, thinking, timeout)
+                       temperature, max_tokens, thinking, timeout, what)
     return _openai(base_url, api_key, model, system, user_turns,
-                   temperature, max_tokens, extra_body, headers, timeout)
+                   temperature, max_tokens, extra_body, headers, timeout, what)
 
 
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            extra_body, headers, timeout) -> str:
+            extra_body, headers, timeout, what) -> str:
     import openai
 
     try:
@@ -59,12 +59,12 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
             stream=False,  # DeepSeek 要显式关；别家无所谓
             **({"extra_body": extra_body} if extra_body else {}))
     except Exception as exc:
-        _fail(exc, "起草")
+        _fail(exc, what)
     return resp.choices[0].message.content or ""
 
 
 def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-               thinking, timeout) -> str:
+               thinking, timeout, what) -> str:
     import anthropic
 
     extra = {}
@@ -79,7 +79,7 @@ def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_to
                                          messages=_turns(user_turns), max_tokens=max_tokens,
                                          temperature=temperature, **extra)
     except Exception as exc:
-        _fail(exc, "起草")
+        _fail(exc, what)
     # 开了思考的话前面还有 thinking 块，只取文本块
     return "".join(b.text for b in message.content if getattr(b, "type", "") == "text")
 
@@ -96,7 +96,7 @@ def _gemini_client(base_url, api_key, timeout):
 
 
 def _gemini(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            thinking, timeout) -> str:
+            thinking, timeout, what) -> str:
     try:
         client, types = _gemini_client(base_url, api_key, timeout)
         config = types.GenerateContentConfig(
@@ -107,7 +107,7 @@ def _gemini(base_url, api_key, model, system, user_turns, temperature, max_token
                     for m in _turns(user_turns, assistant="model")]  # Gemini 那边助手叫 model
         resp = client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as exc:
-        _fail(exc, "起草")
+        _fail(exc, what)
     return resp.text or ""
 
 

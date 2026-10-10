@@ -119,6 +119,23 @@ class ConversationFilterTests(unittest.TestCase):
             self.assertFalse(main.auto_send_reply("月仔", {"candidates": ["收到"], "best_index": 0}, 0))
         send.assert_not_called()
 
+    def test_valid_ranking_keeps_existing_auto_send_flow(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        with patch.object(main, "fill_and_send") as send:
+            sent = main.auto_send_reply(
+                "月仔", {"candidates": ["收到"], "best_index": 0,
+                         "ranking_valid": True, "scores": [0.8]}, 0)
+        self.assertTrue(sent)
+        send.assert_called_once()
+
+    def test_invalid_ranking_never_auto_sends(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        with patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply(
+                "月仔", {"candidates": ["收到"], "best_index": 0, "ranking_valid": False}, 0))
+        send.assert_not_called()
+        self.overlay.set_status.assert_called_with("候选未完成有效排序，本次不会自动发送", "warning")
+
     def test_ignored_chat_never_sends_even_if_authorized(self):
         self.state.update(chat="公众号", raw_chat="公众号")
         self.config["auto_reply_chats"] = {"wechat:公众号": {"enabled": True}}
@@ -329,9 +346,10 @@ class OverlayFilterTests(unittest.TestCase):
     def setUp(self):
         self.config = {"ignored_chats": {"wechat": ["营销群"]}, "auto_switch": True}
         for name, value in (("_read", lambda name, default=None: self.config.get(name, default)),
-                            ("has_key", lambda: True), ("has_jev_key", lambda: True),
+                            ("has_key", lambda: True), ("models_ready", lambda: True),
+                            ("has_jev_key", lambda: True), ("has_judge_key", lambda: True),
                             ("has_llm_key", lambda: True), ("jev_key", lambda: "demo-key"),
-                            ("llm_key", lambda: "demo-key")):
+                            ("judge_key", lambda: "demo-key"), ("llm_key", lambda: "demo-key")):
             target = patch.object(settings, name, value)
             target.start()
             self.addCleanup(target.stop)
@@ -349,6 +367,23 @@ class OverlayFilterTests(unittest.TestCase):
         with patch.object(settings, "save") as save:
             self.overlay._save()
         self.assertEqual(save.call_args.kwargs["ignored_chats_value"], ["银行通知", "文件传输助手"])
+
+    def test_judge_strategy_enables_only_relevant_model_groups(self):
+        self.assertTrue(self.overlay.jev.providerBox.isEnabled())
+        self.assertFalse(self.overlay.judge.providerBox.isEnabled())
+        self.overlay.judgeModeBox.setCurrentIndex(2)
+        self.overlay.judgeReuseSwitch.setChecked(False)
+        self.assertFalse(self.overlay.jev.providerBox.isEnabled())
+        self.assertTrue(self.overlay.judge.providerBox.isEnabled())
+        self.assertTrue(self.overlay.draft.providerBox.isEnabled())
+
+    def test_save_includes_judge_strategy(self):
+        self.overlay.judgeModeBox.setCurrentIndex(2)
+        self.overlay.judgeReuseSwitch.setChecked(True)
+        with patch.object(settings, "save") as save:
+            self.overlay._save()
+        self.assertEqual(save.call_args.kwargs["judge_mode_text"], "llm_only")
+        self.assertTrue(save.call_args.kwargs["judge_reuse_draft_on"])
 
     def test_ignored_chat_disables_auto_reply_and_suppresses_cached_result(self):
         self.overlay.set_chat("公众号")

@@ -83,6 +83,8 @@ _RESULT = {
     "best_index": 1,
     "best_reply": "可以呀，周六六点在上次那家见！我也有点馋了 😋",
     "scores": [0.21, 0.66, 0.13],
+    "ranking_valid": True, "judge_backend": "jev", "ranking_backend": "jev",
+    "fallback_used": False, "warnings": [],
     "answers": {
         "literal_question": {"type": "noul", "noul": 0.98},
         "true_intent": {"type": "choice", "choice": "casual_chat"},
@@ -110,20 +112,24 @@ def main() -> int:
     args = parser.parse_args()
     target = Path(args.screenshot).expanduser() if args.screenshot else None
 
-    # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；全程就两把 key，都当「已配置」
+    # 演示里：Jev 优先，通用判断独立配置为 DeepSeek，起草也走 DeepSeek。
     configured = "" if args.state == "setup" else "demo-key"
     demo_settings = {"relationship": "friends", "context": 10,
-                     "jev_key": configured, "llm_key": configured,
+                     "jev_key": configured, "judge_key": configured, "llm_key": configured,
                      "jev_provider": "openrouter", "jev_model": "typesafe/jev-1.13",
-                     "draft_provider": "deepseek", "draft_model": "deepseek-flash",
-                     "draft_base_url": "", "reply_target": True,
+                     "judge_mode": "jev_fallback", "judge_reuse_draft": False,
+                     "judge_provider": "deepseek", "judge_model": "deepseek-flash",
+                     "judge_base_url": "", "draft_provider": "deepseek",
+                     "draft_model": "deepseek-flash", "draft_base_url": "", "reply_target": True,
                      "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
                      "check_update": True, "debug_view": args.state == "debug",
                      "auto_switch": False, "ignored_chats": {"wechat": []},
                      "auto_reply_chats": {}}
 
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
-                           jev_key_text=None, jev_model_text=None, draft_provider_text=None,
+                           jev_key_text=None, jev_model_text=None, judge_mode_text=None,
+                           judge_reuse_draft_on=None, judge_provider_text=None, judge_key_text=None,
+                           judge_model_text=None, judge_base_url_text=None, draft_provider_text=None,
                            llm_key_text=None, draft_model_text=None, draft_base_url_text=None,
                            reply_target_on=None, style_text=None, thinking_on=None,
                            check_update_on=None, debug_view_on=None, auto_switch_on=None,
@@ -133,16 +139,20 @@ def main() -> int:
         if context_n is not None:
             demo_settings["context"] = context_n
         for name, value in (("jev_provider", jev_provider_text), ("jev_model", jev_model_text),
+                            ("judge_mode", judge_mode_text), ("judge_provider", judge_provider_text),
+                            ("judge_model", judge_model_text), ("judge_base_url", judge_base_url_text),
                             ("draft_provider", draft_provider_text), ("draft_model", draft_model_text),
                             ("draft_base_url", draft_base_url_text), ("style", style_text)):
             if value is not None:
                 demo_settings[name] = value
-        for name, key in (("jev_key", jev_key_text), ("llm_key", llm_key_text)):
+        for name, key in (("jev_key", jev_key_text), ("judge_key", judge_key_text),
+                          ("llm_key", llm_key_text)):
             if key:
                 demo_settings[name] = key
         for name, value in (("reply_target", reply_target_on), ("thinking", thinking_on),
                             ("check_update", check_update_on), ("debug_view", debug_view_on),
-                            ("auto_switch", auto_switch_on)):
+                            ("auto_switch", auto_switch_on),
+                            ("judge_reuse_draft", judge_reuse_draft_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
         if ignored_chats_value is not None:
@@ -169,7 +179,7 @@ def main() -> int:
         return (["typesafe/jev-1.13"] if provider == "openrouter"
                 else ["jev-1.13.0", "jev-latest", "jev-preview"])
 
-    def fake_llm_models(protocol, base_url, api_key, timeout=10):
+    def fake_llm_models(protocol, base_url, api_key, timeout=10, headers=None):
         return {"anthropic": ["claude-demo-4", "claude-demo-4-mini"],
                 "gemini": ["gemini-demo-pro", "gemini-demo-flash"]}.get(
             protocol, ["deepseek-flash", "deepseek-reasoner", "demo-model-a", "demo-model-b"])
@@ -179,15 +189,35 @@ def main() -> int:
             "core.llm.list_models", fake_llm_models), patch.multiple(
         settings,
         _read=lambda name, default=None: demo_settings.get(name, default),
-        has_key=lambda: bool(demo_settings["jev_key"]),
+        has_key=lambda: bool(demo_settings["jev_key"] and demo_settings["judge_key"]
+                             and demo_settings["llm_key"]),
+        models_ready=lambda: bool(demo_settings["jev_key"] and demo_settings["judge_key"]
+                                  and demo_settings["llm_key"]),
         has_jev_key=lambda: bool(demo_settings["jev_key"]),
+        has_judge_key=lambda: bool(demo_settings["judge_key"]),
         has_llm_key=lambda: bool(demo_settings["llm_key"]),
         jev_key=lambda: demo_settings["jev_key"],
+        judge_key=lambda: demo_settings["judge_key"],
         llm_key=lambda: demo_settings["llm_key"],
         relationship=lambda: demo_settings["relationship"],
         context=lambda: demo_settings["context"],
         jev_provider=lambda: demo_settings["jev_provider"],
         jev_model=lambda: demo_settings["jev_model"],
+        judge_mode=lambda: demo_settings["judge_mode"],
+        judge_reuse_draft=lambda: demo_settings["judge_reuse_draft"],
+        judge_provider=lambda: demo_settings["judge_provider"],
+        judge_model=lambda: demo_settings["judge_model"],
+        judge_base_url=lambda: demo_settings["judge_base_url"],
+        general_judge_config=lambda: {
+            "provider": demo_settings["draft_provider"] if demo_settings["judge_reuse_draft"]
+            else demo_settings["judge_provider"],
+            "model": demo_settings["draft_model"] if demo_settings["judge_reuse_draft"]
+            else demo_settings["judge_model"],
+            "base_url": demo_settings["draft_base_url"] if demo_settings["judge_reuse_draft"]
+            else demo_settings["judge_base_url"],
+            "api_key": demo_settings["llm_key"] if demo_settings["judge_reuse_draft"]
+            else demo_settings["judge_key"],
+        },
         draft_provider=lambda: demo_settings["draft_provider"],
         draft_model=lambda: demo_settings["draft_model"],
         draft_base_url=lambda: demo_settings["draft_base_url"],

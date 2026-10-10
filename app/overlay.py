@@ -32,6 +32,11 @@ _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
 ]
+_JUDGE_MODES = [
+    ("Jev 优先，失败后通用模型兜底", "jev_fallback"),
+    ("仅使用 Jev", "jev_only"),
+    ("仅使用通用模型", "llm_only"),
+]
 
 
 def _choice(answers, name):
@@ -615,10 +620,33 @@ class Overlay:
         box.addWidget(_label("模型", 16, "#304c3c", True))
         self._fetched = _Fetched()
         self._fetched.done.connect(self._models_fetched)
-        self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
+        mode_label = _label("判断策略", 13)
+        box.addWidget(mode_label)
+        self.judgeModeBox = ComboBox()
+        self.judgeModeBox.addItems([label for label, _ in _JUDGE_MODES])
+        self.judgeModeBox.setAccessibleName("判断策略")
+        self.judgeModeBox.currentIndexChanged.connect(self._sync_model_fields)
+        mode_label.setBuddy(self.judgeModeBox)
+        box.addWidget(self.judgeModeBox)
         box.addWidget(self._hint(
-            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+            "推荐 Jev 优先：连接失败、限流或服务过载时由通用模型接管；密钥或地址错误会直接提示。"
         ))
+        self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
+        box.addWidget(self._hint("Jev 负责意图、紧张度和候选排序；仅通用模型模式下不调用。"))
+        reuse_row = QHBoxLayout()
+        reuse_row.addWidget(_label("通用判断复用起草配置", 13), 1)
+        self.judgeReuseSwitch = SwitchButton()
+        self.judgeReuseSwitch.setOnText("复用")
+        self.judgeReuseSwitch.setOffText("独立")
+        self.judgeReuseSwitch.setAccessibleName("通用判断是否复用起草配置")
+        self.judgeReuseSwitch.checkedChanged.connect(self._sync_model_fields)
+        reuse_row.addWidget(self.judgeReuseSwitch)
+        box.addLayout(reuse_row)
+        box.addWidget(self._hint(
+            "复用最简单；切到独立后可为判断单独配置来源、模型、地址和 JUDGE_API_KEY。"
+        ))
+        self.judge = self._model_group(box, "通用判断 · 语言模型", "judge", providers.DRAFT_PROVIDERS)
+        box.addWidget(self._hint("按固定结构输出判断与排序，不负责写回复；独立密钥只存系统环境变量。"))
         self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
         box.addWidget(self._hint(
             "写那三条候选。OpenAI / Anthropic / Gemini 三种接口都走各自官方 SDK。"
@@ -664,10 +692,12 @@ class Overlay:
 
     def _model_group(self, box, title, kind, table):
         """一组「来源 / 密钥 / 模型」控件，判断和起草各一份。table 是 core/providers.py 里那张表。"""
+        key_titles = {"jev": "Jev 判断", "judge": "通用判断", "draft": "起草"}
+        stored_keys = {"jev": settings.jev_key, "judge": settings.judge_key,
+                       "draft": settings.llm_key}
         group = SimpleNamespace(kind=kind, table=table, ids=list(table),
-                                keyTitle="判断" if kind == "jev" else "起草",
-                                stored_key=lambda k=kind: (settings.jev_key() if k == "jev"
-                                                           else settings.llm_key()))
+                                keyTitle=key_titles[kind], stored_key=stored_keys[kind],
+                                widgets=[])
         heading = QHBoxLayout()
         heading.addWidget(_label(title, 14, "#304c3c", True), 1)
         group.keyState = _label("", 12, _GREEN)
@@ -682,14 +712,15 @@ class Overlay:
         group.providerBox.setAccessibleName(f"{title} 来源")
         source_label.setBuddy(group.providerBox)
         box.addWidget(group.providerBox)
-        if kind == "draft":  # 只有两个「自定义」来源要自己填地址，别的来源这一行藏着
-            self.baseLabel = _label("Base URL", 13)
-            box.addWidget(self.baseLabel)
-            self.baseEdit = LineEdit()
-            self.baseEdit.setPlaceholderText("https://你的服务/v1")
-            self.baseEdit.setAccessibleName("自定义来源 Base URL")
-            self.baseLabel.setBuddy(self.baseEdit)
-            box.addWidget(self.baseEdit)
+        group.baseLabel = group.baseEdit = None
+        if kind != "jev":
+            group.baseLabel = _label("Base URL", 13)
+            box.addWidget(group.baseLabel)
+            group.baseEdit = LineEdit()
+            group.baseEdit.setPlaceholderText("https://你的服务/v1")
+            group.baseEdit.setAccessibleName(f"{title}自定义来源 Base URL")
+            group.baseLabel.setBuddy(group.baseEdit)
+            box.addWidget(group.baseEdit)
         key_label = _label("密钥", 13)
         box.addWidget(key_label)
         group.keyEdit = PasswordLineEdit()
@@ -699,7 +730,7 @@ class Overlay:
         box.addWidget(group.keyEdit)
         box.addWidget(self._hint(
             "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
-            else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
+            else "上面选哪家就填哪家的 key；换来源重填一次，只存对应密钥。"))
         model_label = _label("模型", 13)
         box.addWidget(model_label)
         row = QHBoxLayout()
@@ -717,6 +748,9 @@ class Overlay:
         group.status = _label("", 12, _MUTED)
         box.addWidget(group.status)
         group.providerBox.currentIndexChanged.connect(lambda _: self._provider_changed(group))
+        group.widgets = [group.providerBox, group.keyEdit, group.modelBox, group.fetchButton]
+        if group.baseEdit:
+            group.widgets.append(group.baseEdit)
         return group
 
     @staticmethod
@@ -726,36 +760,46 @@ class Overlay:
     def _provider_changed(self, group):
         """换来源：模型框回到这家该有的值（存的就是这家才用存的，否则用它的默认），状态清掉。"""
         provider = self._provider_of(group)
-        saved = settings.jev_provider() if group.kind == "jev" else settings.draft_provider()
-        stored = settings.jev_model() if group.kind == "jev" else settings.draft_model()
+        saved = {"jev": settings.jev_provider, "judge": settings.judge_provider,
+                 "draft": settings.draft_provider}[group.kind]()
+        stored = {"jev": settings.jev_model, "judge": settings.judge_model,
+                  "draft": settings.draft_model}[group.kind]()
         group.modelBox.clear()
         group.modelBox.setText(stored if provider == saved else group.table[provider].default)
         group.status.setText("")
         self._sync_model_fields()
 
-    def _sync_model_fields(self):
-        """两组共用：密钥已配置/未配置、占位文案、自定义 Base URL 行的显隐，
-        外加紧凑模式下把来源按钮上的文字省略——ComboBox 是 QPushButton，
-        minimumSizeHint 按整段文字算，不会自动换行/省略，长名字会把设置页撑宽。"""
-        for group in (self.jev, self.draft):
+    def _sync_model_fields(self, *_):
+        """同步三组模型的密钥状态、可用性和自定义地址显隐。"""
+        mode = _JUDGE_MODES[max(0, self.judgeModeBox.currentIndex())][1]
+        reuse = self.judgeReuseSwitch.isChecked()
+        active = {"jev": mode != "llm_only", "judge": mode != "jev_only" and not reuse,
+                  "draft": True}
+        for group in (self.jev, self.judge, self.draft):
             provider = self._provider_of(group)
             name = group.table[provider].name
             configured = bool(group.stored_key())
-            group.keyState.setText("已配置" if configured else "未配置")
+            if group.kind == "judge" and mode != "jev_only" and reuse:
+                group.keyState.setText("复用起草配置")
+            else:
+                group.keyState.setText("已配置" if configured else "未配置")
             group.keyEdit.setPlaceholderText(
                 "已配置，留空保留" if configured else f"输入 {name} API 密钥")
+            for widget in group.widgets:
+                widget.setEnabled(active[group.kind])
             if self._compact:
                 name = group.providerBox.fontMetrics().elidedText(name, Qt.ElideRight, 180)
             group.providerBox.setText(name)
-        custom = self._provider_of(self.draft) in providers.CUSTOM
-        self.baseLabel.setVisible(custom)
-        self.baseEdit.setVisible(custom)
+            if group.baseLabel:
+                custom = active[group.kind] and provider in providers.CUSTOM
+                group.baseLabel.setVisible(custom)
+                group.baseEdit.setVisible(custom)
 
     def _fetch_models(self, group):
         """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
         provider = self._provider_of(group)
-        custom = group.kind == "draft" and provider in providers.CUSTOM
-        base = self.baseEdit.text().strip() if custom else None
+        custom = group.kind != "jev" and provider in providers.CUSTOM
+        base = group.baseEdit.text().strip() if custom else None
         key = group.keyEdit.text().strip() or group.stored_key()
         if not key:
             group.status.setText("先填密钥")
@@ -818,9 +862,15 @@ class Overlay:
         self.styleEdit.setText(settings.style())
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
+        mode = settings.judge_mode()
+        self.judgeModeBox.setCurrentIndex(next(i for i, (_, value) in enumerate(_JUDGE_MODES)
+                                                   if value == mode))
+        self.judgeReuseSwitch.setChecked(settings.judge_reuse_draft())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
+        self._set_group(self.judge, settings.judge_provider(), settings.judge_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
-        self.baseEdit.setText(settings.draft_base_url())
+        self.judge.baseEdit.setText(settings.judge_base_url())
+        self.draft.baseEdit.setText(settings.draft_base_url())
         self.thinkingSwitch.setChecked(settings.thinking())
         self.autoSwitch.setChecked(settings.auto_switch())
         self.ignoredChatsEdit.setPlainText("\n".join(settings.ignored_chats("wechat")))
@@ -832,19 +882,26 @@ class Overlay:
     def _save(self):
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
+        mode = _JUDGE_MODES[max(0, self.judgeModeBox.currentIndex())][1]
+        reuse = self.judgeReuseSwitch.isChecked()
         jev_provider = self._provider_of(self.jev)
+        judge_provider = self._provider_of(self.judge)
         draft_provider = self._provider_of(self.draft)
-        base = self.baseEdit.text().strip()
         if not relationship:
             self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
             self.relEdit.setFocus()
             return
-        if draft_provider in providers.CUSTOM and not base:
-            self._settings_feedback("自定义来源要填 Base URL。", error=True)
-            self.baseEdit.setFocus()
-            return
-        for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
+        active = [(self.draft, draft_provider)]
+        if mode != "llm_only":
+            active.append((self.jev, jev_provider))
+        if mode != "jev_only" and not reuse:
+            active.append((self.judge, judge_provider))
+        for group, provider in active:
             name = group.table[provider].name
+            if group.baseEdit and provider in providers.CUSTOM and not group.baseEdit.text().strip():
+                self._settings_feedback(f"{group.keyTitle}的自定义来源要填 Base URL。", error=True)
+                group.baseEdit.setFocus()
+                return
             if not group.keyEdit.text().strip() and not group.stored_key():
                 self._settings_feedback(f"请先填写 {group.keyTitle} 的 API 密钥。", error=True)
                 group.keyEdit.setFocus()
@@ -858,10 +915,16 @@ class Overlay:
                           jev_provider_text=jev_provider,
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
                           jev_model_text=self.jev.modelBox.text().strip(),
+                          judge_mode_text=mode,
+                          judge_reuse_draft_on=reuse,
+                          judge_provider_text=judge_provider,
+                          judge_key_text=self.judge.keyEdit.text().strip() or None,
+                          judge_model_text=self.judge.modelBox.text().strip(),
+                          judge_base_url_text=self.judge.baseEdit.text().strip(),
                           draft_provider_text=draft_provider,
                           llm_key_text=self.draft.keyEdit.text().strip() or None,
                           draft_model_text=self.draft.modelBox.text().strip(),
-                          draft_base_url_text=base,
+                          draft_base_url_text=self.draft.baseEdit.text().strip(),
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
@@ -1252,17 +1315,20 @@ class Overlay:
         self.set_busy(False)
         self._current = bool(self.cands)
         self._clear_cards()
+        ranking_valid = bool(result.get("ranking_valid", True))
         best = result.get("best_index", 0)
         if best not in range(len(self.cands)):
             best = 0
+            ranking_valid = False
         raw_scores = result.get("scores") or []
         scores = [raw_scores[i] if i < len(raw_scores) else None for i in range(len(self.cands))]
-        if not any(scores):  # 全 0/None（旧结果或接口未返回）就不展示百分比
+        if not any(scores):
             scores = [None] * len(self.cands)
-        # 按概率降序排，推荐位（API 给的 choice）强制第一，同分按原索引
-        order = sorted(range(len(self.cands)), key=lambda i: (i != best, -(scores[i] or 0), i))
+        order = (sorted(range(len(self.cands)), key=lambda i: (i != best, -(scores[i] or 0), i))
+                 if ranking_valid else list(range(len(self.cands))))
         for position, index in enumerate(order):
-            card = _ReplyCard(self, index, recommended=index == best, number=position, score=scores[index])
+            card = _ReplyCard(self, index, recommended=ranking_valid and index == best,
+                              number=position + 1, score=scores[index])
             self.replyBox.addWidget(card)
             self.cards.append(card)
         reply_to = result.get("reply_to")
@@ -1283,10 +1349,17 @@ class Overlay:
         self.insight.setVisible(bool(self.cands))
         self.referenceNote.setVisible(bool(self.cands) and not self._compact)
         self.updated.setText(datetime.now().strftime("%H:%M") + " 更新")
-        if self.cands:
+        warnings = result.get("warnings") or []
+        if self.cands and not ranking_valid:
+            self.set_status("已生成候选，但排序不可用；请手动选择，本次不会自动发送", "warning")
+        elif self.cands and result.get("fallback_used"):
+            self.set_status("Jev 暂时不可用，本次已由通用判断模型接管", "warning")
+        elif self.cands:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")
+        if warnings:
+            self.log("[模型降级] " + "；".join(warnings))
 
     def _clear_cards(self):
         for card in self.cards:

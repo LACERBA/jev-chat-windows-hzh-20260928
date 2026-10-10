@@ -10,7 +10,7 @@
 3. **截图不落盘**：捕获得到的位图始终是内存里的对象（numpy/PIL），全程不写磁盘、不进日志、不上传。
 4. **自动发送默认关闭且只能按会话明确授权**；发送前必须校验当前会话、最佳回复、单次 revision 和冷却时间。
 5. **不碰钱**：转账、红包、收款相关界面元素一律不碰。
-6. 全局只有两把 key：Jev 一把（`JEV_API_KEY`）、语言模型一把（`LLM_API_KEY`），只从环境变量 / 注册表读，任何文件不出现 key。
+6. 密钥只从环境变量 / 注册表读取，任何文件不出现 key：Jev 用 `JEV_API_KEY`，独立通用判断用 `JUDGE_API_KEY`，起草用 `LLM_API_KEY`；通用判断复用起草配置时不需要第三把。
 7. Python 读写文件一律 `encoding='utf-8'`。
 
 ## 为什么走 OCR（已实测的结论，别重测）
@@ -23,6 +23,7 @@
 | 文件 | 作用 |
 |---|---|
 | `core/jev_client.py` | Jev 判断 API 客户端（stdlib、脱敏、429/529 退避）。`ask(state, questions)` |
+| `core/llm_judge.py` | 普通语言模型判断器，输出与 Jev 相同的 answers 结构并严格校验 |
 | `core/questions.py` | 7 道判断题 + `build_state()` + `build_rank_question()` |
 | `core/draft.py` | 生成模型起草 3 条候选（OpenRouter，默认 DeepSeek）。解析器已自测 |
 | `core/engine.py` | **唯一入口** `analyze(messages, relationship)` → `{candidates, best_index, best_reply, answers, usage}` |

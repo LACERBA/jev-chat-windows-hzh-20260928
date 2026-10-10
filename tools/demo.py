@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """端到端冒烟：截图里那段真实对话跑一遍完整链，打印判断 + 排好序的候选。
 
-链路是三段式：Jev 判断（7 道题） → 带着判断起草 3 条 → Jev 排序，两次 Jev 调用。
+链路是三段式：判断（7 道题） → 带着判断起草 3 条 → 排序。这个脚本使用仅 Jev 模式。
 
-全程只要两把 key：判断一把 JEV_API_KEY（OpenRouter 或 TypeSafe 的），起草一把 LLM_API_KEY。
+需要两把 key：JEV_API_KEY（OpenRouter 或 TypeSafe）和起草的 LLM_API_KEY。
 
     set JEV_API_KEY=...   &  set LLM_API_KEY=...    (Windows)
     export JEV_API_KEY=... && export LLM_API_KEY=...(mac/Linux)
@@ -40,9 +40,11 @@ def fmt(name: str, ans: dict) -> str:
     if t == "noul":
         return f"{name}: {ans.get('noul'):.2f}"
     if t == "choice":
-        return f"{name}: {ans.get('choice')} (conf {ans.get('confidence'):.2f})"
+        confidence = ans.get("confidence")
+        return f"{name}: {ans.get('choice')}" + (f" (conf {confidence:.2f})" if confidence is not None else "")
     if t == "score":
-        return f"{name}: {ans.get('score'):.1f}/9 (conf {ans.get('confidence'):.2f})"
+        confidence = ans.get("confidence")
+        return f"{name}: {ans.get('score'):.1f}/9" + (f" (conf {confidence:.2f})" if confidence is not None else "")
     return f"{name}: {ans}"
 
 
@@ -51,7 +53,8 @@ def main() -> int:
     for w, t in MESSAGES:
         print(f"  {w}: {t}")
     try:
-        r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER)
+        r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER,
+                    judge_mode="jev_only")
     except JevError as e:
         print(f"\n失败: {e}")
         return 1

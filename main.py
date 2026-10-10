@@ -343,6 +343,10 @@ def auto_send_reply(title, result, revision, announce=True):
             ov.set_status(f"自动回复冷却中，已跳过本次发送（{_AUTO_REPLY_COOLDOWN:.0f} 秒保护）", "warning")
         return False
     candidates = result.get("candidates") or []
+    if not result.get("ranking_valid", False):
+        if title == ov.current_chat():
+            ov.set_status("候选未完成有效排序，本次不会自动发送", "warning")
+        return False
     best = result.get("best_index")
     if not isinstance(best, int) or best not in range(len(candidates)):
         if title == ov.current_chat():
@@ -434,6 +438,7 @@ def on_toggle_capture(on):
 def analyze_bg(msgs, title, revision, reply_to=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
     try:
+        judge = settings.general_judge_config()
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
                                    model=settings.draft_model() or None,
                                    provider=settings.draft_provider(),
@@ -441,7 +446,12 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    reply_to=reply_to, style=settings.style(),
                                    thinking=settings.thinking(),
                                    jev_provider=settings.jev_provider(),
-                                   jev_model=settings.jev_model() or None),
+                                   jev_model=settings.jev_model() or None,
+                                   judge_mode=settings.judge_mode(),
+                                   llm_judge_provider=judge["provider"],
+                                   llm_judge_model=judge["model"] or None,
+                                   llm_judge_base_url=judge["base_url"] or None,
+                                   llm_judge_api_key=judge["api_key"]),
                      title, revision))
     except Exception as e:
         results.put(("err", f"分析失败: {e}", title, revision))
@@ -461,11 +471,8 @@ def start_analyze(title, msgs):
         ov.set_busy(False)
         ov.set_status("当前会话已忽略，不参与自动处理", "idle")
         return False
-    if not settings.has_jev_key():
-        ov.set_status("请先在设置中配置模型", "warning")
-        return False
-    if not settings.has_llm_key():
-        ov.set_status(f"起草来源 {settings.draft_provider_name()} 没填密钥，去设置里补上", "warning")
+    if not settings.models_ready():
+        ov.set_status("请先在设置中补全当前判断策略和起草模型配置", "warning")
         return False
     state["busy"] = True
     ov.set_busy(True)
@@ -629,7 +636,12 @@ def tick():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
-                if conversation_controller.mark_result_ready(title, revision):
+                if not r.get("ranking_valid", False):
+                    if (conversation_controller.active
+                            and conversation_controller.active.get("title") == title):
+                        conversation_controller.release(
+                            "候选未完成有效排序，本次不会自动发送", "warning")
+                elif conversation_controller.mark_result_ready(title, revision):
                     ov.after(_AUTO_REPLY_SEND_DELAY_MS,
                              lambda t=title, result=r, rev=revision: auto_send_and_track(t, result, rev))
                 else:
@@ -670,8 +682,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
         child = spawn_worker()
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
-    if not settings.has_jev_key():
-        ov.set_status("请先在设置中配置模型", "warning")
+    if not settings.models_ready():
+        ov.set_status("请先在设置中补全当前判断策略和起草模型配置", "warning")
         ov.after(0, ov.open_settings)
     if settings.check_update() and update.parse_version(VERSION):  # 开发版没有版本号，不查也不烦源码用户
         threading.Thread(target=check_update_bg, daemon=True).start()
