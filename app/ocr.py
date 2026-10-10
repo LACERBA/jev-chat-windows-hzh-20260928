@@ -51,8 +51,8 @@ def read_session_name(full, area, badge, app: ChatApp = DEFAULT):
     """只读新未读所在行的名称；低置信度或被省略的名称不用于自动点击。"""
     left, top, right, bottom = badge["box"]
     height = max(12, bottom - top)
-    crop = full[max(area[5], top - height // 2):min(full.shape[0], bottom + height),
-                right + 1:area[0] - 8]
+    crop_top = max(area[5], top - height // 2)
+    crop = full[crop_top:min(full.shape[0], bottom + height * 2), right + 1:area[0] - 8]
     if crop.shape[0] < 8 or crop.shape[1] < 20:
         return ""
     res, _ = _engine(app)(crop, use_cls=False)
@@ -64,7 +64,11 @@ def read_session_name(full, area, badge, app: ChatApp = DEFAULT):
     box, text, confidence = min((item for item in res if item[0][0][1] < row),
                                 key=lambda item: item[0][0][0])
     text = text.strip()
-    if confidence < 0.8 or not text or "…" in text or "..." in text:
+    text_top, text_bottom = min(point[1] for point in box), max(point[1] for point in box)
+    clipped = text_bottom >= crop.shape[0] - 1
+    preview = crop_top + (text_top + text_bottom) / 2 > (top + bottom) / 2 + height * 1.75
+    if (confidence < 0.8 or not text or "…" in text or "..." in text
+            or clipped or preview):
         return ""
     return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text)
 

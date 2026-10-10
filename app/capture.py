@@ -13,6 +13,11 @@ from app import chatapps
 u32 = ctypes.windll.user32
 
 
+def switch_debug(stage, **fields):
+    if os.environ.get("JEV_DEBUG_AUTO_SWITCH") == "1":
+        print(f"[自动切换 {time.monotonic():.3f}] {stage} {fields}", flush=True)
+
+
 def find_chat_hwnd(want=None):
     """枚举可见顶层窗口，按进程名认出聊天软件，返回 (hwnd, ChatApp)。
     微信：同进程还有工具窗和看图窗，面积可能更大，所以按标题挑主窗口。
@@ -133,15 +138,30 @@ def _components(mask):
     return out
 
 
-def unread_badges(full, area):
+def _session_list_left(full, x0, top):
+    columns = np.median(full[top:-6, :x0], axis=0)
+    navigation = np.median(full[top:-6, 8:24], axis=(0, 1))
+    different = np.abs(columns - navigation).sum(axis=1) > 18
+    runs = np.convolve(different.astype(int), np.ones(8, dtype=int), mode="valid")
+    candidates = np.flatnonzero(runs == 8)
+    candidates = candidates[(candidates >= 24) & (candidates < x0 // 2)]
+    left = int(candidates[0]) if candidates.size else int(x0 * 0.26)
+    return max(48, min(x0 - 40, left))
+
+
+def unread_badges(full, area, scale=1.0):
     if area is None:
         return []
+    scale = max(1.0, min(4.0, scale))
     H = full.shape[0]
     x0, _, _, _, _, y_pane = area
-    left = max(48, min(x0 - 40, int(x0 * 0.16)))
     top = max(40, y_pane + 44)
-    if x0 - left < 60 or H - top < 40:
+    if x0 < 108 or H - top < 40:
         return []
+    left = _session_list_left(full, x0, top)
+    if x0 - left < 60:
+        return []
+    switch_debug("sidebar_bounds", left=left, right=x0)
     reg = full[top:H - 6, left:x0]
     r, g, b = reg[:, :, 0], reg[:, :, 1], reg[:, :, 2]
     mask = ((r >= 210) & (g >= 30) & (g <= 145) & (b >= 30) & (b <= 145)
@@ -153,9 +173,14 @@ def unread_badges(full, area):
         xs = np.fromiter((p[1] for p in points), int)
         y0, y1, bx0, bx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         h, width, size = y1 - y0, bx1 - bx0, len(points)
-        if not (4 <= h <= 40 and 4 <= width <= 40 and 10 <= size <= 600):
+        if not (4 * scale <= h <= 40 * scale and 4 * scale <= width <= 60 * scale
+                and 10 * scale ** 2 <= size <= 600 * scale ** 2):
+            if size >= 10 and h >= 4 and width >= 4:
+                switch_debug("red_component_rejected", reason="size", height=int(h), width=int(width),
+                             pixels=int(size), box=(left + int(bx0), top + int(y0),
+                                                  left + int(bx1), top + int(y1)))
             continue
-        if not 0.55 <= width / h <= 1.8 or size / (width * h) < 0.2:
+        if not 0.55 <= width / h <= 2.5 or size / (width * h) < 0.2:
             continue
         colors = reg[ys, xs].astype(float)
         mean = colors.mean(axis=0)
@@ -171,9 +196,16 @@ def unread_badges(full, area):
         digest = zlib.crc32(np.ascontiguousarray(normalized[::2, ::2]).tobytes())
         badges.append({"base": f"{digest:08x}:{width}:{h}", "box": box,
                        "x": left + int((x0 - left) * 0.62), "y": cy})
+    if len(badges) >= 3:
+        center = lambda item: (item["box"][0] + item["box"][2]) / 2
+        anchor = max(badges, key=lambda item: sum(abs(center(item) - center(other)) <= 10 * scale
+                                                for other in badges))
+        aligned = [item for item in badges if abs(center(item) - center(anchor)) <= 10 * scale]
+        if len(aligned) >= 2:
+            badges = aligned
     grouped = []
     for badge in sorted(badges, key=lambda item: (item["y"], item["box"][0])):
-        hit = next((i for i, item in enumerate(grouped) if abs(item["y"] - badge["y"]) <= 24), None)
+        hit = next((i for i, item in enumerate(grouped) if abs(item["y"] - badge["y"]) <= 24 * scale), None)
         if hit is None:
             grouped.append(badge)
         elif badge["box"][0] > grouped[hit]["box"][0]:
@@ -182,7 +214,8 @@ def unread_badges(full, area):
 
 
 class UnreadTracker:
-    def __init__(self, read_name=None):
+    def __init__(self, read_name=None, scale=1.0):
+        self.scale = scale
         self.armed = False
         self.previous = set()
         self.sequence = 0
@@ -191,8 +224,10 @@ class UnreadTracker:
         self.deferred = {}
 
     def update(self, full, area):
-        badges = unread_badges(full, area)
+        badges = unread_badges(full, area, scale=self.scale)
         current = {badge["base"] for badge in badges}
+        switch_debug("unread_snapshot", armed=self.armed,
+                     badges=[(item["base"], item["box"], item["x"], item["y"]) for item in badges])
         self.names = {key: name for key, name in self.names.items() if key in current}
         self.deferred = {key: event for key, event in self.deferred.items() if key in current}
         if not self.armed:
@@ -200,10 +235,11 @@ class UnreadTracker:
             return badges, []
         added = [badge for badge in badges if badge["base"] not in self.previous]
         self.previous = current
+        snapshot_at = time.monotonic()
         for badge in sorted(added, key=lambda item: item["y"], reverse=True):
             self.sequence += 1
             self.deferred[badge["base"]] = {"id": f"{badge['base']}:{self.sequence}",
-                                            "at": time.monotonic()}
+                                            "at": snapshot_at}
         events = []
         for badge in badges:
             base = badge["base"]
@@ -212,6 +248,9 @@ class UnreadTracker:
                 if name:
                     self.names[base] = name
             badge["name"] = self.names.get(base, "")
+            if base in self.deferred:
+                switch_debug("unread_candidate", base=base, name=badge["name"],
+                             point=(badge["x"], badge["y"]))
             # 名称暂未识别时保留事件，等下一次稳定画面再读，绝不盲点未知会话。
             if base in self.deferred and (badge["name"] or self.read_name is None):
                 events.append({**badge, **self.deferred.pop(base)})
@@ -228,6 +267,7 @@ class Capture:
         self.settle, self.max_wait = settle, max_wait
         self.shape = self.area = self.last = self.last_sidebar = self.pending = None
         self.t = self.t0 = 0.0
+        self._debug_frames = 0
         # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
         # 这个属性要 Win10 2004（build 19041）才有，1909 及更早直接抛 CursorConfigUnsupported。
         # 显式 None 走系统默认，不去切换；draw_border 同理。
@@ -238,10 +278,15 @@ class Capture:
 
     def on_frame_arrived(self, frame, control):
         full = np.ascontiguousarray(frame.frame_buffer[:, :, :3][:, :, ::-1])  # BGRA → RGB；缓冲区回调后就没了，必须拷
+        self._debug_frames += 1
+        if self._debug_frames <= 3:
+            switch_debug("capture_frame", shape=full.shape, max_pixel=int(full.max()))
         if full.max() == 0:
             return
         if self.area is None or full.shape != self.shape:
             self.shape, self.area = full.shape, chat_area(full)
+            switch_debug("capture_area", shape=self.shape,
+                         area=self.area[:4] if self.area else None)
             self.last = self.last_sidebar = None
         if self.area is None:
             return

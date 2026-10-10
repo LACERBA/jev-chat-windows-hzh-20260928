@@ -47,7 +47,7 @@ def set_clipboard(text):
 
 
 def click(hwnd, x, y):
-    from app.capture import unminimize
+    from app.capture import switch_debug, unminimize
 
     r = w.RECT()
     if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
@@ -66,16 +66,25 @@ def click(hwnd, x, y):
             raise RuntimeError("无法激活聊天窗口")
         time.sleep(0.15)
     old = w.POINT()
-    u32.GetCursorPos(ctypes.byref(old))
-    if not u32.SetCursorPos(r.left + int(x), r.top + int(y)):
+    u32.GetPhysicalCursorPos(ctypes.byref(old))
+    switch_debug("click_coordinates", local=(x, y), origin=(r.left, r.top),
+                 screen=(r.left + int(x), r.top + int(y)),
+                 dpi=u32.GetDpiForWindow(hwnd),
+                 awareness=u32.GetAwarenessFromDpiAwarenessContext(u32.GetThreadDpiAwarenessContext()))
+    if not u32.SetPhysicalCursorPos(r.left + int(x), r.top + int(y)):
         raise RuntimeError("无法移动鼠标到目标会话")
     try:
         time.sleep(0.05)
+        actual = w.POINT()
+        u32.GetPhysicalCursorPos(ctypes.byref(actual))
+        switch_debug("click_physical_position", position=(actual.x, actual.y))
+        if (actual.x, actual.y) != (r.left + int(x), r.top + int(y)):
+            raise RuntimeError("鼠标位置与目标不符，已取消点击")
         u32.mouse_event(0x2, 0, 0, 0, 0)
         u32.mouse_event(0x4, 0, 0, 0, 0)
         time.sleep(0.05)
     finally:
-        u32.SetCursorPos(old.x, old.y)
+        u32.SetPhysicalCursorPos(old.x, old.y)
 
 
 def fill(hwnd, area, text, *, replace=False):

@@ -9,7 +9,7 @@ import traceback
 import numpy as np
 
 from app import chatapps, settings
-from app.capture import Capture, UnreadTracker, chat_area, unminimize
+from app.capture import Capture, UnreadTracker, chat_area, switch_debug, unminimize
 from app.ocr import Reader, read_session_name, read_title, similar
 
 
@@ -38,6 +38,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
     debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
     ctypes.windll.user32.SetProcessDPIAware()
     app = chatapps.get(app_key)
+    switch_debug("worker_started", hwnd=hwnd, app=app.key)
     cap = None
     readers = {}  # {会话名: Reader}，一个会话一套去重状态
     title, raw_title, head = "", "", None  # 当前会话名 / 上一帧的头部像素
@@ -83,6 +84,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                         last_area, last_chat = rect, None
                         unread_tracker = UnreadTracker(read_name=lambda full, area, badge: read_session_name(full, area, badge, app))
                     if app.key == "wechat":
+                        unread_tracker.scale = (ctypes.windll.user32.GetDpiForWindow(hwnd) or 96) / 96
                         unread, events = unread_tracker.update(full, area)
                         q.put(("unread_state", unread))
                         for event in events:
@@ -91,6 +93,8 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                     if head is None or not np.array_equal(crop, head):  # 名字没动就别白跑一次 OCR
                         head = crop
                         raw_name = read_title(crop, app)
+                        switch_debug("header_title", raw_title=raw_name,
+                                     area=rect, frame_shape=full.shape)
                         # OCR 抖一下（「小分队」↔「小分认」）不能分裂出一个新会话
                         name = (raw_name if settings.is_ignored_chat(raw_name, app.key)
                                 else next((k for k in readers if similar(k, raw_name)), raw_name)) if raw_name else ""

@@ -8,6 +8,7 @@
 """
 import ctypes
 import multiprocessing
+import os
 import queue
 import threading
 import time
@@ -16,7 +17,7 @@ from collections import deque
 from math import isfinite
 
 from app import settings, update, worker
-from app.capture import find_chat_hwnd
+from app.capture import find_chat_hwnd, switch_debug
 from app.fill import click, fill, fill_and_send
 from app.ocr import similar
 from app.overlay import Overlay
@@ -67,9 +68,13 @@ class ConversationController:
         self._confirm_switch()
 
     def on_unread(self, event):
+        switch_debug("event_received", event_id=event["id"], name=event.get("name"),
+                     point=(event.get("x"), event.get("y")), phase=self.phase,
+                     enabled=self.mode_enabled(), age=round(time.monotonic() - event["at"], 3))
         if not self.mode_enabled() or event["id"] in self.processed_set:
             return
         if not event.get("name") or chat_is_ignored(event["name"]):
+            switch_debug("event_ignored", event_id=event["id"], name=event.get("name"))
             self._remember(event["id"])
             return
         if self.active and self.active.get("id") == event["id"]:
@@ -80,6 +85,8 @@ class ConversationController:
             self.pending.pop(oldest, None)
 
     def on_chat(self, title, raw_title):
+        switch_debug("chat_changed", title=title, raw_title=raw_title, phase=self.phase,
+                     expected=self.active.get("name") if self.active else None)
         if chat_is_ignored(title, raw_title):
             if self.active:
                 self.release("当前会话已忽略，继续监听其他新消息", "idle")
@@ -195,15 +202,19 @@ class ConversationController:
             candidates.append(event)
         if not candidates:
             return
-        event = max(candidates, key=lambda item: (item["at"], item["id"]))
+        event = max(candidates, key=lambda item: (item["at"], -self.badges[item["base"]]["y"], item["id"]))
         self.pending.pop(event["id"], None)
         target = self.badges[event["base"]]
+        switch_debug("switch_selected", event_id=event["id"], name=target.get("name"),
+                     point=(target["x"], target["y"]), current=state["raw_chat"],
+                     age=round(time.monotonic() - event["at"], 3))
         self.active = {**event, "previous_title": state["chat"], "previous_raw": state["raw_chat"]}
         self.phase = "switching"
         self.deadline = time.monotonic() + 3.5
         try:
             click(state["hwnd"], target["x"], target["y"])
         except Exception as e:
+            switch_debug("switch_failed", name=target.get("name"), error=f"{type(e).__name__}: {e}")
             ov.log(f"[自动切换失败] {type(e).__name__}: {e}")
             self.release("自动切换会话失败，继续监听新消息", "warning")
             return
@@ -304,6 +315,9 @@ def fill_reply(text):
 
 
 def auto_send_reply(title, result, revision, announce=True):
+    if os.environ.get("JEV_DISABLE_AUTO_SEND") == "1":
+        switch_debug("send_disabled_for_debug", title=title)
+        return False
     if chat_is_ignored(title, state.get("raw_chat", "")):
         return False
     if state.get("app") != "wechat":
@@ -646,6 +660,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     try:
         state["hwnd"], found = find_chat_hwnd()
         state["app"] = found.key
+        switch_debug("main_started", hwnd=state["hwnd"], app=found.key,
+                     auto_switch=settings.auto_switch(),
+                     auto_send_disabled=os.environ.get("JEV_DISABLE_AUTO_SEND") == "1")
     except RuntimeError:
         ov.set_capture(False, "未找到聊天窗口，打开后再开启采集")
     else:

@@ -80,6 +80,16 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertEqual(self.controller.active["name"], "月仔")
         self.assertNotIn("public:1", self.controller.pending)
 
+    def test_same_snapshot_prioritizes_top_conversation_not_hash_order(self):
+        for base, name, y in (("a-friend", "月仔", 100), ("z-other", "其他人", 300)):
+            event = {"base": base, "id": base + ":1", "name": name, "at": 1}
+            self.controller.pending[event["id"]] = event
+            self.controller.badges[base] = {**event, "x": 120, "y": y}
+        with patch.object(main, "click") as click:
+            self.controller.advance()
+        click.assert_called_once_with(1, 120, 100)
+        self.assertEqual(self.controller.active["name"], "月仔")
+
     def test_unknown_or_changed_target_is_not_clicked(self):
         for name in ("", "银行通知"):
             with self.subTest(name=name):
@@ -101,6 +111,13 @@ class ConversationFilterTests(unittest.TestCase):
         with patch.object(main.threading, "Thread") as thread:
             self.assertFalse(main.start_analyze("公众号", [("her", "文章标题", None)]))
         thread.assert_not_called()
+
+    def test_debug_mode_disables_sending_for_authorized_normal_chat(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        with patch.dict(main.os.environ, {"JEV_DISABLE_AUTO_SEND": "1"}), \
+                patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply("月仔", {"candidates": ["收到"], "best_index": 0}, 0))
+        send.assert_not_called()
 
     def test_ignored_chat_never_sends_even_if_authorized(self):
         self.state.update(chat="公众号", raw_chat="公众号")
@@ -204,6 +221,52 @@ class UnreadNameTests(unittest.TestCase):
         self.assertFalse(tracker.deferred)
 
 
+class UnreadGeometryTests(unittest.TestCase):
+    def _frame(self):
+        frame = np.full((400, 600, 3), 245, dtype=np.uint8)
+        frame[:, :80] = 215
+        frame[:, 80:300] = 235
+        return frame
+
+    def _badge(self, frame, x, y):
+        ys, xs = np.ogrid[:frame.shape[0], :frame.shape[1]]
+        frame[(xs - x) ** 2 + (ys - y) ** 2 <= 7 ** 2] = (255, 80, 80)
+
+    def test_numeric_unread_badge_at_200_percent_dpi_is_detected(self):
+        from app.capture import unread_badges
+
+        frame = self._frame()
+        ys, xs = np.ogrid[:frame.shape[0], :frame.shape[1]]
+        frame[(xs - 130) ** 2 + (ys - 180) ** 2 <= 16 ** 2] = (255, 80, 80)
+        frame[173:187, 128:132] = 255
+        area = (300, 80, 600, 380, np.array([245, 245, 245]), 20)
+        badges = unread_badges(frame, area, scale=2)
+        self.assertEqual(len(badges), 1)
+        self.assertGreater(badges[0]["box"][2] - badges[0]["box"][0], 30)
+
+    def test_red_avatar_decoration_outside_badge_column_is_ignored(self):
+        from app.capture import unread_badges
+
+        frame = self._frame()
+        for x, y in ((130, 100), (130, 180), (130, 260), (190, 340)):
+            self._badge(frame, x, y)
+        area = (300, 80, 600, 380, np.array([245, 245, 245]), 20)
+        badges = unread_badges(frame, area)
+        self.assertEqual(len(badges), 3)
+        self.assertTrue(all(badge["box"][0] < 150 for badge in badges))
+
+    def test_navigation_badge_is_not_a_conversation_unread(self):
+        from app.capture import unread_badges
+
+        frame = self._frame()
+        self._badge(frame, 66, 120)
+        self._badge(frame, 130, 180)
+        area = (300, 80, 600, 380, np.array([245, 245, 245]), 20)
+        badges = unread_badges(frame, area)
+        self.assertEqual(len(badges), 1)
+        self.assertGreater(badges[0]["box"][0], 80)
+
+
 class SessionNameOcrTests(unittest.TestCase):
     def setUp(self):
         self.frame = np.zeros((300, 400, 3), dtype=np.uint8)
@@ -232,6 +295,23 @@ class SessionNameOcrTests(unittest.TestCase):
         with patch.object(ocr, "_engine", return_value=Mock(
                 return_value=([self._item("工作群（12）")], None))):
             self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "工作群")
+
+    def test_message_preview_is_not_accepted_as_session_name(self):
+        with patch.object(ocr, "_engine", return_value=Mock(
+                return_value=([self._item("叶艺凡妈妈：我们", y=33)], None))):
+            self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "")
+
+    def test_valid_title_with_colon_is_preserved(self):
+        for title in ("团队：研发", "JH2026秋自然拼读-T二四16：30"):
+            with self.subTest(title=title), patch.object(ocr, "_engine", return_value=Mock(
+                    return_value=([self._item(title)], None))):
+                self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), title)
+
+    def test_cut_off_title_is_not_accepted_as_complete_name(self):
+        def recognize(crop, **kwargs):
+            return [self._item("公众", y=crop.shape[0] - 14)], None
+        with patch.object(ocr, "_engine", return_value=recognize):
+            self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "")
 
     def test_invalid_crop_does_not_call_ocr(self):
         with patch.object(ocr, "_engine") as engine:
