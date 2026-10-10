@@ -100,6 +100,106 @@ class ConversationFilterTests(unittest.TestCase):
                     self.controller.advance()
                 click.assert_not_called()
 
+    def test_waiting_send_timeout_keeps_active_chat_locked(self):
+        import time
+
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": time.monotonic()}
+        self.controller.phase = "waiting_send"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔",
+                                  "name": "月仔", "revision": 1}
+        self.controller.send_revision = 1
+        self.controller.deadline = 1
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main.time, "monotonic", return_value=2), \
+                patch.object(main, "click") as click:
+            self.controller.tick()
+        click.assert_not_called()
+        self.assertEqual(self.controller.phase, "waiting_send")
+        self.assertEqual(self.controller.active["title"], "月仔")
+        self.assertIn(event["id"], self.controller.pending)
+        self.overlay.set_status.assert_called_with(
+            "自动回复仍在等待发送，暂不切换其他会话", "warning")
+
+    def test_expired_send_callback_is_cancelled_after_session_release(self):
+        chat = main.chat_of("月仔")
+        chat["rev"] = 3
+        chat["result"] = {"candidates": ["收到"], "best_index": 0,
+                          "ranking_valid": True, "scores": [0.8]}
+        self.controller.phase = "listening"
+        self.controller.active = None
+        with patch.object(main, "auto_send_reply") as send:
+            main.auto_send_and_track("月仔", chat["result"], 3)
+        send.assert_not_called()
+
+    def test_active_send_callback_requires_matching_session_and_revision(self):
+        chat = main.chat_of("月仔")
+        chat["rev"] = 3
+        self.controller.phase = "waiting_send"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
+        self.controller.send_revision = 2
+        with patch.object(main, "auto_send_reply") as send:
+            main.auto_send_and_track("月仔", {"candidates": ["收到"], "best_index": 0}, 2)
+        send.assert_not_called()
+
+    def test_failed_auto_send_keeps_next_chat_pending_until_manual_switch(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.phase = "waiting_send"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔",
+                                  "revision": 1}
+        self.controller.send_revision = 1
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        self.controller.on_send_attempt("月仔", 1, False)
+        self.assertEqual(self.controller.phase, "send_failed")
+        with patch.object(main, "click") as click:
+            self.controller.advance()
+            click.assert_not_called()
+            self.controller.on_chat("其他人", "其他人")
+            self.controller.advance()
+        click.assert_called_once_with(1, 120, 90)
+
+    def test_verification_timeout_keeps_next_chat_pending_until_confirmation_or_manual_switch(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.phase = "verifying"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔",
+                                  "name": "月仔"}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        self.controller.deadline = 1
+        with patch.object(main.time, "monotonic", return_value=2), \
+                patch.object(main, "click") as click:
+            self.controller.tick()
+            click.assert_not_called()
+        self.assertEqual(self.controller.phase, "verifying")
+        self.assertIn(event["id"], self.controller.pending)
+        self.overlay.set_status.assert_called_with(
+            "发送已执行但未确认，暂停切换；请检查当前会话后再切换", "warning")
+
+    def test_pending_other_chat_never_switches_during_active_reply_phases(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        for phase in ("switching", "waiting_lines", "analyzing", "waiting_send", "verifying"):
+            with self.subTest(phase=phase):
+                self.controller.phase = phase
+                self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔",
+                                          "name": "月仔", "previous_title": "月仔",
+                                          "previous_raw": "月仔"}
+                self.controller.pending = {event["id"]: dict(event)}
+                self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+                with patch.object(main, "click") as click:
+                    self.controller.advance()
+                click.assert_not_called()
+                self.assertIn(event["id"], self.controller.pending)
+
+    def test_unconfigured_conversation_releases_without_waiting_to_send(self):
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "candidate_title": "月仔", "candidate_raw": "月仔"}
+        self.controller._confirm_switch()
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertIsNone(self.controller.active)
+        self.overlay.set_status.assert_called_with("已切换到「月仔」，该会话未开启自动回复", "idle")
+
     def test_first_frame_does_not_bypass_authorization_in_switch_mode(self):
         self.assertEqual(self.controller.route_lines("月仔", "月仔", 1, True, "her"), "skip")
         self.assertEqual(self.controller.route_lines("公众号", "公众号", 1, True, "her"), "skip")
@@ -181,8 +281,8 @@ class ConversationFilterTests(unittest.TestCase):
         phases = {
             "switching": "微信会话切换确认超时，继续监听新消息",
             "waiting_lines": "切换后的会话尚未读到新消息，继续监听",
-            "waiting_send": "等待自动回复执行超时，继续监听新消息",
-            "verifying": "发送状态未确认，已停止重试",
+            "waiting_send": "自动回复仍在等待发送，暂不切换其他会话",
+            "verifying": "发送已执行但未确认，暂停切换；请检查当前会话后再切换",
         }
         for phase, expected in phases.items():
             with self.subTest(phase=phase):
@@ -192,7 +292,8 @@ class ConversationFilterTests(unittest.TestCase):
                 with patch.object(main.time, "monotonic", return_value=2):
                     self.controller.tick()
                 self.overlay.set_status.assert_called_with(expected, "warning")
-                self.assertEqual(self.controller.phase, "listening")
+                expected_phase = phase if phase in ("waiting_send", "verifying") else "listening"
+                self.assertEqual(self.controller.phase, expected_phase)
 
     def test_switch_confirmation_rejects_wrong_chat(self):
         self.controller.phase = "switching"

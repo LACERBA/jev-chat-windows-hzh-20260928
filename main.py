@@ -105,6 +105,8 @@ class ConversationController:
     def route_lines(self, title, raw_title, revision, initial, latest_who):
         if chat_is_ignored(title, raw_title):
             return "skip"
+        if self.phase == "send_failed":
+            return "skip"
         if self.phase == "switching":
             if self._matches_switch_target(title, raw_title):
                 self.early_lines = (title, raw_title, revision, initial, latest_who)
@@ -154,12 +156,21 @@ class ConversationController:
         if self.active and self.active.get("title") == title:
             self.release("自动处理未完成，继续监听新消息", "warning")
 
+    def send_is_pending(self, title, revision):
+        return (self.phase == "waiting_send" and self.active is not None
+                and self.active.get("title") == title
+                and self.active.get("raw") == state.get("raw_chat")
+                and title == state.get("chat") and self.send_revision == revision
+                and chat_of(title)["rev"] == revision)
+
     def on_send_attempt(self, title, revision, sent):
         if (self.phase != "waiting_send" or not self.active
                 or self.active.get("title") != title or self.send_revision != revision):
             return
         if not sent:
-            self.release("自动回复未发送，继续监听新消息", "warning")
+            self.phase = "send_failed"
+            self.deadline = 0.0
+            ov.set_status("自动回复未完成，已暂停切换；请检查当前会话后再切换", "warning")
             return
         self.phase = "verifying"
         self.expected_text = chat_of(title)["last_auto_sent_text"]
@@ -228,16 +239,18 @@ class ConversationController:
     def tick(self):
         if self.phase in ("switching", "waiting_lines", "waiting_send", "verifying"):
             if self.deadline and time.monotonic() >= self.deadline:
-                text = {
-                    "switching": "微信会话切换确认超时，继续监听新消息",
-                    "waiting_lines": "切换后的会话尚未读到新消息，继续监听",
-                    "waiting_send": "等待自动回复执行超时，继续监听新消息",
-                    "verifying": "发送状态未确认，已停止重试",
-                }[self.phase]
                 switch_debug("conversation_timeout", phase=self.phase,
                              title=self.active.get("title") if self.active else None,
                              expected=self.active.get("name") if self.active else None)
-                self.release(text, "warning")
+                if self.phase in ("waiting_send", "verifying"):
+                    self.deadline = 0.0
+                    text = ("自动回复仍在等待发送，暂不切换其他会话" if self.phase == "waiting_send"
+                            else "发送已执行但未确认，暂停切换；请检查当前会话后再切换")
+                    ov.set_status(text, "warning")
+                else:
+                    text = ("微信会话切换确认超时，继续监听新消息" if self.phase == "switching"
+                            else "切换后的会话尚未读到新消息，继续监听")
+                    self.release(text, "warning")
         self.advance()
 
     def buffers_fresh_message(self, title, raw_title, revision):
@@ -435,6 +448,10 @@ def auto_send_reply(title, result, revision, announce=True):
 
 
 def auto_send_and_track(title, result, revision):
+    if not conversation_controller.send_is_pending(title, revision):
+        switch_debug("stale_auto_send_cancelled", title=title, revision=revision,
+                     phase=conversation_controller.phase)
+        return
     sent = auto_send_reply(title, result, revision, announce=False)
     conversation_controller.on_send_attempt(title, revision, sent)
 
