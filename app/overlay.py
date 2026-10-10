@@ -1351,7 +1351,7 @@ class Overlay:
         self.updated.setText(datetime.now().strftime("%H:%M") + " 更新")
         warnings = result.get("warnings") or []
         if self.cands and not ranking_valid:
-            self.set_status("已生成候选，但排序不可用；请手动选择，本次不会自动发送", "warning")
+            self.set_status("排序不可用，第一条候选将作为默认选项", "warning")
         elif self.cands and result.get("fallback_used"):
             self.set_status("Jev 暂时不可用，本次已由通用判断模型接管", "warning")
         elif self.cands:

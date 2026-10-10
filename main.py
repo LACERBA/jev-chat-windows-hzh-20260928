@@ -391,7 +391,8 @@ def auto_send_reply(title, result, revision, announce=True):
             ov.set_status(f"自动回复冷却中，已跳过本次发送（{_AUTO_REPLY_COOLDOWN:.0f} 秒保护）", "warning")
         return False
     candidates = result.get("candidates") or []
-    if not result.get("ranking_valid", False):
+    if (not result.get("ranking_valid", False)
+            and not result.get("auto_send_fallback", False)):
         if title == ov.current_chat():
             ov.set_status("候选未完成有效排序，本次不会自动发送", "warning")
         return False
@@ -400,13 +401,15 @@ def auto_send_reply(title, result, revision, announce=True):
         if title == ov.current_chat():
             ov.set_status("自动回复已跳过：本次没有选出最佳回复", "warning")
         return False
-    scores = result.get("scores") or []
-    try:
-        score = float(scores[best])
-    except (IndexError, TypeError, ValueError):
-        score = None
-    if score is not None and (not isfinite(score) or not 0 <= score <= 1):
-        score = None
+    score = None
+    if result.get("ranking_valid"):
+        scores = result.get("scores") or []
+        try:
+            score = float(scores[best])
+        except (IndexError, TypeError, ValueError):
+            pass
+        if score is not None and (not isfinite(score) or not 0 <= score <= 1):
+            score = None
     text = reply_text(title, str(candidates[best]).strip())
     if not text:
         return False
@@ -423,8 +426,11 @@ def auto_send_reply(title, result, revision, announce=True):
     if title == ov.current_chat():
         ov.invalidate_replies()
         if announce:
-            suffix = f"（{score:.0%}）" if score is not None else ""
-            ov.set_status(f"已自动发送最佳回复{suffix}", "success")
+            if result.get("ranking_valid"):
+                suffix = f"（{score:.0%}）" if score is not None else ""
+                ov.set_status(f"已自动发送最佳回复{suffix}", "success")
+            else:
+                ov.set_status("排序不可用，已自动发送第一条候选回复", "success")
     return True
 
 
@@ -685,11 +691,12 @@ def tick():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
-                if not r.get("ranking_valid", False):
+                if (not r.get("ranking_valid", False)
+                        and not r.get("auto_send_fallback", False)):
                     if (conversation_controller.active
                             and conversation_controller.active.get("title") == title):
                         conversation_controller.release(
-                            "候选未完成有效排序，本次不会自动发送", "warning")
+                            "候选未完成有效排序", "warning")
                 elif conversation_controller.mark_result_ready(title, revision):
                     ov.after(_AUTO_REPLY_SEND_DELAY_MS,
                              lambda t=title, result=r, rev=revision: auto_send_and_track(t, result, rev))

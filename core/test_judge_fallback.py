@@ -196,6 +196,7 @@ class EngineFallbackTests(unittest.TestCase):
         self.assertEqual(result["candidates"], CANDIDATES)
         self.assertEqual(result["best_index"], 0)
         self.assertFalse(result["ranking_valid"])
+        self.assertTrue(result["auto_send_fallback"])
         self.assertTrue(result["warnings"])
 
 

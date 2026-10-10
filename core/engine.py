@@ -141,13 +141,11 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                     except JevError:
                         ranked = None
             if ranked is None:
-                warnings.append("候选排序不可用，请手动选择；本次不会自动发送")
+                warnings.append("通用模型未能排序，将以第一条候选作为默认选择")
         if ranked:
             answers = {**answers, **ranked["answers"]}
             _add_usage(usage, ranked.get("usage"))
             ranking_valid = True
-        elif not warnings or "候选排序不可用，请手动选择；本次不会自动发送" not in warnings:
-            warnings.append("候选排序不可用，请手动选择；本次不会自动发送")
     if (len(candidates) >= 2 and not ranking_valid and not final_selector_attempted
             and generic_available and judge_mode in ("jev_fallback", "llm_only")):
         try:
@@ -160,8 +158,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             warnings.append("已由通用模型直接从候选中选择最佳回答")
         except JevError:
             warnings.append("通用模型未能选出候选；本次不会自动发送")
-    if not ranking_valid and "候选排序不可用，请手动选择；本次不会自动发送" not in warnings:
-        warnings.append("候选排序不可用，请手动选择；本次不会自动发送")
+    if not ranking_valid:
+        warnings.append("候选排序不可用，将以第一条候选作为默认选择")
 
     best_key = (answers.get("best_reply") or {}).get("choice")
     best_index = _REPLY_IDX.get(best_key, 0)
@@ -187,6 +185,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         "usage": usage,
         "reply_to": reply_to,
         "ranking_valid": ranking_valid,
+        "auto_send_fallback": bool(candidates) and not ranking_valid,
         "judge_backend": judge_backend,
         "ranking_backend": ranking_backend,
         "fallback_used": fallback_used,

@@ -128,7 +128,24 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertTrue(sent)
         send.assert_called_once()
 
-    def test_invalid_ranking_never_auto_sends(self):
+    def test_unranked_first_choice_auto_sends_only_for_authorized_chat(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        result = {"candidates": ["第一条候选", "第二条候选"], "best_index": 0,
+                  "scores": [0.0, 0.0], "ranking_valid": False, "auto_send_fallback": True}
+        with patch.object(main, "fill_and_send") as send:
+            self.assertTrue(main.auto_send_reply("月仔", result, 0))
+        send.assert_called_once_with(1, self.state["area"], "第一条候选", "enter")
+        self.assertEqual(main.chat_of("月仔")["last_auto_sent_text"], "第一条候选")
+        self.assertNotIn("0%", str(self.overlay.set_status.call_args))
+
+    def test_unranked_first_choice_respects_per_chat_authorization(self):
+        result = {"candidates": ["第一条候选"], "best_index": 0,
+                  "ranking_valid": False, "auto_send_fallback": True}
+        with patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply("月仔", result, 0))
+        send.assert_not_called()
+
+    def test_unranked_result_without_explicit_fallback_never_auto_sends(self):
         self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
         with patch.object(main, "fill_and_send") as send:
             self.assertFalse(main.auto_send_reply(
