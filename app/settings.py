@@ -13,7 +13,7 @@ import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
 from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, JUDGE_ENV,
-                            LEGACY, LLM_ENV)
+                            LEGACY, LLM_ENV, VISION_ENV, VISION_PROVIDERS)
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -93,6 +93,37 @@ def draft_model() -> str:
 def draft_base_url() -> str:
     """自定义来源的 Base URL；其余来源用表里的，这里返回空。"""
     return str(_read("draft_base_url") or "") if draft_provider() in CUSTOM else ""
+
+def media_mode() -> str:
+    value = _read("media_mode", "ocr")
+    return value if value in ("ocr", "vision", "hybrid") else "ocr"
+
+
+def vision_upload() -> bool:
+    return bool(_read("vision_upload", False))
+
+
+def vision_provider() -> str:
+    value = _read("vision_provider", "sensenova")
+    return value if value in VISION_PROVIDERS else "sensenova"
+
+
+def vision_model() -> str:
+    return str(_read("vision_model") or "") or VISION_PROVIDERS[vision_provider()].default
+
+
+def vision_base_url() -> str:
+    return str(_read("vision_base_url") or "") if vision_provider() in CUSTOM else ""
+
+
+def vision_key() -> str:
+    return _get_key(VISION_ENV)
+
+
+def vision_config() -> dict:
+    return {"provider": vision_provider(), "model": vision_model(),
+            "base_url": vision_base_url(), "api_key": vision_key(), "mode": media_mode()}
+
 
 def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
@@ -276,7 +307,10 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None,
          ignored_chats_value: list[str] | None = None,
-         analysis_enabled_on: bool | None = None, send_enabled_on: bool | None = None) -> None:
+         analysis_enabled_on: bool | None = None, send_enabled_on: bool | None = None,
+         media_mode_text: str | None = None, vision_upload_on: bool | None = None,
+         vision_provider_text: str | None = None, vision_key_text: str | None = None,
+         vision_model_text: str | None = None, vision_base_url_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。密钥只写进程环境 + HKCU\\Environment。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     judge = judge_provider_text if judge_provider_text in DRAFT_PROVIDERS else judge_provider()
@@ -284,7 +318,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     # 没重填就把老变量里的值抄进新名字，迁移一次性做完（_get_key 已经退回读过老的了）
     wrote_key = False
     for env, typed in ((JEV_ENV, jev_key_text), (JUDGE_ENV, judge_key_text),
-                       (LLM_ENV, llm_key_text)):
+                       (LLM_ENV, llm_key_text), (VISION_ENV, vision_key_text)):
         value = typed or ("" if _read_env(env) else _get_key(env))
         if value:
             _set_key(env, value)
@@ -313,6 +347,11 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "judge_base_url": keep(judge_base_url_text, "judge_base_url"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
+        "media_mode": media_mode_text if media_mode_text in ("ocr", "vision", "hybrid") else media_mode(),
+        "vision_upload": flag(vision_upload_on, vision_upload),
+        "vision_provider": vision_provider_text if vision_provider_text in VISION_PROVIDERS else vision_provider(),
+        "vision_model": keep(vision_model_text, "vision_model"),
+        "vision_base_url": keep(vision_base_url_text, "vision_base_url"),
         "reply_target": flag(reply_target_on, reply_target),
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),

@@ -102,6 +102,35 @@ class WorkerStorageTests(unittest.TestCase):
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(snapshots[0]["new"], [("her", None, "你好")])
 
+    def test_media_image_packet_is_only_the_target_crop(self):
+        from app.media import media_token
+
+        item = {"fingerprint": "1" * 32, "kind": "image", "ocr_text": "", "who": "her", "sender": None,
+                "rect": (0, 0, 4, 4), "pixels": np.full((4, 4, 3), 100, dtype=np.uint8)}
+        self.reader.last_media = [item]
+        self.reader.read.return_value = [("her", None, media_token(item["fingerprint"]), 10)]
+        with patch.object(settings, "vision_upload", return_value=True), \
+                patch.object(settings, "media_mode", return_value="hybrid"):
+            snapshots = self.run_worker()
+        job = snapshots[0]["media_jobs"][0]
+        self.assertTrue(job["image"].startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertNotIn("pixels", job)
+        self.assertNotIn("rect", job)
+        self.assertEqual(next(iter(snapshots[0]["media_state"].values()))["status"], "pending")
+
+    def test_only_collection_does_not_queue_visual_requests(self):
+        from app.media import media_token
+
+        item = {"fingerprint": "1" * 32, "kind": "image", "ocr_text": "", "who": "her", "sender": None}
+        self.reader.last_media = [item]
+        self.reader.read.return_value = [("her", None, media_token(item["fingerprint"]), 10)]
+        with patch.object(settings, "vision_upload", return_value=True), \
+                patch.object(settings, "media_mode", return_value="hybrid"), \
+                patch.object(settings, "analysis_enabled", return_value=False):
+            snapshots = self.run_worker()
+        self.assertEqual(snapshots[0]["media_jobs"], [])
+        self.assertIn("图片消息", snapshots[0]["history"][0][2])
+
 
 class CaptureSnapshotTests(unittest.TestCase):
     def test_static_frame_is_available_for_explicit_reread(self):

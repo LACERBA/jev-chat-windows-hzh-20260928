@@ -5,9 +5,14 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from app.media import TOKEN, describe_media, media_token, same_media
+
 
 @lru_cache(maxsize=4096)
 def _same_text(left, right):
+    media_left, media_right = TOKEN.fullmatch(left), TOKEN.fullmatch(right)
+    if media_left or media_right:
+        return bool(media_left and media_right and same_media(media_left[1], media_right[1]))
     return (left == right or difflib.SequenceMatcher(None, left, right).ratio() >= 0.75
             or len(left) == len(right) >= 3 and sum(a != b for a, b in zip(left, right)) <= 1)
 
@@ -57,6 +62,8 @@ class MessageStore:
             self.connection.execute("PRAGMA query_only=ON")
             self.has_states = bool(self.connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'message_states'").fetchone())
+            self.has_media = bool(self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'message_media'").fetchone())
             return
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -117,6 +124,17 @@ class MessageStore:
                 observations INTEGER NOT NULL,
                 seen_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS message_media (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+                fingerprint TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                ocr_text TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                uncertainty TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'ocr',
+                status TEXT NOT NULL DEFAULT 'ocr',
+                updated_at REAL NOT NULL
+            );
             CREATE VIEW IF NOT EXISTS effective_messages AS
                 SELECT m.id, m.conversation_id, COALESCE(s.who, m.who) AS who,
                     CASE WHEN s.message_id IS NULL THEN m.sender ELSE s.sender END AS sender,
@@ -125,6 +143,7 @@ class MessageStore:
                 WHERE COALESCE(s.status, 'active') = 'active';
         """)
         self.has_states = True
+        self.has_media = True
         self._quarantine_legacy()
 
     def close(self):
@@ -144,8 +163,42 @@ class MessageStore:
         return list(reversed(rows))
 
     def history(self, app, title, limit=60):
-        return [(row["who"], row["sender"], row["text"])
-                for row in self._history_rows(app, title, limit)]
+        return self.context(app, title, limit)["history"]
+
+    def context(self, app, title, limit=60):
+        """文本和 ID 基于同一次查询，避免并发采集时将媒体描述拼到其他消息上。"""
+        rows = self._history_rows(app, title, limit)
+        media = self._media_rows(rows)
+        history = [(row["who"], row["sender"], describe_media(media[row["id"]])
+                    if row["id"] in media else row["text"]) for row in rows]
+        return {"history": history, "history_ids": [row["id"] for row in rows], "media_state": media}
+
+    def history_ids(self, app, title, limit=60):
+        return [row["id"] for row in self._history_rows(app, title, limit)]
+
+    def media_state(self, app, title, limit=60):
+        return self._media_rows(self._history_rows(app, title, limit))
+
+    def _media_rows(self, messages):
+        if not self.has_media or not messages:
+            return {}
+        ids = [row["id"] for row in messages]
+        roles = {row["id"]: row["who"] for row in messages}
+        marks = ",".join("?" for _ in ids)
+        return {row["message_id"]: {**dict(row), "who": roles[row["message_id"]]} for row in self.connection.execute(
+            f"SELECT * FROM message_media WHERE message_id IN ({marks})", ids)}
+
+    def update_media(self, app, title, message_id, fingerprint, result):
+        """异步识别只更新原消息；身份和状态校验防止过期结果覆盖新的识别。"""
+        with self.connection:
+            changed = self.connection.execute("""
+                UPDATE message_media SET summary = ?, uncertainty = ?, source = ?, status = ?, updated_at = ?
+                WHERE message_id = ? AND fingerprint = ? AND status = 'pending'
+                AND message_id IN (SELECT m.id FROM messages m JOIN conversations c
+                    ON c.id = m.conversation_id WHERE c.app = ? AND c.title = ?)
+            """, (result.get("summary", ""), result.get("uncertainty", ""), result.get("source", "ocr"),
+                  result.get("status", "failed"), time.time(), message_id, fingerprint, app, title)).rowcount
+        return bool(changed)
 
     def _revise(self, row, value, status, reason, snapshot_id=None):
         now = time.time()
@@ -224,6 +277,8 @@ class MessageStore:
         corrected = False
         for i, j in aligned:
             value = tuple(visible[j])
+            if TOKEN.fullmatch(previous[i][2]):
+                continue
             if previous[i] == value:
                 self.connection.execute(
                     "UPDATE correction_candidates SET observations = 0 WHERE message_id = ?", (rows[i]["id"],))
@@ -251,7 +306,7 @@ class MessageStore:
             "SELECT title FROM conversations WHERE app = ? ORDER BY last_read_at", (app,))]
 
     def record_snapshot(self, app, title, raw_title, visible, area, ocr_ms=0,
-                        title_confirmed=True, observed_at=None):
+                        title_confirmed=True, observed_at=None, media=None, vision=False):
         now = time.time() if observed_at is None else float(observed_at)
         rows = self._history_rows(app, title)
         previous = [(row["who"], row["sender"], row["text"]) for row in rows]
@@ -299,9 +354,49 @@ class MessageStore:
                         self._revise(original, value, "pending", "unanchored_batch", snapshot_id)
             corrected = (self._correct_observations(rows, visible, snapshot_id)
                          if title_confirmed and observed_at is None else False)
+            jobs = []
+            effective = self._history_rows(app, title)
+            if media and title_confirmed and not discontinuous:
+                aligned = dict((j, effective[i]) for i, j in align_messages(
+                    [(row["who"], row["sender"], row["text"]) for row in effective], visible))
+                for item in media:
+                    token = media_token(item["fingerprint"])
+                    for j, row in aligned.items():
+                        if visible[j][2] != token or visible[j][0] != item["who"]:
+                            continue
+                        existing = self.connection.execute(
+                            "SELECT * FROM message_media WHERE message_id = ?", (row["id"],)).fetchone()
+                        fresh = not existing and (bool(rows) and row["id"] > rows[-1]["id"]
+                                                  or not rows and j == len(visible) - 1)
+                        latest = (existing and existing["status"] == "ocr" and j == len(visible) - 1
+                                  and row["id"] == effective[-1]["id"])
+                        eligible = vision and item["who"] == "her" and (fresh or latest)
+                        state = "pending" if eligible else "ocr"
+                        if eligible and existing and existing["status"] == "ocr":
+                            self.connection.execute("UPDATE message_media SET status = 'pending', updated_at = ? "
+                                                    "WHERE message_id = ?", (now, row["id"]))
+                        if not existing:
+                            self.connection.execute("""
+                                INSERT INTO message_media(message_id, fingerprint, kind, ocr_text, status, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (row["id"], item["fingerprint"], item["kind"], item["ocr_text"], state, now))
+                        if eligible or vision and existing and existing["status"] == "pending":
+                            jobs.append({**item, "message_id": row["id"],
+                                         "fingerprint": existing["fingerprint"] if existing else item["fingerprint"]})
+            if not vision:
+                self.connection.execute("""
+                    UPDATE message_media SET status = 'ocr', updated_at = ? WHERE status = 'pending'
+                    AND message_id IN (SELECT id FROM messages WHERE conversation_id = ?)
+                """, (now, conversation_id))
+            media_values = self.media_state(app, title)
+            rendered = self.history(app, title)
+            new_ids = {row["id"] for row in effective if row["id"] > (rows[-1]["id"] if rows else 0)}
+            rendered_new = [value for row, value in zip(effective[-60:], rendered) if row["id"] in new_ids]
         return {"id": snapshot_id, "title": title, "raw_title": raw_title,
-                "visible": list(visible), "new": [] if discontinuous else new,
-                "history": self.history(app, title), "corrected": corrected,
+                "visible": list(visible), "new": [] if discontinuous or not title_confirmed else rendered_new,
+                "history": rendered, "corrected": corrected,
                 "area": tuple(area), "read_at": now, "baseline": baseline,
                 "title_confirmed": bool(title_confirmed), "status": status,
-                "discontinuous": discontinuous}
+                "discontinuous": discontinuous, "media_jobs": jobs, "media_state": media_values,
+                "latest_id": effective[-1]["id"] if effective else None,
+                "history_ids": [row["id"] for row in effective[-60:]]}

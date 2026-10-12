@@ -9,6 +9,7 @@ from rapidocr_onnxruntime import RapidOCR
 
 from app.chatapps import DEFAULT, ChatApp
 from app.message_store import new_messages
+from app.media import MediaReader
 
 _ENGINE: dict = {}
 _FELL_BACK = set()
@@ -119,6 +120,8 @@ class Reader:
         self.seen = []  # [(who, name, text)]，累计，封顶 500
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
         self.last_ms = 0  # 上一帧 OCR 耗时
+        self.media = MediaReader()
+        self.last_media = []
 
     def read(self, chat, pane_bg):
         """→ [(who, name, text, y)]，同一气泡的多行已合并。who ∈ me/her；name 群聊里是发言人，单聊 None。
@@ -166,7 +169,13 @@ class Reader:
                 lines[-1][4] = bottom
             else:
                 lines.append([who, nm, text, top, bottom])
-        return [(w, n, t, y) for w, n, t, y, _ in lines]
+        messages = [(w, n, t, y) for w, n, t, y, _ in lines]
+        self.last_media = []
+        if self.app.key == "wechat":
+            messages, self.last_media = self.media.read(chat, pane_bg, messages, self.last_boxes, self.ocr)
+            self.last_boxes.extend(item["rect"] + ("media", item["kind"]) for item in self.last_media)
+        self.last_ms = int((time.perf_counter() - t0) * 1000)
+        return messages
 
     def new_lines(self, lines):
         """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text)]。

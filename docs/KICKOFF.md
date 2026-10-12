@@ -7,10 +7,10 @@
 
 1. 只读**自己设备上、自己有权查看**的对话。
 2. 采集只用**窗口级截图 + 本地离线 OCR**。不 hook、不注入、不读微信数据库、不解密、不碰微信进程。
-3. **截图不落盘**：捕获得到的位图始终是内存里的对象（numpy/PIL），全程不写磁盘、不进日志、不上传。
+3. **截图不落盘，默认不上传**：捕获得到的位图始终在内存中，不写磁盘、不进日志。可选视觉模型仅在明确允许图片上传且开启生成建议时接收单条目标消息裁剪图；禁止将整窗、侧栏、头像或相邻消息作为视觉输入。
 4. **自动发送默认关闭且只能按会话明确授权**；发送前必须校验当前会话、最佳回复、单次 revision 和冷却时间。
 5. **不碰钱**：转账、红包、收款相关界面元素一律不碰。
-6. 密钥只从环境变量 / 注册表读取，任何文件不出现 key：Jev 用 `JEV_API_KEY`，独立通用判断用 `JUDGE_API_KEY`，起草用 `LLM_API_KEY`；通用判断复用起草配置时不需要第三把。
+6. 密钥只从环境变量 / 注册表读取，任何文件不出现 key：Jev 用 `JEV_API_KEY`，独立通用判断用 `JUDGE_API_KEY`，起草用 `LLM_API_KEY`，可选视觉模型用 `VISION_API_KEY`；通用判断复用起草配置时不需要独立判断密钥。
 7. Python 读写文件一律 `encoding='utf-8'`。
 
 ## 为什么走 OCR（已实测的结论，别重测）
@@ -73,3 +73,7 @@ Jev 接口、题目口径都跟 `core/` 里一致。
 - 自动文字修订须有前后相邻的准确消息锚点，且连续两次 OCR 一致；滚动隐藏消息不代表识别错误。启动时隔离旧版无锚点基线污染并从已存正确快照恢复漏入库消息；恢复记录沿用原采集时间，不算实时新消息。
 - Windows 离线回归命令：`.venv\Scripts\python.exe -m unittest app.test_ocr_geometry app.test_worker_storage app.test_message_store app.test_conversation_filter app.test_model_settings core.test_judge_fallback`。真实截图回归可设置 `JEV_OCR_TEST_IMAGE` 指向用户提供的本地截图；不复制截图进仓库。需要无窗口运行时设置 `QT_QPA_PLATFORM=offscreen`；发送相关测试使用 Mock，不实际操作聊天窗口。
 - 数据库及其 `-wal`、`-shm` 文件不进 Git；SQLite 文本未加密，依靠本机目录权限保护。开启生成建议后，最近的消息上下文仍会发给用户配置的模型服务。
+- 微信媒体定位和内存 PNG 编码在 `app/media.py`；`message_media` 关联原消息 ID，保存类型、感知指纹、OCR 原文、视觉描述、来源和状态，不保存图片。原始 `messages.text` 中的媒体标识仅用于顺序对齐，媒体上下文必须通过 `MessageStore.history()` 展开，不能直接消费 `effective_messages` 中的标识。
+- `core/vision.py` 只识别单条裁剪图；`core/llm.py` 分别适配 OpenAI Base64 Data URL、Anthropic Base64 source、Gemini inline bytes。视觉模型配置默认关闭，SenseNova 参数按图像接口使用 `reasoning_effort: none`，其他兼容模型需要验证图像输入能力。
+- 媒体回归追加：`.venv\Scripts\python.exe -m unittest app.test_media app.test_media_pipeline core.test_vision`。设置 `JEV_MEDIA_TEST_DIR` 为用户提供的四张示例图目录可执行本地截图回归；不复制图片、不发网络请求。完整回归同时执行上面的六个模块。
+- 待识别的媒体暂缓生成回复；识别失败或只有 OCR 的媒体上下文不允许自动发送。异步更新按消息 ID、会话、指纹和 pending 状态校验，历史基线的自动发送禁用状态不能因视觉补充而解除。

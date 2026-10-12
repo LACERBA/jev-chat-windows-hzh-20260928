@@ -21,9 +21,12 @@ from app.capture import find_chat_hwnd, switch_debug
 from app.fill import click, fill, fill_and_send
 from app.ocr import similar
 from app.message_store import MessageStore
+from app.media import describe_media
 from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
+from core.vision import recognize as recognize_media
+from core.jev_client import JevError
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
@@ -33,6 +36,9 @@ chats = {}
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "", "raw_chat": "",
          "ocr_confirmed": False, "read_at": 0.0}
 results = queue.Queue()
+media_results = queue.Queue()
+media_slots = threading.BoundedSemaphore(3)
+media_inflight = set()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 _AUTO_REPLY_COOLDOWN = 8.0
 _AUTO_REPLY_ECHO_WINDOW = 12.0
@@ -408,7 +414,8 @@ def chat_of(title):
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
                                     "target": None, "senders": [], "auto_sent_rev": -1,
                                     "auto_blocked_rev": -1, "last_auto_sent_at": 0.0,
-                                    "last_auto_sent_text": ""})
+                                    "last_auto_sent_text": "", "media_states": {},
+                                    "media_waiting": False, "latest_id": None, "history_ids": []})
 
 
 def sync_history(title, history):
@@ -423,6 +430,135 @@ def sync_history(title, history):
     ov.set_targets(title, chat["senders"], target_of(title))
 
 
+def sync_media(title, values, latest_id=None):
+    chat = chat_of(title)
+    previous = chat["media_states"]
+    updated = {key: value if value["updated_at"] >= previous.get(key, {}).get("updated_at", 0)
+               else previous[key] for key, value in values.items()}
+    merged = {**previous, **updated}
+    chat["media_states"] = {key: merged[key] for key in sorted(merged)[-60:]}
+    if latest_id is not None:
+        chat["latest_id"] = max(chat["latest_id"] or 0, latest_id)
+
+
+def sync_media_history(title, history, ids):
+    chat = chat_of(title)
+    if ids and chat["history_ids"] and ids[-1] < chat["history_ids"][-1]:
+        history, ids = [(who, name, text) for who, text, name in chat["history"]], chat["history_ids"]
+    elif ids:
+        chat["history_ids"] = list(ids)
+    values = chat["media_states"]
+    if ids:
+        history = [(who, name, describe_media(values[message_id]) if message_id in values else text)
+                   for message_id, (who, name, text) in zip(ids, history)]
+    sync_history(title, history)
+
+
+def context_media(title):
+    chat = chat_of(title)
+    ids = set(chat["history_ids"][-settings.context():])
+    return [value for key, value in chat["media_states"].items() if not chat["history_ids"] or key in ids]
+
+
+def media_pending(title):
+    return any(value["status"] == "pending" for value in context_media(title))
+
+
+def media_unreadable(title):
+    values = context_media(title)
+    return any(value.get("who") == "her" and (value["status"] in ("pending", "failed", "partial")
+               or not value.get("summary")) for value in values)
+
+
+def start_media_jobs(snapshot):
+    app_key = state.get("app", "wechat")
+    for job in reversed(snapshot.get("media_jobs", [])):
+        identity = (app_key, snapshot["title"], job["message_id"])
+        if identity in media_inflight:
+            continue
+        media_inflight.add(identity)
+        job["raw_title"] = snapshot["raw_title"]
+        admitted = media_slots.acquire(blocking=False)
+        threading.Thread(target=recognize_media_bg,
+                         args=(app_key, snapshot["title"], job, admitted), daemon=True).start()
+
+
+def recognize_media_bg(app_key, title, job, admitted=True):
+    """后台线程只处理目标裁剪图和原消息 ID，识别完成后释放图像内存。"""
+    fallback = {"summary": "", "source": "ocr", "status": "failed",
+                "uncertainty": "视觉识别未完成，本次仅保留本地 OCR，不能推断画面内容"}
+    try:
+        raw_title = job.get("raw_title", title)
+        allowed = (settings.analysis_enabled() and settings.vision_upload() and settings.media_mode() != "ocr"
+                   and (not settings.auto_switch() or settings.auto_reply_config(raw_title, app_key)["enabled"]))
+        if admitted and allowed and not settings.is_ignored_chat(title, app_key) and not settings.is_ignored_chat(raw_title, app_key):
+            try:
+                result = recognize_media(job["image"], job["kind"], job["ocr_text"], settings.vision_config())
+            except JevError as error:
+                result = {**fallback, "uncertainty": str(error) + "；已回退本地 OCR"}
+            except Exception:
+                result = fallback
+        else:
+            result = {**fallback, "status": "ocr" if not allowed else "failed"}
+        if not settings.analysis_enabled() or not settings.vision_upload() or settings.media_mode() == "ocr":
+            result = {**fallback, "status": "ocr"}
+        store = MessageStore(settings.message_db_path())
+        try:
+            changed = store.update_media(app_key, title, job["message_id"], job["fingerprint"], result)
+            media_results.put({"app": app_key, "title": title, "message_id": job["message_id"],
+                               **store.context(app_key, title), "changed": changed})
+        finally:
+            store.close()
+    except Exception:
+        media_results.put({"app": app_key, "title": title, "message_id": job["message_id"], "error": True})
+    finally:
+        job.pop("image", None)
+        if admitted:
+            media_slots.release()
+
+
+def drain_media():
+    while True:
+        try:
+            event = media_results.get_nowait()
+        except queue.Empty:
+            return
+        title = event["title"]
+        media_inflight.discard((event["app"], title, event["message_id"]))
+        if event["app"] != state.get("app", "wechat"):
+            continue
+        chat = chat_of(title)
+        if event.get("error"):
+            if title == ov.current_chat():
+                ov.set_status("媒体识别结果保存失败，暂不自动回复；请重新开启采集后重试", "warning")
+            continue
+        sync_media(title, event["media_state"])
+        if event["changed"]:
+            sync_media_history(title, event["history"], event.get("history_ids", []))
+            relevant = not chat["history_ids"] or event["message_id"] in chat["history_ids"][-settings.context():]
+            if relevant:
+                blocked = chat["rev"] <= chat["auto_blocked_rev"]
+                chat["rev"] += 1
+                if blocked:
+                    chat["auto_blocked_rev"] = chat["rev"]
+                chat["result"] = None
+                if title == ov.current_chat():
+                    ov.invalidate_replies()
+            request_read()
+        if media_pending(title) or not chat["media_waiting"]:
+            continue
+        chat["media_waiting"] = False
+        if not settings.analysis_enabled() or chat_is_ignored(title) or not chat["history"] or chat["history"][-1][0] != "her":
+            continue
+        msgs = list(chat["history"])
+        if conversation_controller.active and conversation_controller._matches(title, state.get("raw_chat", "")):
+            conversation_controller.active["revision"] = chat["rev"]
+        if state["busy"]:
+            state["rerun"] = (title, msgs)
+        else:
+            start_analyze(title, msgs)
+
+
 def restore_history():
     if not os.path.exists(settings.message_db_path()):
         return
@@ -432,7 +568,9 @@ def restore_history():
         app_key = state.get("app", "wechat")
         for title in store.conversations(app_key):
             if not chat_is_ignored(title):
-                sync_history(title, store.history(app_key, title))
+                context = store.context(app_key, title)
+                sync_media(title, context["media_state"])
+                sync_media_history(title, context["history"], context["history_ids"])
                 chat = chat_of(title)
                 chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
     except Exception as e:
@@ -443,12 +581,15 @@ def restore_history():
 
 
 def on_processing_changed():
+    request_read()
     conversation_controller.release()
     conversation_controller.pending_current = None
     state["rerun"] = None
     ov.set_busy(False)
     for chat in chats.values():
         chat["rev"] += 1
+        chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
+        chat["media_waiting"] = False
     ov.invalidate_replies()
 
 
@@ -490,6 +631,10 @@ def auto_send_reply(title, result, revision, announce=True):
     raw_config = settings.auto_reply_config(state.get("raw_chat", ""), state.get("app"))
     chat = chat_of(title)
     if not config["enabled"] or title != state["chat"] or revision != chat["rev"]:
+        return False
+    if media_unreadable(title):
+        if title == ov.current_chat():
+            ov.set_status("媒体内容尚未完整识别，本次候选仅供手动选择，不自动发送", "warning")
         return False
     if settings.auto_switch() and not raw_config["enabled"]:
         return False
@@ -654,9 +799,15 @@ def start_analyze(title, msgs):
         ov.set_busy(False)
         ov.set_status("当前会话已忽略，不参与自动处理", "idle")
         return False
+    if media_pending(title):
+        chat_of(title)["media_waiting"] = True
+        if title == ov.current_chat():
+            ov.set_status("正在识别目标媒体消息，完成后再生成回复", "busy")
+        return True
     if not settings.models_ready():
         ov.set_status("请先在设置中补全当前判断策略和起草模型配置", "warning")
         return False
+    chat_of(title)["media_waiting"] = False
     state["busy"] = True
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
@@ -751,7 +902,11 @@ def drain():
             if not snapshot["title_confirmed"]:
                 ov.set_status("会话标题尚未识别清楚，暂不处理消息", "warning")
                 continue
-            sync_history(title, snapshot["history"])
+            sync_media(title, snapshot.get("media_state", {}), snapshot.get("latest_id"))
+            sync_media_history(title, snapshot["history"], snapshot.get("history_ids", []))
+            start_media_jobs(snapshot)
+            if snapshot.get("media_jobs") and not snapshot["new"] and chat_of(title)["history"][-1][0] == "her":
+                chat_of(title)["media_waiting"] = True
             read_status = ("corrected" if snapshot.get("corrected") else "pending"
                            if snapshot.get("discontinuous") else snapshot["status"])
             ov.set_read_state(title, snapshot["read_at"], len(snapshot["new"]), read_status)
@@ -857,6 +1012,7 @@ def drain():
 def tick():
     try:
         drain()
+        drain_media()
         while not update_result.empty():
             latest, url = update_result.get()
             ov.set_update(latest, url)
@@ -887,6 +1043,11 @@ def tick():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
+                if media_unreadable(title):
+                    conversation_controller.result_abandoned(title)
+                    if title == ov.current_chat():
+                        ov.set_status("媒体内容未完整识别，回复建议仅供手动选择", "warning")
+                    continue
                 if (not r.get("ranking_valid", False)
                         and not r.get("auto_send_fallback", False)):
                     if (conversation_controller.active

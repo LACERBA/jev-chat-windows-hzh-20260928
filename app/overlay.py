@@ -22,7 +22,7 @@ from qfluentwidgets import (
 
 from app import settings
 from app.version import VERSION
-from core import jev_client, llm, providers
+from core import jev_client, llm, providers, vision
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -37,6 +37,10 @@ _JUDGE_MODES = [
     ("仅使用 Jev", "jev_only"),
     ("仅使用通用模型", "llm_only"),
 ]
+
+
+_MEDIA_MODES = [("仅本地 OCR，不上传图片", "ocr"), ("视觉模型识别，失败回退 OCR", "vision"),
+                ("OCR + 视觉模型互补", "hybrid")]
 
 
 def _choice(answers, name):
@@ -154,6 +158,7 @@ class _Fetched(QObject):
     """取模型列表的后台线程 → 主线程：哪一组（SimpleNamespace）、取回来的模型 id、失败原因（成功是空串）。
     Qt 不让跨线程碰控件，信号是跨线程唯一干净的路。"""
     done = Signal(object, list, str)
+    tested = Signal(str)
 
 
 class _TitleBar(QWidget):
@@ -680,6 +685,34 @@ class Overlay:
             "写那三条候选。OpenAI / Anthropic / Gemini 三种接口都走各自官方 SDK。"
             "默认 DeepSeek 官网直连，国内最快。"
         ))
+        box.addWidget(_label("图片、视频封面与表情识别", 14))
+        self.mediaModeBox = ComboBox()
+        self.mediaModeBox.addItems([label for label, _ in _MEDIA_MODES])
+        self.mediaModeBox.setAccessibleName("媒体识别方式")
+        self.mediaModeBox.setMinimumWidth(0)
+        box.addWidget(self.mediaModeBox)
+        upload_row = QHBoxLayout()
+        upload_row.addWidget(_label("允许目标消息图片上传", 13), 1)
+        self.visionUploadSwitch = SwitchButton()
+        self.visionUploadSwitch.setOnText("允许")
+        self.visionUploadSwitch.setOffText("禁止")
+        self.visionUploadSwitch.setAccessibleName("允许目标消息图片发送到视觉模型")
+        upload_row.addWidget(self.visionUploadSwitch)
+        box.addLayout(upload_row)
+        box.addWidget(self._hint(
+            "默认仅本地 OCR。开启图片上传后，只发送单条目标消息裁剪图（内存 Base64），不保存原图；"
+            "视频只看封面。照片和表情需要支持图像输入的模型，模糊缩略图可能无法完整识别；"
+            "仅 OCR 或识别失败的媒体回复建议需手动选择，不自动发送。"
+        ))
+        self.vision = self._model_group(box, "视觉识别 · 独立模型", "vision", providers.VISION_PROVIDERS)
+        self.visionTestButton = PushButton("验证图像输入能力")
+        self.visionTestButton.setAccessibleName("使用合成图片验证视觉模型")
+        self.visionTestButton.clicked.connect(self._test_vision)
+        box.addWidget(self.visionTestButton)
+        box.addWidget(self._hint("验证只发送程序生成的测试图，不发送微信截图；获取模型列表不等于模型支持识图。"))
+        self._fetched.tested.connect(self._vision_tested)
+        self.mediaModeBox.currentIndexChanged.connect(self._sync_model_fields)
+        self.visionUploadSwitch.checkedChanged.connect(self._sync_model_fields)
         think_row = QHBoxLayout()
         think_row.addWidget(_label("起草时开启思考模式", 13), 1)
         self.thinkingSwitch = SwitchButton()
@@ -718,9 +751,9 @@ class Overlay:
 
     def _model_group(self, box, title, kind, table):
         """一组「来源 / 密钥 / 模型」控件，判断和起草各一份。table 是 core/providers.py 里那张表。"""
-        key_titles = {"jev": "Jev 判断", "judge": "通用判断", "draft": "起草"}
+        key_titles = {"jev": "Jev 判断", "judge": "通用判断", "draft": "起草", "vision": "视觉识别"}
         stored_keys = {"jev": settings.jev_key, "judge": settings.judge_key,
-                       "draft": settings.llm_key}
+                       "draft": settings.llm_key, "vision": settings.vision_key}
         group = SimpleNamespace(kind=kind, table=table, ids=list(table),
                                 keyTitle=key_titles[kind], stored_key=stored_keys[kind],
                                 widgets=[])
@@ -787,9 +820,9 @@ class Overlay:
         """换来源：模型框回到这家该有的值（存的就是这家才用存的，否则用它的默认），状态清掉。"""
         provider = self._provider_of(group)
         saved = {"jev": settings.jev_provider, "judge": settings.judge_provider,
-                 "draft": settings.draft_provider}[group.kind]()
+                 "draft": settings.draft_provider, "vision": settings.vision_provider}[group.kind]()
         stored = {"jev": settings.jev_model, "judge": settings.judge_model,
-                  "draft": settings.draft_model}[group.kind]()
+                  "draft": settings.draft_model, "vision": settings.vision_model}[group.kind]()
         group.modelBox.clear()
         group.modelBox.setText(stored if provider == saved else group.table[provider].default)
         group.status.setText("")
@@ -799,9 +832,12 @@ class Overlay:
         """同步三组模型的密钥状态、可用性和自定义地址显隐。"""
         mode = _JUDGE_MODES[max(0, self.judgeModeBox.currentIndex())][1]
         reuse = self.judgeReuseSwitch.isChecked()
+        visual = _MEDIA_MODES[max(0, self.mediaModeBox.currentIndex())][1] != "ocr"
+        self.visionUploadSwitch.setEnabled(visual)
         active = {"jev": mode != "llm_only", "judge": mode != "jev_only" and not reuse,
-                  "draft": True}
-        for group in (self.jev, self.judge, self.draft):
+                  "draft": True, "vision": visual and self.visionUploadSwitch.isChecked()}
+        self.visionTestButton.setEnabled(active["vision"])
+        for group in (self.jev, self.judge, self.draft, self.vision):
             provider = self._provider_of(group)
             name = group.table[provider].name
             configured = bool(group.stored_key())
@@ -844,14 +880,44 @@ class Overlay:
             if group.kind == "jev":
                 models = jev_client.list_models(provider, key)
             else:
-                spec = providers.DRAFT_PROVIDERS[provider]
+                spec = group.table[provider]
                 models = llm.list_models(spec.protocol, base or spec.base, key, headers=spec.headers)
                 if spec.keep:  # 目录里混了别的协议时，只留这条路打得通的
                     models = [m for m in models if spec.keep(m)]
             reason = "" if models else "这个来源没返回任何模型"
         except Exception as exc:  # 线程里漏异常会静默吞掉，按钮就永远停在禁用态
-            models, reason = [], str(exc)[:120]
+            models, reason = [], jev_client.redact_secrets(str(exc).replace(key, "[REDACTED]"))[:120]
         self._fetched.done.emit(group, models, reason)
+
+    def _test_vision(self):
+        if not self.visionUploadSwitch.isChecked():
+            return
+        provider = self._provider_of(self.vision)
+        config = {"provider": provider, "model": self.vision.modelBox.text().strip(),
+                  "base_url": self.vision.baseEdit.text().strip() if provider in providers.CUSTOM else "",
+                  "api_key": self.vision.keyEdit.text().strip() or self.vision.stored_key(), "mode": "vision"}
+        self.visionTestButton.setEnabled(False)
+        self.vision.status.setText("正在使用合成图片验证…")
+        threading.Thread(target=self._test_vision_bg, args=(config,), daemon=True).start()
+
+    def _test_vision_bg(self, config):
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (180, 100), "white")
+        ImageDraw.Draw(image).rectangle((40, 20, 140, 80), fill="red")
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        try:
+            result = vision.recognize(buffer.getvalue(), "image", "", config)
+            message = "图像输入已通过验证：" + result["summary"] if result["status"] == "ready" else "模型未能识别测试图"
+        except Exception as exc:
+            message = "图像输入验证失败：" + jev_client.redact_secrets(str(exc))[:160]
+        self._fetched.tested.emit(message)
+
+    def _vision_tested(self, message):
+        self._sync_model_fields()
+        self.vision.status.setText(message)
 
     def _models_fetched(self, group, models, reason):
         """回到主线程：填进下拉框，原来选中的还在列表里就留着。"""
@@ -897,6 +963,11 @@ class Overlay:
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.judge.baseEdit.setText(settings.judge_base_url())
         self.draft.baseEdit.setText(settings.draft_base_url())
+        self._set_group(self.vision, settings.vision_provider(), settings.vision_model())
+        self.vision.baseEdit.setText(settings.vision_base_url())
+        self.mediaModeBox.setCurrentIndex(next(i for i, (_, value) in enumerate(_MEDIA_MODES)
+                                              if value == settings.media_mode()))
+        self.visionUploadSwitch.setChecked(settings.vision_upload())
         self.thinkingSwitch.setChecked(settings.thinking())
         self.autoSwitch.setChecked(settings.auto_switch())
         self.ignoredChatsEdit.setPlainText("\n".join(settings.ignored_chats("wechat")))
@@ -906,6 +977,9 @@ class Overlay:
         self.settingsFeedback.hide()
 
     def _save(self):
+        previous_media = (settings.media_mode(), settings.vision_upload(), settings.vision_provider(),
+                          settings.vision_model(), settings.vision_base_url())
+        vision_key_changed = bool(self.vision.keyEdit.text().strip())
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
         mode = _JUDGE_MODES[max(0, self.judgeModeBox.currentIndex())][1]
@@ -922,6 +996,9 @@ class Overlay:
             active.append((self.jev, jev_provider))
         if mode != "jev_only" and not reuse:
             active.append((self.judge, judge_provider))
+        media_mode = _MEDIA_MODES[max(0, self.mediaModeBox.currentIndex())][1]
+        if media_mode != "ocr" and self.visionUploadSwitch.isChecked():
+            active.append((self.vision, self._provider_of(self.vision)))
         for group, provider in active:
             name = group.table[provider].name
             if group.baseEdit and provider in providers.CUSTOM and not group.baseEdit.text().strip():
@@ -951,6 +1028,12 @@ class Overlay:
                           llm_key_text=self.draft.keyEdit.text().strip() or None,
                           draft_model_text=self.draft.modelBox.text().strip(),
                           draft_base_url_text=self.draft.baseEdit.text().strip(),
+                          media_mode_text=media_mode,
+                          vision_upload_on=self.visionUploadSwitch.isChecked(),
+                          vision_provider_text=self._provider_of(self.vision),
+                          vision_key_text=self.vision.keyEdit.text().strip() or None,
+                          vision_model_text=self.vision.modelBox.text().strip(),
+                          vision_base_url_text=self.vision.baseEdit.text().strip(),
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
@@ -960,6 +1043,10 @@ class Overlay:
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
+        current_media = (settings.media_mode(), settings.vision_upload(), settings.vision_provider(),
+                         settings.vision_model(), settings.vision_base_url())
+        if self.on_processing_change and (previous_media != current_media or vision_key_changed):
+            self.on_processing_change()
         self._load_settings()
         self._render_auto_reply()
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次

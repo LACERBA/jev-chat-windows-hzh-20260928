@@ -12,6 +12,7 @@ from app import chatapps, settings
 from app.capture import Capture, UnreadTracker, chat_area, switch_debug, unminimize
 from app.ocr import Reader, read_session_name, read_title, similar
 from app.message_store import MessageStore
+from app.media import encode_crop
 
 
 def _err(q):
@@ -53,6 +54,8 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
     unread_tracker = UnreadTracker(read_name=lambda full, area, badge: read_session_name(full, area, badge, app))
     last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
     last_chat = None
+    dispatched_media = set()
+    media_config = None
     warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
     while True:
         if not enabled.is_set():
@@ -70,6 +73,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
                 enabled.clear()  # 自己清掉，下一圈就去等着，别一秒重试几十次
                 continue
             head = last_chat = None
+            dispatched_media.clear()
             q.put(("resumed",))
         if not cap.alive():
             break
@@ -137,11 +141,27 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
                             if read_requested is not None:
                                 read_requested.set()
                             continue
+                        media = getattr(reader, "last_media", [])
+                        media = media if isinstance(media, list) else []
+                        config = (settings.media_mode(), settings.vision_upload(), settings.analysis_enabled())
+                        if config != media_config:
+                            dispatched_media.clear()
+                            media_config = config
+                        vision = (config[1] and config[0] != "ocr" and config[2]
+                                  and (not settings.auto_switch() or settings.auto_reply_config(raw_title, app.key)["enabled"]))
                         snapshot = store.record_snapshot(app.key, title, raw_title, visible, rect,
-                                                         reader.last_ms, title_confirmed)
+                                                         reader.last_ms, title_confirmed, media=media, vision=vision)
+                        snapshot["media_jobs"] = [job for job in snapshot["media_jobs"]
+                                                  if job["message_id"] not in dispatched_media]
+                        for job in snapshot["media_jobs"]:
+                            job["image"] = encode_crop(job.pop("pixels"))
+                            job.pop("rect", None)
+                        for item in media:
+                            item.pop("pixels", None)
                         snapshot["initial"] = initial or snapshot["baseline"]
-                        last_chat = chat_pixels if visible and title_confirmed else None
                         q.put(("snapshot", snapshot))
+                        dispatched_media.update(job["message_id"] for job in snapshot["media_jobs"])
+                        last_chat = chat_pixels if visible and title_confirmed else None
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines, unread)))
         except Exception:

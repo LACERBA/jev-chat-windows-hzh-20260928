@@ -9,6 +9,8 @@ SDK 都在函数里 import：桌面端一次只用到其中一家，启动时没
 """
 from __future__ import annotations
 
+import base64
+
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .jev_client import JevError, _fail
 except ImportError:
@@ -27,13 +29,26 @@ def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
 def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: str,
          user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
          thinking: bool = False, extra_body: dict | None = None,
-         headers: dict | None = None, timeout: float = 30, what: str = "起草") -> str:
+         headers: dict | None = None, timeout: float = 30, what: str = "起草",
+         image: bytes | None = None) -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
     thinking: 思考模式。OpenAI 协议没有统一字段，各家自己的开关由调用方经 extra_body 带进来；
               anthropic / gemini 是协议自带的参数，这里直接处理。
     """
+    if image is not None:
+        if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > 8 * 1024 * 1024:
+            raise JevError("图像输入必须是内存 PNG，且不超过 8MB")
+        encoded = base64.b64encode(image).decode("ascii")
+        parts = [{"type": "text", "text": user_turns[-1]}]
+        if protocol == "anthropic":
+            parts.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}})
+        elif protocol == "gemini":
+            parts.append({"type": "image", "data": image})
+        else:
+            parts.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}})
+        user_turns = list(user_turns[:-1]) + [parts]
     if protocol == "anthropic":
         return _anthropic(base_url, api_key, model, system, user_turns,
                           temperature, max_tokens, thinking, timeout, what)
@@ -103,7 +118,10 @@ def _gemini(base_url, api_key, model, system, user_turns, temperature, max_token
             system_instruction=system, temperature=temperature, max_output_tokens=max_tokens,
             # thinking_budget=0 才是真的关掉；不传是让模型自己定（等于开着）
             thinking_config=None if thinking else types.ThinkingConfig(thinking_budget=0))
-        contents = [types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
+        contents = [types.Content(role=m["role"], parts=(
+            [types.Part(text=m["content"])] if isinstance(m["content"], str) else
+            [types.Part(text=p["text"]) if p["type"] == "text" else
+             types.Part.from_bytes(data=p["data"], mime_type="image/png") for p in m["content"]]))
                     for m in _turns(user_turns, assistant="model")]  # Gemini 那边助手叫 model
         resp = client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as exc:

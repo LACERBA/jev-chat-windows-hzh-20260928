@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.message_store import MessageStore, new_messages
 
@@ -172,6 +173,86 @@ class MessageStoreTests(unittest.TestCase):
         second = self.record(visible)
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM ocr_snapshots").fetchone()[0], 1)
+
+    def media(self, fingerprint="1" * 32, text="", who="her"):
+        from app.media import media_token
+
+        item = {"fingerprint": fingerprint, "kind": "image", "ocr_text": text, "who": who,
+                "sender": None}
+        return (who, None, media_token(fingerprint)), item
+
+    def test_context_reads_message_order_once_for_ids_and_text(self):
+        bubble, item = self.media()
+        self.record([bubble, ("her", None, "最新文字")], media=[item])
+        with patch.object(self.store, "_history_rows", wraps=self.store._history_rows) as rows:
+            context = self.store.context("wechat", "月仔")
+        rows.assert_called_once()
+        self.assertEqual(len(context["history"]), len(context["history_ids"]))
+        self.assertIn("图片消息", context["history"][0][2])
+        self.assertIn(context["history_ids"][0], context["media_state"])
+
+    def test_media_identity_is_not_based_on_generated_summary(self):
+        bubble, item = self.media(text="通知正文")
+        snapshot = self.record([bubble], media=[item], vision=True)
+        message_id = snapshot["media_jobs"][0]["message_id"]
+        self.assertTrue(self.store.update_media("wechat", "月仔", message_id, item["fingerprint"],
+                                              {"summary": "通知图片", "status": "ready", "source": "hybrid"}))
+        again = self.record([bubble], media=[item], vision=True)
+        self.assertEqual(again["new"], [])
+        self.assertEqual(again["media_jobs"], [])
+        self.assertIn("通知正文", again["history"][0][2])
+        self.assertIn("通知图片", again["history"][0][2])
+        original = self.store.connection.execute("SELECT text FROM messages").fetchone()[0]
+        self.assertEqual(original, bubble[2])
+
+    def test_consecutive_identical_media_are_distinct_messages(self):
+        bubble, item = self.media()
+        self.record([bubble], media=[item])
+        latest = self.record([bubble, bubble], media=[item])
+        self.assertEqual(len(latest["new"]), 1)
+        self.assertEqual(len(latest["media_state"]), 2)
+        self.assertEqual(self.record([bubble, bubble], media=[item])["new"], [])
+
+    def test_different_media_tokens_do_not_match_by_shared_prefix(self):
+        first, item = self.media()
+        second, other = self.media("2" * 32)
+        self.record([first], media=[item])
+        latest = self.record([first, second], media=[item, other])
+        self.assertEqual(len(latest["new"]), 1)
+        self.assertEqual(len(latest["history"]), 2)
+
+    def test_only_latest_baseline_media_is_sent_to_vision(self):
+        first, item = self.media()
+        second, other = self.media("2" * 32)
+        snapshot = self.record([first, second], media=[item, other], vision=True)
+        self.assertEqual(len(snapshot["media_jobs"]), 1)
+        self.assertEqual(snapshot["media_jobs"][0]["fingerprint"], other["fingerprint"])
+
+    def test_media_result_is_scoped_to_conversation_and_fingerprint(self):
+        bubble, item = self.media()
+        snapshot = self.record([bubble], media=[item], vision=True)
+        message_id = snapshot["media_jobs"][0]["message_id"]
+        result = {"summary": "不应写入", "status": "ready"}
+        self.assertFalse(self.store.update_media("wechat", "其他会话", message_id, item["fingerprint"], result))
+        self.assertFalse(self.store.update_media("wechat", "月仔", message_id, "2" * 32, result))
+        self.assertEqual(self.store.media_state("wechat", "月仔")[message_id]["status"], "pending")
+
+    def test_disabling_vision_releases_pending_media_without_deleting_original(self):
+        bubble, item = self.media()
+        snapshot = self.record([bubble], media=[item], vision=True)
+        latest = self.record([bubble], media=[item], vision=False)
+        self.assertEqual(latest["new"], [])
+        self.assertEqual(next(iter(latest["media_state"].values()))["status"], "ocr")
+        message_id = snapshot["media_jobs"][0]["message_id"]
+        self.assertFalse(self.store.update_media("wechat", "月仔", message_id, item["fingerprint"],
+                                               {"summary": "过期结果", "status": "ready"}))
+
+    def test_restart_can_retry_visible_pending_media(self):
+        bubble, item = self.media()
+        first = self.record([bubble], media=[item], vision=True)
+        second = self.record([bubble], media=[item], vision=True)
+        self.assertEqual(second["new"], [])
+        self.assertEqual(first["media_jobs"][0]["message_id"], second["media_jobs"][0]["message_id"])
 
 
 if __name__ == "__main__":

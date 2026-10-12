@@ -3,7 +3,7 @@ from unittest.mock import mock_open, patch
 
 from app import settings
 from core import jev_client
-from core.providers import JEV_ENV, JUDGE_ENV, LLM_ENV
+from core.providers import JEV_ENV, JUDGE_ENV, LLM_ENV, VISION_ENV
 
 
 class ModelSettingsTests(unittest.TestCase):
@@ -77,6 +77,37 @@ class ModelSettingsTests(unittest.TestCase):
     def test_judge_key_is_redacted(self):
         with patch.dict(jev_client.os.environ, {JUDGE_ENV: "judge-secret"}, clear=False):
             self.assertEqual(jev_client.redact_secrets("key=judge-secret"), "key=[REDACTED]")
+
+    def test_media_defaults_do_not_upload_images(self):
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
+            self.assertEqual(settings.media_mode(), "ocr")
+            self.assertFalse(settings.vision_upload())
+            self.assertEqual(settings.vision_provider(), "sensenova")
+            self.assertEqual(settings.vision_model(), "sensenova-6.8-flash-lite")
+
+    def test_vision_key_is_saved_only_to_environment_and_redacted(self):
+        config = self._config()
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch.object(settings, "_set_key") as set_key, \
+                patch.object(settings, "_notify_env"), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(media_mode_text="hybrid", vision_upload_on=True, vision_key_text="vision-secret")
+        set_key.assert_any_call(VISION_ENV, "vision-secret")
+        self.assertEqual(dump.call_args.args[0]["media_mode"], "hybrid")
+        self.assertNotIn("vision-secret", str(dump.call_args.args[0]))
+        with patch.dict(jev_client.os.environ, {VISION_ENV: "vision-secret"}, clear=False):
+            self.assertEqual(jev_client.redact_secrets("key=vision-secret"), "key=[REDACTED]")
+
+    def test_unrelated_save_preserves_vision_config(self):
+        config = self._config(media_mode="hybrid", vision_upload=True, vision_provider="custom_openai",
+                              vision_model="local-vision", vision_base_url="http://localhost:1234/v1")
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(debug_view_on=True)
+        data = dump.call_args.args[0]
+        for name in ("media_mode", "vision_upload", "vision_provider", "vision_model", "vision_base_url"):
+            self.assertEqual(data[name], config[name])
 
 
 if __name__ == "__main__":

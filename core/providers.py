@@ -22,6 +22,7 @@ TYPESAFE_BASE = "https://api.typesafe.ai"
 JEV_ENV = "JEV_API_KEY"       # Jev 判断，不管选 OpenRouter 还是 TypeSafe
 JUDGE_ENV = "JUDGE_API_KEY"   # 独立通用判断；复用起草配置时不用
 LLM_ENV = "LLM_API_KEY"       # 起草，不管选哪家语言模型
+VISION_ENV = "VISION_API_KEY"
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
 
@@ -66,12 +67,18 @@ DRAFT_PROVIDERS = {  # 第一个就是默认：DeepSeek 官网直连
     "custom_anthropic": _Draft("自定义 · Anthropic 兼容", "anthropic", "", "", _NONE),
 }
 
+VISION_PROVIDERS = {key: DRAFT_PROVIDERS[key]._replace(default="") for key in (
+    "openai", "openrouter", "dashscope", "zhipu", "siliconflow", "moonshot",
+    "anthropic", "gemini", "custom_openai", "custom_anthropic")}
+VISION_PROVIDERS["sensenova"] = _Draft("SenseNova 商汤", "openai", "https://token.sensenova.cn/v1",
+                                     "sensenova-6.8-flash-lite", lambda on: {"reasoning_effort": "none"})
+
 # 这两个来源没有固定地址，设置页要多露一行 Base URL 出来
 CUSTOM = ("custom_openai", "custom_anthropic")
 # 起草时认思考开关的来源，设置页那句提示照着这里写
 THINKING = ("DeepSeek", "OpenRouter", "Anthropic", "Gemini")
 # 所有可能存 key 的环境变量，脱敏时一次全过一遍（jev_client.redact_secrets）
-ENV_VARS = sorted({JEV_ENV, JUDGE_ENV, LLM_ENV, *LEGACY.values()})
+ENV_VARS = sorted({JEV_ENV, JUDGE_ENV, LLM_ENV, VISION_ENV, *LEGACY.values()})
 
 
 if __name__ == "__main__":
@@ -95,5 +102,5 @@ if __name__ == "__main__":
     assert not any(go.keep(m) for m in (
         "minimax-m3", "qwen3.8-max", "grok-4.7", "gpt-6-luna", "muse-spark-1.2-contributor"))
     assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "JUDGE_API_KEY", "LLM_API_KEY",
-                        "OPENROUTER_API_KEY"]
+                        "OPENROUTER_API_KEY", "VISION_API_KEY"]
     print("providers ok")
