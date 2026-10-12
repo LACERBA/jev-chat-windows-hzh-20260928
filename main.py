@@ -20,6 +20,7 @@ from app import settings, update, worker
 from app.capture import find_chat_hwnd, switch_debug
 from app.fill import click, fill, fill_and_send
 from app.ocr import similar
+from app.message_store import MessageStore
 from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
@@ -29,12 +30,19 @@ from core.engine import analyze
 # 只是缓冲区，实际喂模型几条由设置里的「参考上下文」决定
 # senders：这个群里发过言的人，去重、最近的排最前；target：用户挑的回复对象（None = 跟着最近那个走）
 chats = {}
-state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "", "raw_chat": ""}
+state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "", "raw_chat": "",
+         "ocr_confirmed": False, "read_at": 0.0}
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 _AUTO_REPLY_COOLDOWN = 8.0
 _AUTO_REPLY_ECHO_WINDOW = 12.0
 _AUTO_REPLY_SEND_DELAY_MS = 1200
+read_requested = None
+
+
+def request_read():
+    if read_requested is not None:
+        read_requested.set()
 
 
 def chat_is_ignored(title, raw_title=""):
@@ -56,6 +64,8 @@ class ConversationController:
         self.expected_text = ""
         self.pending_current = None
         self.early_lines = None
+        self.early_snapshot = None
+        self.last_read_request = 0.0
 
     def mode_enabled(self):
         return (settings.auto_switch() and state.get("app") == "wechat"
@@ -102,7 +112,28 @@ class ConversationController:
             if title != self.active.get("title") or raw_title != self.active.get("raw"):
                 self.release("会话被手动切换，本次自动处理已取消", "warning")
 
+    def on_snapshot(self, snapshot):
+        title, raw_title = snapshot["title"], snapshot["raw_title"]
+        if not snapshot["title_confirmed"]:
+            return
+        if self.phase == "switching" and self._matches_switch_target(title, raw_title):
+            self.early_snapshot = snapshot
+            return
+        if self.phase != "waiting_lines" or not self._matches(title, raw_title):
+            return
+        visible = snapshot["visible"]
+        if not visible:
+            return
+        if not settings.analysis_enabled():
+            self.release(f"已读取「{raw_title}」的消息并保存到本地，仅采集模式", "success")
+        elif not snapshot["new"]:
+            self.release(f"已读取「{raw_title}」的可见消息，与本地历史一致，暂无新增", "idle")
+        elif visible[-1][0] == "me":
+            self.release("你已回复，等待对方的新消息", "idle")
+
     def route_lines(self, title, raw_title, revision, initial, latest_who):
+        if not settings.analysis_enabled():
+            return "skip"
         if chat_is_ignored(title, raw_title):
             return "skip"
         if self.phase == "send_failed":
@@ -116,6 +147,9 @@ class ConversationController:
         if self.phase == "waiting_lines" and self._matches(title, raw_title):
             if not self.active["authorized"]:
                 self.release(f"「{raw_title}」未开启自动回复，已跳过分析", "idle")
+                return "skip"
+            if latest_who != "her":
+                self.release("你已回复，等待对方的新消息", "idle")
                 return "skip"
             self.phase = "analyzing"
             self.deadline = 0.0
@@ -146,6 +180,9 @@ class ConversationController:
 
     def mark_result_ready(self, title, revision):
         if self.phase != "analyzing" or not self.active or self.active.get("title") != title:
+            return False
+        if not settings.send_enabled():
+            self.release("回复建议已生成，自动发送已关闭", "success")
             return False
         self.phase = "waiting_send"
         self.send_revision = revision
@@ -187,7 +224,7 @@ class ConversationController:
         return True
 
     def advance(self):
-        if self.phase != "listening" or state["busy"]:
+        if self.phase != "listening" or state["busy"] and settings.analysis_enabled():
             return
         if not self.pending_current and not self.pending:
             return
@@ -248,6 +285,9 @@ class ConversationController:
         ov.set_status("检测到新消息，正在切换会话", "busy")
 
     def tick(self):
+        if self.phase == "waiting_lines" and time.monotonic() - self.last_read_request >= 1.0:
+            request_read()
+            self.last_read_request = time.monotonic()
         if self.phase in ("switching", "waiting_lines", "waiting_send", "verifying"):
             if self.deadline and time.monotonic() >= self.deadline:
                 switch_debug("conversation_timeout", phase=self.phase,
@@ -260,7 +300,7 @@ class ConversationController:
                     ov.set_status(text, "warning")
                 else:
                     text = ("微信会话切换确认超时，继续监听新消息" if self.phase == "switching"
-                            else "切换后的会话尚未读到新消息，继续监听")
+                            else "会话已切换，但 OCR 尚未确认可见文本消息，继续监听")
                     self.release(text, "warning")
         self.advance()
 
@@ -282,6 +322,7 @@ class ConversationController:
         self.expected_text = ""
         self.pending_current = None
         self.early_lines = None
+        self.early_snapshot = None
 
     def release(self, text=None, kind="idle"):
         if self.active:
@@ -289,6 +330,7 @@ class ConversationController:
         self.phase = "listening"
         self.active = None
         self.early_lines = None
+        self.early_snapshot = None
         self.deadline = 0.0
         self.send_revision = None
         self.expected_text = ""
@@ -306,14 +348,17 @@ class ConversationController:
             return
         self.active.update(title=title, raw=raw_title,
                            authorized=settings.auto_reply_config(raw_title, "wechat")["enabled"])
-        if not self.active["authorized"]:
+        if not self.active["authorized"] and settings.analysis_enabled():
             self.release(f"已切换到「{raw_title}」，该会话未开启自动回复", "idle")
             return
         self.phase = "waiting_lines"
         self.deadline = time.monotonic() + 4.0
+        request_read()
+        self.last_read_request = time.monotonic()
+        snapshot, self.early_snapshot = self.early_snapshot, None
         early = self.early_lines
         self.early_lines = None
-        if early:
+        if early and settings.analysis_enabled():
             early_title, early_raw, revision, _, latest_who = early
             if (early_title != title or early_raw != raw_title
                     or state["chat"] != title or state["raw_chat"] != raw_title
@@ -330,7 +375,11 @@ class ConversationController:
             if not start_analyze(title, list(chat_of(title)["history"])):
                 self.release("模型尚未配置，已跳过自动分析", "warning")
             return
-        ov.set_status(f"已切换到「{raw_title}」，正在读取新消息", "busy")
+        if snapshot:
+            self.on_snapshot(snapshot)
+            if self.phase != "waiting_lines":
+                return
+        ov.set_status(f"已切换到「{raw_title}」，正在读取并核对本地历史", "busy")
 
     def _matches_switch_target(self, title, raw_title):
         if not self.active or not self.active.get("name"):
@@ -362,6 +411,45 @@ def chat_of(title):
                                     "last_auto_sent_text": ""})
 
 
+def sync_history(title, history):
+    chat = chat_of(title)
+    messages = [(who, text, name) for who, name, text in history]
+    if list(chat["history"]) == messages:
+        return
+    chat["history"] = deque(messages, maxlen=60)
+    chat["senders"] = list(dict.fromkeys(name for who, _, name in reversed(messages)
+                                        if who == "her" and name))
+    ov.replace_history(title, messages)
+    ov.set_targets(title, chat["senders"], target_of(title))
+
+
+def restore_history():
+    if not os.path.exists(settings.message_db_path()):
+        return
+    store = None
+    try:
+        store = MessageStore(settings.message_db_path(), read_only=True)
+        app_key = state.get("app", "wechat")
+        for title in store.conversations(app_key):
+            if not chat_is_ignored(title):
+                sync_history(title, store.history(app_key, title))
+    except Exception as e:
+        ov.set_status(f"本地消息历史读取失败：{type(e).__name__}", "warning")
+    finally:
+        if store is not None:
+            store.close()
+
+
+def on_processing_changed():
+    conversation_controller.release()
+    conversation_controller.pending_current = None
+    state["rerun"] = None
+    ov.set_busy(False)
+    for chat in chats.values():
+        chat["rev"] += 1
+    ov.invalidate_replies()
+
+
 def target_of(title):
     """这个会话现在的回复对象：用户挑过且人还在就用它，否则用最近说话的那个；单聊没有发言人 → None。"""
     chat = chat_of(title)
@@ -387,6 +475,8 @@ def fill_reply(text):
 
 
 def auto_send_reply(title, result, revision, announce=True):
+    if not settings.send_enabled() or not settings.analysis_enabled():
+        return False
     if os.environ.get("JEV_DISABLE_AUTO_SEND") == "1":
         switch_debug("send_disabled_for_debug", title=title)
         return False
@@ -401,7 +491,13 @@ def auto_send_reply(title, result, revision, announce=True):
         return False
     if settings.auto_switch() and not raw_config["enabled"]:
         return False
-    if state["hwnd"] is None or state["area"] is None or not capture_on.is_set():
+    if (state["hwnd"] is None or state["area"] is None or not capture_on.is_set()
+            or not state.get("ocr_confirmed", True)):
+        return False
+    if "read_at" in state and time.time() - state["read_at"] > 2.0:
+        request_read()
+        if title == ov.current_chat():
+            ov.set_status("发送前的当前会话读取尚未确认，本次不自动发送", "warning")
         return False
     if chat["auto_sent_rev"] == revision:
         return False
@@ -470,7 +566,8 @@ def auto_send_and_track(title, result, revision):
 def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
     p = multiprocessing.Process(target=worker.run,
-                                args=(q, state["hwnd"], capture_on, debug_on, state.get("app")),
+                                args=(q, state["hwnd"], capture_on, debug_on, state.get("app"),
+                                      read_requested),
                                 daemon=True)
     p.start()
     return p
@@ -547,6 +644,8 @@ def check_update_bg():
 
 
 def start_analyze(title, msgs):
+    if not settings.analysis_enabled():
+        return False
     raw_title = state.get("raw_chat", "") if title == state.get("chat") else ""
     if chat_is_ignored(title, raw_title):
         ov.invalidate_replies()
@@ -599,6 +698,7 @@ def drain():
         if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
             state["chat"] = msg[1]
             state["raw_chat"] = msg[2] if len(msg) > 2 else msg[1]
+            state["ocr_confirmed"] = False
             ov.set_chat(msg[1])
             conversation_controller.on_chat(state["chat"], state["raw_chat"])
             if chat_is_ignored(state["chat"], state["raw_chat"]):
@@ -620,6 +720,7 @@ def drain():
             continue
         if kind == "resumed":  # 子进程重新开始采集
             ov.set_capture(True)
+            restore_history()
             continue
         if kind == "dead":  # 采集彻底停了（微信关了之类），这才是真的要清状态
             state["area"] = None
@@ -636,8 +737,38 @@ def drain():
                 child.join()
                 child = None
             continue
+        snapshot = msg[1] if kind == "snapshot" else None
+        if snapshot is not None:
+            title, raw_title = snapshot["title"], snapshot["raw_title"]
+            state["area"] = snapshot["area"]
+            if title == state["chat"] and raw_title == state["raw_chat"]:
+                state["ocr_confirmed"] = snapshot["title_confirmed"] and bool(snapshot["visible"])
+                state["read_at"] = snapshot["read_at"]
+            if chat_is_ignored(title, raw_title):
+                continue
+            if not snapshot["title_confirmed"]:
+                ov.set_status("会话标题尚未识别清楚，暂不处理消息", "warning")
+                continue
+            sync_history(title, snapshot["history"])
+            ov.set_read_state(title, snapshot["read_at"], len(snapshot["new"]), snapshot["status"])
+            if snapshot.get("discontinuous"):
+                chat = chat_of(title)
+                chat["rev"] += 1
+                chat["auto_blocked_rev"] = chat["rev"]
+                ov.invalidate_replies()
+                if conversation_controller._matches(title, raw_title):
+                    conversation_controller.release()
+                ov.set_status("当前画面与历史缺少连续锚点，已保存文本但不自动回复", "warning")
+                continue
+            if not snapshot["new"]:
+                conversation_controller.on_snapshot(snapshot)
+                continue
+            msg = ("lines", title, snapshot["new"], snapshot["area"],
+                   snapshot["initial"], raw_title)
         _, title, new, area, *meta = msg
         state["area"] = area
+        if not new:
+            continue
         initial = bool(meta and meta[0])
         raw_title = meta[1] if len(meta) > 1 and meta[1] else state.get("raw_chat") or title
         if chat_is_ignored(title, raw_title):
@@ -658,18 +789,28 @@ def drain():
             if auto_echo:
                 who, name = "me", None
             normalized.append((who, name, text))
-            chat["history"].append((who, text, name))
-            ov.log_message(who, text, name, chat=title)
+            if snapshot is None:
+                chat["history"].append((who, text, name))
+                ov.log_message(who, text, name, chat=title)
             if who == "her" and name:  # 群里发过言的人，去重后最近的排最前
                 if name in chat["senders"]:
                     chat["senders"].remove(name)
                 chat["senders"].insert(0, name)
+        if snapshot is not None and normalized != new:
+            history = snapshot["history"][:-len(new)] + normalized
+            sync_history(title, history[-60:])
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         action = conversation_controller.route_lines(
             title, raw_title, chat["rev"], initial, normalized[-1][0])
         if (initial and action != "analyze_fresh"
                 and not conversation_controller.buffers_fresh_message(title, raw_title, chat["rev"])):
             chat["auto_blocked_rev"] = chat["rev"]  # 首帧是屏幕旧记录，只展示建议，绝不自动发送
+        if snapshot is not None:
+            conversation_controller.on_snapshot(snapshot)
+        if not settings.analysis_enabled():
+            if title == ov.current_chat():
+                ov.set_status("消息已保存到本地，生成建议与自动发送均未执行", "success")
+            continue
         if conversation_controller.observe(title, normalized):
             state["rerun"] = None
             ov.set_busy(False)
@@ -699,6 +840,10 @@ def tick():
         while not results.empty():
             kind, r, title, revision = results.get()
             state["busy"] = False
+            if not settings.analysis_enabled():
+                state["rerun"] = None
+                ov.set_busy(False)
+                continue
             if state["rerun"]:  # 分析期间又来了新消息，接着跑最新的
                 (t, msgs), state["rerun"] = state["rerun"], None
                 if not start_analyze(t, msgs):
@@ -726,9 +871,11 @@ def tick():
                         conversation_controller.release(
                             "候选未完成有效排序", "warning")
                 elif conversation_controller.mark_result_ready(title, revision):
+                    request_read()
                     ov.after(_AUTO_REPLY_SEND_DELAY_MS,
                              lambda t=title, result=r, rev=revision: auto_send_and_track(t, result, rev))
-                else:
+                elif settings.send_enabled():
+                    request_read()
                     ov.after(_AUTO_REPLY_SEND_DELAY_MS,
                              lambda t=title, result=r, rev=revision: auto_send_reply(t, result, rev))
             else:
@@ -746,12 +893,14 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
     ctypes.windll.user32.SetProcessDPIAware()
     q = multiprocessing.Queue()
+    read_requested = multiprocessing.Event()
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集
     debug_on = multiprocessing.Event()  # 同上，置位=子进程往队列里送整帧给调试窗
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  app_key_of=lambda: state.get("app", "wechat"),
-                 result_of=lambda t: chats.get(t, {}).get("result"))
+                 result_of=lambda t: chats.get(t, {}).get("result"),
+                 on_processing_change=on_processing_changed)
     child = dbg = None
     try:
         state["hwnd"], found = find_chat_hwnd()
@@ -766,8 +915,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
         child = spawn_worker()
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
-    if not settings.models_ready():
-        ov.set_status("请先在设置中补全当前判断策略和起草模型配置", "warning")
+    if settings.analysis_enabled() and not settings.models_ready():
+        ov.set_status("请先在设置中补全当前判断策略和起草模型配置；消息采集入库不受影响", "warning")
         ov.after(0, ov.open_settings)
     if settings.check_update() and update.parse_version(VERSION):  # 开发版没有版本号，不查也不烦源码用户
         threading.Thread(target=check_update_bg, daemon=True).start()

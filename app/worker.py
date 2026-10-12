@@ -11,6 +11,7 @@ import numpy as np
 from app import chatapps, settings
 from app.capture import Capture, UnreadTracker, chat_area, switch_debug, unminimize
 from app.ocr import Reader, read_session_name, read_title, similar
+from app.message_store import MessageStore
 
 
 def _err(q):
@@ -32,7 +33,7 @@ def _packet(full, area, title, reader, lines, unread):
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
 
-def run(q, hwnd, enabled, debug_on, app_key=None):
+def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
     """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
     恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
     debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
@@ -40,6 +41,13 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
     app = chatapps.get(app_key)
     switch_debug("worker_started", hwnd=hwnd, app=app.key)
     cap = None
+    try:
+        store = MessageStore(settings.message_db_path())
+    except Exception:
+        q.put(("dead", "本地消息数据库无法打开，请检查程序目录的写入权限"))
+        enabled.clear()
+        return
+    title_confirmed = False
     readers = {}  # {会话名: Reader}，一个会话一套去重状态
     title, raw_title, head = "", "", None  # 当前会话名 / 上一帧的头部像素
     unread_tracker = UnreadTracker(read_name=lambda full, area, badge: read_session_name(full, area, badge, app))
@@ -61,13 +69,17 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                 q.put(("dead", "无法开始采集：" + (" ".join(str(e).split())[:120] or type(e).__name__)))
                 enabled.clear()  # 自己清掉，下一圈就去等着，别一秒重试几十次
                 continue
+            head = last_chat = None
             q.put(("resumed",))
         if not cap.alive():
             break
         try:
             unminimize(hwnd)
-            full = cap.settled()
+            requested = read_requested is not None and read_requested.is_set()
+            full = cap.snapshot() if requested else cap.settled()
             if full is not None:
+                if requested:
+                    read_requested.clear()
                 reader, lines, unread = None, [], []  # 调试视图要用，消息区没认出来时就是空的
                 area = chat_area(full)  # 每次停稳都重算：拖完窗口微信布局会晚一拍才铺好，只按尺寸变化算一次会锁死
                 if area is None:
@@ -90,9 +102,12 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                         for event in events:
                             q.put(("unread", event))
                     crop = full[y_pane:y0, x0:x1]  # 头部：会话名在这里
-                    if head is None or not np.array_equal(crop, head):  # 名字没动就别白跑一次 OCR
+                    if requested or head is None or not np.array_equal(crop, head):  # 名字没动就别白跑一次 OCR
                         head = crop
                         raw_name = read_title(crop, app)
+                        title_confirmed = bool(raw_name)
+                        if not title_confirmed:
+                            head = None
                         switch_debug("header_title", raw_title=raw_name,
                                      area=rect, frame_shape=full.shape)
                         # OCR 抖一下（「小分队」↔「小分认」）不能分裂出一个新会话
@@ -113,17 +128,26 @@ def run(q, hwnd, enabled, debug_on, app_key=None):
                     initial = title not in readers
                     reader = readers.setdefault(title, Reader(app))
                     chat_pixels = full[y0:y1, x0:x1]
-                    if last_chat is None or not np.array_equal(chat_pixels, last_chat):
-                        last_chat = chat_pixels
+                    if requested or last_chat is None or not np.array_equal(chat_pixels, last_chat):
                         lines = reader.read(chat_pixels, bg)
-                        new = reader.new_lines(lines)
-                        if new:
-                            q.put(("lines", title, new, rect, initial, raw_title))
+                        visible = [(who, name, text) for who, name, text, _ in lines]
+                        latest = cap.latest
+                        if latest is not None and not np.array_equal(crop, latest[y_pane:y0, x0:x1]):
+                            head = last_chat = None
+                            if read_requested is not None:
+                                read_requested.set()
+                            continue
+                        snapshot = store.record_snapshot(app.key, title, raw_title, visible, rect,
+                                                         reader.last_ms, title_confirmed)
+                        snapshot["initial"] = initial or snapshot["baseline"]
+                        last_chat = chat_pixels if visible and title_confirmed else None
+                        q.put(("snapshot", snapshot))
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines, unread)))
         except Exception:
             _err(q)  # 一帧出错不退出
         time.sleep(0.05)
+    store.close()
     q.put(("dead", "采集停了（聊天窗口关了？）"))
     try:
         cap.wait()  # 采集线程若是报错死的，这里把错抛出来

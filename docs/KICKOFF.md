@@ -62,3 +62,12 @@
 
 安卓原版 `Finderchangchang/jev-chat-JARVIS`（同一套 Jev 判断内核，采集是安卓无障碍）。
 Jev 接口、题目口径都跟 `core/` 里一致。
+
+## 本地消息采集与回归验证
+
+- `app/message_store.py` 使用 Python 标准库 SQLite；采集子进程写入 `messages.sqlite3`，消费端使用只读连接，WAL 支持并行读写。不需要新增依赖。
+- `conversations` 按聊天软件和 OCR 会话名隔离；`messages` 存气泡文本、说话人和采集时间；`ocr_snapshots` 存可见文本与识别元数据，不存截图。采集时间不是微信原始发送时间。
+- 采集、生成建议、允许自动发送分别控制；`send_enabled` 默认关闭，开启后仍须会话授权。关闭 `analysis_enabled` 时采集入库不依赖模型配置。
+- 去重按气泡顺序对齐，不按历史文本是否出现去重；无连续锚点的画面保存为基线，不触发自动回复。只能采集已显示并被 OCR 识别的内容，不代表完整微信历史。
+- Windows 离线回归命令：`.venv\Scripts\python.exe -m unittest app.test_worker_storage app.test_message_store app.test_conversation_filter app.test_model_settings core.test_judge_fallback`。需要无窗口运行时设置 `QT_QPA_PLATFORM=offscreen`；发送相关测试使用 Mock，不实际操作聊天窗口。
+- 数据库及其 `-wal`、`-shm` 文件不进 Git；SQLite 文本未加密，依靠本机目录权限保护。开启生成建议后，最近的消息上下文仍会发给用户配置的模型服务。

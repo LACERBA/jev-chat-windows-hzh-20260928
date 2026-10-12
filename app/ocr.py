@@ -8,6 +8,7 @@ import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 
 from app.chatapps import DEFAULT, ChatApp
+from app.message_store import new_messages
 
 _ENGINE: dict = {}
 _FELL_BACK = set()
@@ -168,11 +169,10 @@ class Reader:
         """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text)]。
         本帧有已知行时只要已知行下方的：往上滚翻出来的旧消息在已知行上方，不算。
         本帧一行已知的都没有（大图把旧文字全顶出去了、切了聊天、滚远了）：全算，宁可多算不能漏。
-        ponytail: 同一人连发两句一模一样的会吞一句——对触发分析无害。"""
-        known_y = [y for w, n, t, y in lines if self._seen(w, n, t)]
-        floor = max(known_y) if known_y else -1
-        new = [(w, n, t) for w, n, t, y in lines if y > floor and not self._seen(w, n, t)]
-        self.seen.extend((w, n, t) for w, n, t, _ in lines if not self._seen(w, n, t))
+        重复文本按气泡顺序区分，同一人再次发相同内容仍可识别为新消息。"""
+        visible = [(w, n, t) for w, n, t, _ in lines]
+        new, _ = new_messages(self.seen, visible)
+        self.seen.extend(new)
         del self.seen[:-500]
         return new
 

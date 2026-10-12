@@ -113,6 +113,15 @@ def debug_view() -> bool:
 def auto_switch() -> bool:
     return bool(_read("auto_switch", False))
 
+def analysis_enabled() -> bool:
+    return bool(_read("analysis_enabled", True))
+
+def send_enabled() -> bool:
+    return bool(_read("send_enabled", False))
+
+def message_db_path() -> str:
+    return os.path.join(_ROOT, "messages.sqlite3")
+
 def normalize_chat_title(title: str) -> str:
     return " ".join(title.split())
 
@@ -266,7 +275,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None,
-         ignored_chats_value: list[str] | None = None) -> None:
+         ignored_chats_value: list[str] | None = None,
+         analysis_enabled_on: bool | None = None, send_enabled_on: bool | None = None) -> None:
     """每个参数为空/None = 保留当前值。密钥只写进程环境 + HKCU\\Environment。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     judge = judge_provider_text if judge_provider_text in DRAFT_PROVIDERS else judge_provider()
@@ -308,6 +318,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
         "auto_switch": flag(auto_switch_on, auto_switch),
+        "analysis_enabled": flag(analysis_enabled_on, analysis_enabled),
+        "send_enabled": flag(send_enabled_on, send_enabled),
         "ignored_chats": ignored,
         "auto_reply_chats": (_read("auto_reply_chats", {}) if auto_reply_chats_value is None
                               else auto_reply_chats_value),

@@ -11,7 +11,8 @@ import main
 
 class ConversationFilterTests(unittest.TestCase):
     def setUp(self):
-        self.config = {"auto_switch": True, "ignored_chats": {"wechat": ["银行通知", "营销群"]}}
+        self.config = {"auto_switch": True, "send_enabled": True,
+                       "ignored_chats": {"wechat": ["银行通知", "营销群"]}}
         self.read_patch = patch.object(settings, "_read", side_effect=lambda name, default=None:
                                        self.config.get(name, default))
         self.read_patch.start()
@@ -305,7 +306,7 @@ class ConversationFilterTests(unittest.TestCase):
     def test_each_timeout_names_the_stage_that_stalled(self):
         phases = {
             "switching": "微信会话切换确认超时，继续监听新消息",
-            "waiting_lines": "切换后的会话尚未读到新消息，继续监听",
+            "waiting_lines": "会话已切换，但 OCR 尚未确认可见文本消息，继续监听",
             "waiting_send": "自动回复仍在等待发送，暂不切换其他会话",
             "verifying": "发送已执行但未确认，暂停切换；请检查当前会话后再切换",
         }
@@ -415,6 +416,140 @@ class ConversationFilterTests(unittest.TestCase):
         analyze.assert_not_called()
         self.assertEqual(self.controller.phase, "waiting_lines")
 
+    def _drain_packets(self, packets):
+        import queue as queue_module
+
+        q = Mock()
+        q.get_nowait.side_effect = packets + [queue_module.Empty]
+        with patch.object(main, "q", q, create=True):
+            main.drain()
+
+    def _snapshot(self, new=None, visible=None, **changes):
+        new = [] if new is None else new
+        snapshot = {"title": "月仔", "raw_title": "月仔", "new": new,
+                    "visible": visible if visible is not None else [("her", None, "是吗 哈哈")],
+                    "history": [("her", None, "是吗 哈哈")], "area": self.state["area"],
+                    "read_at": 100, "initial": False, "title_confirmed": True, "status": "read"}
+        snapshot.update(changes)
+        return snapshot
+
+    def test_cached_snapshot_completes_switch_read_without_false_timeout_or_model_call(self):
+        self.controller.phase = "waiting_lines"
+        self.controller.active = {"id": "person:1", "title": "月仔", "raw": "月仔",
+                                  "authorized": True}
+        with patch.object(main, "start_analyze") as analyze:
+            self._drain_packets([("snapshot", self._snapshot())])
+        analyze.assert_not_called()
+        self.assertEqual(self.controller.phase, "listening")
+        self.overlay.set_status.assert_called_with(
+            "已读取「月仔」的可见消息，与本地历史一致，暂无新增", "idle")
+        self.assertEqual(list(main.chat_of("月仔")["history"]), [("her", "是吗 哈哈", None)])
+
+    def test_cached_snapshot_before_confirmation_is_replayed(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "previous_title": "群聊", "previous_raw": "群聊"}
+        self.controller.badges = {"person": {"name": "月仔"}}
+        with patch.object(main, "start_analyze") as analyze:
+            self._drain_packets([("chat", "月仔", "月仔"), ("snapshot", self._snapshot()),
+                                 ("unread_state", [])])
+        analyze.assert_not_called()
+        self.assertEqual(self.controller.phase, "listening")
+
+    def test_later_cached_snapshot_does_not_discard_buffered_fresh_message(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "previous_title": "群聊", "previous_raw": "群聊"}
+        self.controller.badges = {"person": {"name": "月仔"}}
+        new = [("her", None, "是吗 哈哈")]
+        with patch.object(main, "start_analyze", return_value=True) as analyze:
+            self._drain_packets([("chat", "月仔", "月仔"),
+                                 ("snapshot", self._snapshot(new=new, initial=True)),
+                                 ("snapshot", self._snapshot()), ("unread_state", [])])
+        analyze.assert_called_once_with("月仔", [("her", "是吗 哈哈", None)])
+        self.assertEqual(self.controller.phase, "analyzing")
+        self.assertEqual(main.chat_of("月仔")["auto_blocked_rev"], -1)
+
+    def test_read_only_mode_does_not_call_models_or_require_reply_authorization(self):
+        self.config["analysis_enabled"] = False
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "candidate_title": "月仔", "candidate_raw": "月仔"}
+        self.controller._confirm_switch()
+        self.assertEqual(self.controller.phase, "waiting_lines")
+        with patch.object(main, "start_analyze") as analyze:
+            self._drain_packets([("snapshot", self._snapshot(new=[("her", None, "是吗 哈哈")]))])
+        analyze.assert_not_called()
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertEqual(len(main.chat_of("月仔")["history"]), 1)
+
+    def test_global_send_switch_blocks_authorized_chat_without_stopping_analysis(self):
+        self.config["send_enabled"] = False
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "person:1", "title": "月仔", "raw": "月仔"}
+        self.assertFalse(self.controller.mark_result_ready("月仔", 0))
+        self.assertEqual(self.controller.phase, "listening")
+        with patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply(
+                "月仔", {"candidates": ["收到"], "best_index": 0, "ranking_valid": True}, 0))
+        send.assert_not_called()
+
+    def test_snapshot_preserves_auto_send_echo_protection(self):
+        import time
+
+        chat = main.chat_of("月仔")
+        chat["last_auto_sent_text"] = "这是刚刚发送的回复"
+        chat["last_auto_sent_at"] = time.monotonic()
+        incoming = [("her", None, "这是刚刚发送的回复")]
+        with patch.object(main, "start_analyze") as analyze:
+            self._drain_packets([("snapshot", self._snapshot(new=incoming, visible=incoming,
+                                                              history=incoming))])
+        analyze.assert_not_called()
+        self.assertEqual(list(chat["history"]), [("me", "这是刚刚发送的回复", None)])
+
+    def test_changing_mode_invalidates_scheduled_send_revision(self):
+        chat = main.chat_of("月仔")
+        chat["rev"] = 3
+        self.controller.phase = "waiting_send"
+        self.controller.active = {"id": "person:1", "title": "月仔", "raw": "月仔"}
+        self.controller.send_revision = 3
+        main.on_processing_changed()
+        with patch.object(main, "auto_send_reply") as send:
+            main.auto_send_and_track("月仔", {}, 3)
+        send.assert_not_called()
+        self.assertEqual(chat["rev"], 4)
+        self.assertEqual(self.controller.phase, "listening")
+
+    def test_unconfirmed_or_discontinuous_snapshot_never_triggers_analysis(self):
+        for changes in ({"title_confirmed": False}, {"discontinuous": True}):
+            with self.subTest(changes=changes), patch.object(main, "start_analyze") as analyze:
+                self._drain_packets([("snapshot", self._snapshot(new=[("her", None, "未知消息")],
+                                                                 **changes))])
+            analyze.assert_not_called()
+
+    def test_switch_confirmation_requests_fresh_ocr_even_if_pixels_unchanged(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.controller.phase = "switching"
+        self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
+                                  "candidate_title": "月仔", "candidate_raw": "月仔"}
+        event = Mock()
+        with patch.object(main, "read_requested", event):
+            self.controller._confirm_switch()
+        event.set.assert_called_once()
+
+    def test_send_requires_recent_confirmed_snapshot(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.state["ocr_confirmed"] = True
+        self.state["read_at"] = 100
+        with patch.object(main.time, "time", return_value=103), \
+                patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply(
+                "月仔", {"candidates": ["收到"], "best_index": 0, "ranking_valid": True}, 0))
+        send.assert_not_called()
+
     def test_ignored_lines_are_not_stored_or_analyzed(self):
         queue = Mock()
         import queue as queue_module
@@ -426,6 +561,32 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertNotIn("公众号", main.chats)
         analyze.assert_not_called()
         self.overlay.log_message.assert_not_called()
+
+
+class MessageSequenceTests(unittest.TestCase):
+    def setUp(self):
+        with patch.object(ocr, "_engine"):
+            self.reader = ocr.Reader()
+
+    def test_repeated_incoming_text_after_outgoing_reply_is_new(self):
+        first = [("her", None, "是吗 哈哈", 10), ("me", None, "到底怎么了", 50)]
+        self.reader.new_lines(first)
+        self.assertEqual(self.reader.new_lines(first + [("her", None, "是吗 哈哈", 90)]),
+                         [("her", None, "是吗 哈哈")])
+
+    def test_identical_consecutive_bubbles_are_distinct(self):
+        self.reader.new_lines([("her", None, "哈哈", 10)])
+        self.assertEqual(self.reader.new_lines([("her", None, "哈哈", 10),
+                                                ("her", None, "哈哈", 50)]),
+                         [("her", None, "哈哈")])
+
+    def test_unchanged_and_scrolled_history_is_not_new(self):
+        lines = [("her", None, "你好", 10), ("me", None, "今天怎么样", 50),
+                 ("her", None, "还好", 90)]
+        self.reader.new_lines(lines)
+        self.assertEqual(self.reader.new_lines(lines), [])
+        self.assertEqual(self.reader.new_lines(lines[:2]), [])
+        self.assertEqual(self.reader.new_lines(lines[1:]), [])
 
 
 class UnreadNameTests(unittest.TestCase):
@@ -630,6 +791,46 @@ class OverlayFilterTests(unittest.TestCase):
         self.assertFalse(self.overlay.autoKeyBox.isEnabled())
         self.assertEqual(self.overlay.cands, [])
         self.assertEqual(self.overlay.emptyTitle.text(), "当前会话已忽略")
+
+    def test_processing_switches_default_to_suggestions_without_sending(self):
+        self.assertTrue(self.overlay.analysisSwitch.isChecked())
+        self.assertFalse(self.overlay.sendSwitch.isChecked())
+
+    def test_read_only_switch_persists_independently_and_notifies_controller(self):
+        callback = Mock()
+        self.overlay.on_processing_change = callback
+
+        def save(**changes):
+            self.config["analysis_enabled"] = changes["analysis_enabled_on"]
+            self.config["send_enabled"] = changes["send_enabled_on"]
+
+        with patch.object(settings, "save", side_effect=save) as persist:
+            self.overlay.analysisSwitch.setChecked(False)
+        persist.assert_called_once_with(analysis_enabled_on=False, send_enabled_on=False)
+        callback.assert_called_once()
+        self.assertTrue(self.overlay.captureSwitch.isChecked())
+        self.assertEqual(self.overlay.emptyTitle.text(), "仅采集并保存消息")
+
+    def test_global_send_enable_requires_explicit_confirmation(self):
+        from PySide6.QtWidgets import QMessageBox
+
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.No), \
+                patch.object(settings, "save") as save:
+            self.overlay.sendSwitch.setChecked(True)
+        save.assert_not_called()
+        self.assertFalse(self.overlay.sendSwitch.isChecked())
+
+    def test_restored_history_and_read_status_are_isolated_by_chat(self):
+        self.overlay.set_chat("月仔")
+        self.overlay.replace_history("月仔", [("her", "是吗 哈哈", None), ("me", "已回复", None)])
+        self.overlay.set_read_state("月仔", 100, 0, "read")
+        self.overlay.replace_history("其他人", [("her", "另一段消息", None)])
+        self.assertEqual(self.overlay.counts["月仔"], 2)
+        self.assertEqual(self.overlay.counts["其他人"], 1)
+        self.assertEqual(self.overlay.hers["月仔"], "是吗 哈哈")
+        self.assertIn("新增 0 条", self.overlay.readState.text())
+        self.overlay.set_chat("其他人")
+        self.assertNotIn("新增 0 条", self.overlay.readState.text())
 
     def test_regular_chat_retains_auto_reply_controls(self):
         self.overlay.set_chat("月仔")

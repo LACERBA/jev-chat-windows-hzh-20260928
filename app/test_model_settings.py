@@ -57,6 +57,23 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertFalse(data["judge_reuse_draft"])
         self.assertNotIn("judge-secret", str(data))
 
+    def test_processing_defaults_keep_sending_disabled(self):
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
+            self.assertTrue(settings.analysis_enabled())
+            self.assertFalse(settings.send_enabled())
+
+    def test_processing_mode_save_preserves_independent_switches_and_chat_authorization(self):
+        config = self._config(analysis_enabled=False, send_enabled=True,
+                              auto_reply_chats={"wechat:月仔": {"enabled": True}})
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), \
+                patch("builtins.open", mock_open()), patch.object(settings.json, "dump") as dump:
+            settings.save(send_enabled_on=False)
+        data = dump.call_args.args[0]
+        self.assertFalse(data["analysis_enabled"])
+        self.assertFalse(data["send_enabled"])
+        self.assertEqual(data["auto_reply_chats"], config["auto_reply_chats"])
+
     def test_judge_key_is_redacted(self):
         with patch.dict(jev_client.os.environ, {JUDGE_ENV: "judge-secret"}, clear=False):
             self.assertEqual(jev_client.redact_secrets("key=judge-secret"), "key=[REDACTED]")

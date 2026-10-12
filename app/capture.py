@@ -268,6 +268,7 @@ class Capture:
         self.shape = self.area = self.last = self.last_sidebar = self.pending = None
         self.t = self.t0 = 0.0
         self._debug_frames = 0
+        self.latest = None
         # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
         # 这个属性要 Win10 2004（build 19041）才有，1909 及更早直接抛 CursorConfigUnsupported。
         # 显式 None 走系统默认，不去切换；draw_border 同理。
@@ -283,6 +284,7 @@ class Capture:
             switch_debug("capture_frame", shape=full.shape, max_pixel=int(full.max()))
         if full.max() == 0:
             return
+        self.latest = full
         if self.area is None or full.shape != self.shape:
             self.shape, self.area = full.shape, chat_area(full)
             switch_debug("capture_area", shape=self.shape,
@@ -315,6 +317,11 @@ class Capture:
             return None
         full, self.pending = self.pending, None
         return full
+
+    def snapshot(self):
+        if self.pending is not None:
+            return self.settled()
+        return self.latest
 
     def alive(self):
         return not self.ctl.is_finished()

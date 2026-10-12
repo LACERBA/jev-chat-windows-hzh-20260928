@@ -226,7 +226,7 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None, app_key_of=None):
+                 on_toggle_debug=None, app_key_of=None, on_processing_change=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -239,6 +239,8 @@ class Overlay:
         self.on_toggle_debug = on_toggle_debug
         self.app_key_of = app_key_of or (lambda: "wechat")
         self.result_of = result_of
+        self.on_processing_change = on_processing_change
+        self.read_states = {}
         self.cands = []
         self.cards = []
         self._busy = False
@@ -278,7 +280,7 @@ class Overlay:
         self.captureSwitch = SwitchButton(header)
         self.captureSwitch.setOnText("采集中")
         self.captureSwitch.setOffText("已暂停")
-        self.captureSwitch.setToolTip("开启或暂停采集")
+        self.captureSwitch.setToolTip("开启或暂停消息读取与本地 SQLite 保存，与生成建议和自动发送独立")
         self.captureSwitch.setAccessibleName("开启或暂停采集")
         self.captureSwitch.setChecked(True)
         self.captureSwitch.checkedChanged.connect(self._capture_toggled)
@@ -322,8 +324,9 @@ class Overlay:
         self.win.resize(min(440, screen.width() - 32), min(820, screen.height() - 48))
         self.win.move(screen.right() - self.win.width() - 20, screen.top() + 24)
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
-        self.set_status("等待新消息" if settings.has_key() else "需要配置模型",
-                        "idle" if settings.has_key() else "warning")
+        self.set_status("仅采集模式：消息保存到本地 SQLite" if not settings.analysis_enabled()
+                        else "等待新消息" if settings.has_key() else "需要配置模型",
+                        "idle" if not settings.analysis_enabled() or settings.has_key() else "warning")
         self.win.show()
 
     def _scroll_page(self):
@@ -391,6 +394,30 @@ class Overlay:
         self.chatFollow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         chat_row.addWidget(self.chatFollow)
         body.addLayout(chat_row)
+        processing_row = QHBoxLayout()
+        processing_row.addWidget(_label("生成建议", 12, _MUTED))
+        self.analysisSwitch = SwitchButton()
+        self.analysisSwitch.setOnText("开")
+        self.analysisSwitch.setOffText("关")
+        self.analysisSwitch.setAccessibleName("生成回复建议")
+        self.analysisSwitch.setToolTip("关闭后只在本地读取和保存消息，不调用模型")
+        processing_row.addWidget(self.analysisSwitch)
+        processing_row.addStretch(1)
+        processing_row.addWidget(_label("允许发送", 12, _MUTED))
+        self.sendSwitch = SwitchButton()
+        self.sendSwitch.setOnText("开")
+        self.sendSwitch.setOffText("关")
+        self.sendSwitch.setAccessibleName("允许自动发送")
+        self.sendSwitch.setToolTip("全局发送开关；仍需当前会话明确开启自动回复，手动填入不受影响")
+        processing_row.addWidget(self.sendSwitch)
+        body.addLayout(processing_row)
+        self._render_processing()
+        self.analysisSwitch.checkedChanged.connect(self._processing_toggled)
+        self.sendSwitch.checkedChanged.connect(self._processing_toggled)
+        self.readState = _label("消息读取后自动保存到本地 SQLite", 11, _MUTED)
+        self.readState.setWordWrap(True)
+        self.readState.setToolTip(settings.message_db_path())
+        body.addWidget(self.readState)
         auto_row = QHBoxLayout()
         auto_row.setSpacing(8)
         auto_prefix = _label("自动回复", 12, _MUTED)
@@ -573,7 +600,8 @@ class Overlay:
         auto_switch_row.addWidget(self.autoSwitch)
         box.addLayout(auto_switch_row)
         box.addWidget(self._hint(
-            "检测到运行期间的新未读后串行切换；未开启自动回复的会话不会调用模型。"
+            "检测到运行期间的新未读后串行切换并采集入库；关闭生成建议即可仅采集，"
+            "未开启会话自动回复时不会自动调用模型。"
         ))
         ignored_label = _label("忽略微信会话（可选，每行一个完整名称）", 13)
         box.addWidget(ignored_label)
@@ -1024,6 +1052,8 @@ class Overlay:
         configured = settings.has_key()
         if not on:
             self.set_status(reason or "采集已暂停，聊天内容不再读取", "warning")
+        elif not settings.analysis_enabled():
+            self.set_status("仅采集模式：正在读取并保存到本地 SQLite", "idle")
         elif configured:
             self.set_status("等待新消息", "idle")
         else:
@@ -1060,6 +1090,11 @@ class Overlay:
         if settings.is_ignored_chat(self._shown, self.app_key_of()):
             self.emptyTitle.setText("当前会话已忽略")
             self.emptyHint.setText("不自动切换、不生成回复建议、不自动发送。\n你仍可以在微信中手动浏览。")
+            self.setupButton.hide()
+            return
+        if not settings.analysis_enabled():
+            self.emptyTitle.setText("仅采集并保存消息")
+            self.emptyHint.setText("不调用模型，不自动发送。\n需要回复建议时，开启上方的生成建议。")
             self.setupButton.hide()
             return
         configured = settings.has_key()
@@ -1130,6 +1165,59 @@ class Overlay:
         self.latest.setToolTip(text)
         self.context.show()
 
+    def replace_history(self, title, messages):
+        self.feeds[title] = []
+        self.counts[title] = 0
+        self.hers.pop(title, None)
+        if title == self._shown:
+            self.feed.clear()
+        for who, text, name in messages:
+            self.log_message(who, text, name, timestamp="已采集", chat=title)
+        if title == self._shown:
+            self._history_title()
+
+    def set_read_state(self, title, read_at, new_count, status):
+        moment = datetime.fromtimestamp(read_at).strftime("%H:%M:%S")
+        text = (f"本地已保存 · {moment} · 新增 {new_count} 条" if status == "read"
+                else f"OCR 暂未识别到文本消息 · {moment}")
+        self.read_states[title] = text
+        if title == self._shown:
+            self.readState.setText(text)
+
+    def _render_processing(self):
+        for widget, value in ((self.analysisSwitch, settings.analysis_enabled()),
+                              (self.sendSwitch, settings.send_enabled())):
+            widget.blockSignals(True)
+            widget.setChecked(value)
+            widget.blockSignals(False)
+
+    def _processing_toggled(self, _):
+        sending = self.sendSwitch.isChecked()
+        if sending and not settings.send_enabled():
+            answer = QMessageBox.warning(
+                self.win, "允许自动发送",
+                "开启后，已明确授权自动回复的会话可以发送新消息的回复。\n"
+                "仅采集和仅生成建议都不需要开启。是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self._render_processing()
+                return
+        try:
+            settings.save(analysis_enabled_on=self.analysisSwitch.isChecked(), send_enabled_on=sending)
+        except Exception:
+            self._render_processing()
+            self.set_status("处理模式保存失败，请检查配置文件是否可写。", "error")
+            return
+        if self.on_processing_change:
+            self.on_processing_change()
+        self._empty_text()
+        self._render_auto_reply()
+        text = ("仅采集模式：本地读取并保存消息，不调用模型、不自动发送"
+                if not self.analysisSwitch.isChecked() else "生成建议模式：不会自动发送"
+                if not sending else "生成建议与授权会话自动发送已开启")
+        self.set_status(text, "warning" if sending and self.analysisSwitch.isChecked() else "success")
+
     def _auto_send_key(self):
         return "ctrl_enter" if self.autoKeyBox.currentIndex() == 1 else "enter"
 
@@ -1147,7 +1235,7 @@ class Overlay:
         self.autoReplySwitch.setEnabled(enabled)
         self.autoKeyBox.setEnabled(enabled)
         tooltip = ("当前会话已忽略，不参与自动处理" if ignored
-                   else "只对当前显示的会话生效；开启后最佳回复会覆盖输入框并直接发送"
+                   else "只对当前显示的会话生效；全局允许发送开启后，最佳回复才会覆盖输入框并发送"
                    if app_key == "wechat" else "当前聊天软件暂未开放自动发送，请先使用手动填入")
         self.autoReplySwitch.setToolTip(tooltip)
         self.autoKeyBox.setToolTip("必须和微信中的发送快捷键设置一致；选出最佳回复后会自动发送"
@@ -1231,6 +1319,7 @@ class Overlay:
     def _switch_to(self, title):
         """换正在看的会话：记录、对方最近说、条数、上次的建议一起换过去。"""
         self._shown = title
+        self.readState.setText(self.read_states.get(title, "消息读取后自动保存到本地 SQLite"))
         self.feed.clear()
         for line in self.feeds.get(title, []):
             self.feed.appendPlainText(line)
