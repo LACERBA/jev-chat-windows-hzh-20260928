@@ -125,7 +125,8 @@ class MediaReader:
         for x, y, bw, bh, size in stats[1:]:
             if (20 * scale <= bw <= 90 * scale and 20 * scale <= bh <= 90 * scale
                     and 0.7 <= bw / bh <= 1.4 and size > bw * bh * 0.35
-                    and (x + bw < w * 0.10 or x > w * 0.90)):
+                    and (x + bw < w / 2 and x <= bw * 0.85
+                         or x > w / 2 and w - x - bw <= bw * 0.85)):
                 avatars.append((int(x), int(y), int(bw), int(bh)))
         avatars.sort(key=lambda rect: rect[1])
         media = []
@@ -160,11 +161,17 @@ class MediaReader:
                 dominant = colors[amounts.argmax()].astype(int) * 8
                 colorful = ((pixels.max(axis=2).astype(int) - pixels.min(axis=2)) > 40)
                 colorful &= np.abs(pixels.astype(int) - dominant).sum(axis=2) > 60
+                if dominant.max() - dominant.min() > 40:
+                    hue = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)[:, :, 0].astype(int)
+                    background_hue = int(cv2.cvtColor(dominant.astype(np.uint8).reshape(1, 1, 3), cv2.COLOR_RGB2HSV)[0, 0, 0])
+                    difference = np.abs(hue - background_hue)
+                    colorful &= np.minimum(difference, 180 - difference) > 12
                 has_color = colorful.sum() >= max(20, pixels.shape[0] * pixels.shape[1] * 0.005)
                 filtered = any(box[4] in ("image", "tiny") for box in contained)
                 textured = amounts.max() / len(samples) < 0.55
-                if not (has_color or filtered or textured and y1 - y0 > ah * 1.5
-                        or not normal and y1 - y0 >= ah):
+                large = y1 - y0 > ah * 2
+                if not (has_color or filtered and large or textured and y1 - y0 > ah * 1.5
+                        or not normal and y1 - y0 >= ah and (not text or large)):
                     continue
                 names = [box[5] for box in boxes if box[4] == "name" and ax < box[0] < left + aw
                          and ay - ah <= box[1] < y0]

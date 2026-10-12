@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -32,6 +33,27 @@ class MediaGeometryTests(unittest.TestCase):
         self.assertEqual(media[0]["pixels"].shape, (140, 180, 3))
         self.assertEqual(messages[-1], lines[0])
 
+    def test_narrow_pane_detects_emoji_and_image_with_fixed_size_avatars(self):
+        self.frame = np.full((400, 400, 3), 245, dtype=np.uint8)
+        self.frame[30:62, 18:50] = (20, 30, 50)
+        self.frame[30:62, 64:104] = 235
+        self.frame[40:55, 76:92] = (250, 180, 20)
+        self.frame[110:142, 18:50] = (20, 30, 50)
+        self.frame[110:324, 64:199] = (160, 80, 60)
+        messages, media = self.read()
+        self.assertEqual([item["kind"] for item in media], ["emoji", "image"])
+        self.assertEqual([line[0] for line in messages], ["her", "her"])
+        self.assertEqual(media[-1]["rect"], (64, 110, 199, 324))
+
+    def test_narrow_pane_outgoing_avatar_is_not_mistaken_for_media(self):
+        self.frame = np.full((400, 400, 3), 245, dtype=np.uint8)
+        self.frame[50:82, 350:382] = (20, 30, 50)
+        self.frame[50:200, 205:340] = (100, 100, 100)
+        messages, media = self.read()
+        self.assertEqual(len(media), 1)
+        self.assertEqual(messages[0][0], "me")
+        self.assertEqual(media[0]["rect"], (205, 50, 340, 200))
+
     def test_outgoing_image_uses_layout_not_image_color(self):
         self.frame[:] = 245
         self.frame[50:90, 545:585] = (20, 30, 50)
@@ -46,6 +68,23 @@ class MediaGeometryTests(unittest.TestCase):
         self.frame[50:90, 75:255] = 235
         lines = [("her", None, "普通文字", 60)]
         messages, media = self.read(lines, [(80, 60, 200, 80, "her", "普通文字")])
+        self.assertEqual(media, [])
+        self.assertEqual(messages, lines)
+
+    def test_filtered_text_on_flat_bubble_is_not_media(self):
+        self.frame[50:190, 75:255] = 245
+        self.frame[50:90, 75:255] = 235
+        messages, media = self.read([], [(80, 60, 200, 80, "image", "普通文字")])
+        self.assertEqual(media, [])
+        self.assertEqual(messages, [])
+
+    def test_green_text_antialiasing_is_not_an_emoji(self):
+        self.frame[:] = 245
+        self.frame[50:90, 545:585] = (20, 30, 50)
+        self.frame[50:90, 350:525] = (149, 236, 105)
+        self.frame[60:80, 365:510:3] = (75, 118, 53)
+        lines = [("me", None, "普通文字", 60)]
+        messages, media = self.read(lines, [(365, 60, 510, 80, "me", "普通文字")])
         self.assertEqual(media, [])
         self.assertEqual(messages, lines)
 
@@ -102,6 +141,46 @@ class MediaGeometryTests(unittest.TestCase):
     def test_png_encoding_is_in_memory(self):
         encoded = encode_crop(self.frame[50:190, 75:255])
         self.assertTrue(encoded.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    @unittest.skipUnless(os.environ.get("JEV_MEDIA_BUG_IMAGE"), "需要用户提供的窄窗口截图")
+    def test_user_narrow_window_screenshot_detects_latest_media(self):
+        from app.capture import chat_area
+        from app.ocr import Reader
+
+        frame = np.array(Image.open(os.environ["JEV_MEDIA_BUG_IMAGE"]).convert("RGB"))[:, :624]
+        area = chat_area(frame)
+        self.assertIsNotNone(area)
+        x0, y0, x1, y1, bg, _ = area
+        self.assertLess(x1 - x0, 500)
+        reader = Reader()
+        messages = reader.read(frame[y0:y1, x0:x1], bg)
+        self.assertEqual([item["kind"] for item in reader.last_media], ["emoji", "image"],
+                         [(item["kind"], item["rect"], item["ocr_text"]) for item in reader.last_media])
+        self.assertEqual(messages[-1][0], "her")
+        left, top, right, bottom = reader.last_media[-1]["rect"]
+        self.assertGreaterEqual(x0 + left, 274)
+        self.assertLessEqual(x0 + right, 420)
+        self.assertGreaterEqual(y0 + top, 286)
+        self.assertLessEqual(y0 + bottom, 507)
+        from app.media import TOKEN
+        from app.message_store import MessageStore
+
+        visible = [(who, name, text) for who, name, text, _ in messages]
+        baseline = [line for line in visible if not TOKEN.fullmatch(line[2])]
+        self.assertTrue(baseline)
+        with tempfile.TemporaryDirectory() as directory:
+            store = MessageStore(Path(directory) / "messages.sqlite3")
+            try:
+                store.record_snapshot("wechat", "月伢", "月伢", baseline, area[:4])
+                snapshot = store.record_snapshot("wechat", "月伢", "月伢", visible, area[:4], media=reader.last_media)
+                self.assertEqual(len(snapshot["new"]), 2)
+                self.assertFalse(snapshot["discontinuous"])
+                self.assertIn("表情消息", snapshot["new"][0][2])
+                self.assertIn("图片消息", snapshot["new"][1][2])
+                repeated = store.record_snapshot("wechat", "月伢", "月伢", visible, area[:4], media=reader.last_media)
+                self.assertEqual(repeated["new"], [])
+            finally:
+                store.close()
 
     @unittest.skipUnless(os.environ.get("JEV_MEDIA_TEST_DIR"), "需要用户提供的本地媒体截图目录")
     def test_four_reference_screenshots(self):
