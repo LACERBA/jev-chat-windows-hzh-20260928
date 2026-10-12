@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import urllib.request
 
-_API = "https://api.github.com/repos/jev-chat/jev-chat-windows/releases/latest"
+_API = "https://api.github.com/repos/LACERBA/local-ai-chat/releases/latest"
 
 
 def parse_version(v: str) -> tuple[int, ...] | None:
@@ -25,7 +25,7 @@ def check_latest(current: str, timeout=6) -> tuple[str, str] | None:
         return None
     try:
         req = urllib.request.Request(_API, headers={
-            "User-Agent": f"jev-chat-windows/{current}",
+            "User-Agent": f"local-ai-chat/{current}",
             "Accept": "application/vnd.github+json",
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:

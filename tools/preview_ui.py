@@ -242,7 +242,7 @@ def main() -> int:
 
         # 只有当前会话有结果，切到另一个会话就是空态——跟真实情况一致
         ov = Overlay(on_fill=simulate_fill, result_of=lambda t: _RESULT if t == _CHAT else None)
-        ov.win.setWindowTitle("JevChat-Windows · 界面演示（合成数据）")
+        ov.win.setWindowTitle("Local AI Chat · 界面演示（合成数据）")
         shot = ov.win  # 截图截哪个窗口；调试预览截调试窗
 
         if args.state == "debug":
@@ -265,7 +265,7 @@ def main() -> int:
             ov.set_chat(_CHAT)
             ov.show(_RESULT)
             ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
-            ov.set_update("9.9.9", "https://github.com/jev-chat/jev-chat-windows/releases/latest")
+            ov.set_update("9.9.9", "https://github.com/LACERBA/local-ai-chat/releases/latest")
             if args.state == "loading":
                 ov.set_busy(True)
                 ov.set_status("演示模式：正在为最新消息生成建议…", kind="busy")

@@ -42,7 +42,7 @@ _NONE = lambda on: {}  # noqa: E731 —— 没有思考开关的来源
 # OpenCode Go 用这个头做路由和 prompt cache，缺了直接 400。进程内一个 UUID 就过格式校验
 _OPENCODE_HEADERS = {
     "x-opencode-session": str(uuid.uuid4()),
-    "User-Agent": "jev-chat-windows",
+    "User-Agent": "local-ai-chat",
 }
 # /v1/models 还混着走 /messages、/responses 的模型，那些用 chat/completions 会失败
 _OPENCODE_CHAT = ("deepseek-", "glm-", "kimi-", "mimo-", "longcat-", "hy", "space-bunny-")
@@ -90,7 +90,7 @@ if __name__ == "__main__":
     assert go.protocol == "openai" and go.base == "https://opencode.ai/zen/go/v1"
     assert go.default == "deepseek-v4.1-flash" and go.extra(True) == {}
     uuid.UUID(go.headers["x-opencode-session"])
-    assert go.headers["User-Agent"] == "jev-chat-windows" and "key" not in go.headers
+    assert go.headers["User-Agent"] == "local-ai-chat" and "key" not in go.headers
     assert go.keep("deepseek-v4.1-flash") and go.keep("glm-5.3") and go.keep("hy3")
     assert not any(go.keep(m) for m in (
         "minimax-m3", "qwen3.8-max", "grok-4.7", "gpt-6-luna", "muse-spark-1.2-contributor"))

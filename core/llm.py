@@ -199,9 +199,9 @@ if __name__ == "__main__":
     assert "extra_body" not in seen["openai.call"]
     # 来源要求的额外头（OpenCode Go）要进 SDK，别的来源不带
     chat("openai", "https://opencode.ai/zen/go/v1", "k", "deepseek-v4.1-flash", "S", ["U"],
-         headers={"x-opencode-session": "sid", "User-Agent": "jev-chat-windows"})
+         headers={"x-opencode-session": "sid", "User-Agent": "local-ai-chat"})
     assert seen["openai.init"]["default_headers"] == {
-        "x-opencode-session": "sid", "User-Agent": "jev-chat-windows"}
+        "x-opencode-session": "sid", "User-Agent": "local-ai-chat"}
     chat("openai", "https://api.deepseek.com", "k", "m", "S", ["U"])
     assert "default_headers" not in seen["openai.init"]
     # 追问补齐：user / assistant / user 三轮
@@ -236,8 +236,8 @@ if __name__ == "__main__":
     # 列模型：去重排序；gemini 剥掉 models/ 前缀
     assert list_models("openai", "https://x/v1", "k") == ["a", "b"]
     assert "default_headers" not in seen["openai.init"]
-    list_models("openai", "https://x/v1", "k", headers={"User-Agent": "jev-chat-windows"})
-    assert seen["openai.init"]["default_headers"] == {"User-Agent": "jev-chat-windows"}
+    list_models("openai", "https://x/v1", "k", headers={"User-Agent": "local-ai-chat"})
+    assert seen["openai.init"]["default_headers"] == {"User-Agent": "local-ai-chat"}
     assert list_models("anthropic", "", "k") == ["claude-x", "claude-y"]
     assert list_models("gemini", "", "k") == ["gemini-1", "gemini-2"]
 

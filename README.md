@@ -1,21 +1,19 @@
-# JevChat-Windows
+# Local AI Chat
 
-本仓库只维护当前这一套识别。有能力的人可以 Fork 后自行适配别的聊天窗口，作者不提供这项适配，也不对 Fork 出去的改动负责。
+本项目由 `LACERBA/local-ai-chat` 独立维护，用于自己设备上的聊天消息采集、SQLite 存储、分析和授权回复。不再使用原 fork 仓库的发布与更新渠道；上游代码的许可证、版权和来源声明继续保留。
 
 ```bash
-git clone https://github.com/jev-chat/jev-chat-windows.git
-cd jev-chat-windows
+git clone git@github.com:LACERBA/local-ai-chat.git
+cd local-ai-chat
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
 
-## 公众号
+## 项目维护与来源
 
-反馈和合作走公众号「恸码奇点」。扫左边的码，或者搜一搜这个名字。
-
-<p align="center"><img src="docs/wechat-mp.png" width="640" alt="公众号：恸码奇点"></p>
+源码与反馈统一使用 [LACERBA/local-ai-chat](https://github.com/LACERBA/local-ai-chat)；问题可提交到本仓库的 [Issues](https://github.com/LACERBA/local-ai-chat/issues)。原项目的公众号不作为本仓库的维护或反馈入口。
 
 聊天窗口旁挂的回复辅助：本地 OCR 读屏上的对话 → 配置的判断器分析意图/情绪 → 给出 3 条候选回复 →
 一键填入输入框。默认由你确认发送；也可以只为明确选中的会话开启自动回复。
@@ -25,13 +23,13 @@ python main.py
 
 ## 下载即用（推荐）
 
-**普通使用直接下载，不用装 Python、不用碰源码。** 后面的「源码运行」是给开发者的。
+**安装包由本仓库独立发布，不再下载或检查原项目的版本。** 新仓库尚未发布安装包时，请先使用后面的「源码运行」。
 
-👉 **[下载最新版](https://github.com/jev-chat/jev-chat-windows/releases/latest)**
+**[查看本仓库 Releases](https://github.com/LACERBA/local-ai-chat/releases)**
 
-1. 在 Releases 页下载 `jev-chat-windows-vX.Y.Z.zip`（约 146 MB）
+1. 在 Releases 页下载 `local-ai-chat-vX.Y.Z.zip`（约 146 MB）
 2. 解压到一个固定目录（整个文件夹一起，exe 要用旁边那堆文件）
-3. 双击 `jev-chat-windows.exe`
+3. 双击 `local-ai-chat.exe`
 
 要求：Windows 10 1903+ / 11，聊天窗口开着，Jev 与起草服务的 API key（见下）。
 
@@ -254,8 +252,8 @@ MiniMax、Qwen 走 `/messages`，Grok、GPT 走 `/responses`，选了会失败�
 普通使用请直接用上面的[下载即用](#下载即用推荐)。想改代码、调 prompt、自己打包才需要这一节。
 
 ```bash
-git clone https://github.com/jev-chat/jev-chat-windows.git
-cd jev-chat-windows
+git clone git@github.com:LACERBA/local-ai-chat.git
+cd local-ai-chat
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -277,7 +275,7 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --clean jev.spec
 ```
 
-出来的是 `dist\jev-chat-windows\`，整个文件夹就是成品（onedir：onefile 有 150MB 要每次启动解压）。
+出来的是 `dist\local-ai-chat\`，整个文件夹就是成品（onedir：onefile 有 150MB 要每次启动解压）。
 推一个 `v*` tag，`.github/workflows/release.yml` 会在 `windows-latest` 上打好、压成 zip 挂到 Release 上；
 手动触发（workflow_dispatch）只出 artifact，方便试打包。
 
@@ -380,7 +378,7 @@ NOTICE                  出处、第三方组件许可证与商用约束
 docs/KICKOFF.md         最初的需求和硬约束说明
 docs/icon.ico           程序图标，tools/make_icon.py 生成
 docs/ui_*.png           README 里那三张截图，tools/preview_ui.py --screenshot 出的
-docs/wechat-mp.png      公众号「恸码奇点」长条横幅，README 标题下和设置页底部共用
+docs/wechat-mp.png      保留的上游历史资源，不作为本仓库的反馈入口
 config.json             你自己的设置，不进仓库（在 .gitignore 里）
 messages.sqlite3         本地消息文本与 OCR 元数据，不进仓库；不存截图
 ```
@@ -496,8 +494,8 @@ messages.sqlite3         本地消息文本与 OCR 元数据，不进仓库；�
 
 Copyright © 2026 rezoch340 与 jev-chat 贡献者。代码以 [MIT](LICENSE) 协议开源，另见 [NOTICE](NOTICE)。
 
-- 本项目是 [Jev 聊天助手](https://github.com/jev-chat/jev-chat-jarvis)（安卓原版）的 Windows
-  姊妹项目，Jev 判断内核与题目口径来自上游，版权归 Finderchangchang 与 jev-chat 贡献者所有。
+- 本项目在 JevChat-Windows 代码基础上独立维护，不代表原项目作者或组织。Jev 判断内核与题目口径来自
+  [Jev 聊天助手](https://github.com/jev-chat/jev-chat-jarvis)（安卓原版），上游部分版权归 Finderchangchang 与 jev-chat 贡献者所有。
 - **分发或商用时须保留 LICENSE 与 NOTICE**，并在产品「关于」页、说明文档或发布页写明来源。推荐写法：
   `基于 JevChat-Windows（https://github.com/jev-chat/jev-chat-windows）二次开发`。
 - 不要用「JevChat-Windows」「Jev 聊天助手」「jev-chat」名称或 chatjevs.com 域名暗示由原作者出品或背书。

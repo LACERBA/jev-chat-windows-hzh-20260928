@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 REM One-click local build. ASCII only: Chinese Windows cmd is GBK.
-REM Output: dist\jev-chat-windows\jev-chat-windows.exe
+REM Output: dist\local-ai-chat\local-ai-chat.exe
 
 if not exist ".venv\Scripts\python.exe" (
     echo Creating virtualenv .venv ...
@@ -19,8 +19,8 @@ pyinstaller --noconfirm --clean jev.spec || goto :fail
 
 echo.
 echo Build OK.
-echo   %cd%\dist\jev-chat-windows\jev-chat-windows.exe
-echo Ship the whole dist\jev-chat-windows folder: the exe needs the files next to it.
+echo   %cd%\dist\local-ai-chat\local-ai-chat.exe
+echo Ship the whole dist\local-ai-chat folder: the exe needs the files next to it.
 pause
 exit /b 0
 
