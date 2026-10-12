@@ -103,6 +103,69 @@ class MessageStoreTests(unittest.TestCase):
         self.assertEqual(self.store.history("wechat", "月仔"), [])
         self.assertEqual(self.store.conversations("wechat"), [])
 
+    def test_unanchored_batch_is_quarantined_and_does_not_block_latest_message(self):
+        history = [("me", None, "claude code 确实猛"), ("me", None, "来进行图灵测试")]
+        self.record(history)
+        bad = self.record([("her", "ALiGN前端...", "我叫MT4")])
+        self.assertEqual(bad["history"], history)
+        latest = self.record(history + [("her", None, "6机器人都用上了")])
+        self.assertEqual(latest["new"], [("her", None, "6机器人都用上了")])
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 4)
+
+    def test_stable_ocr_correction_keeps_original_and_audit(self):
+        self.record([("me", None, "刚刚怎么了"), ("her", None, "今天真是不好竟思"),
+                     ("me", None, "没事的")])
+        visible = [("me", None, "刚刚怎么了"), ("her", None, "今天真是不好意思"),
+                   ("me", None, "没事的")]
+        first = self.record(visible)
+        second = self.record(visible)
+        self.assertEqual(first["history"][1][2], "今天真是不好竟思")
+        self.assertEqual(second["history"][1][2], "今天真是不好意思")
+        self.assertTrue(second["corrected"])
+        original = self.store.connection.execute("SELECT text FROM messages ORDER BY id LIMIT 1 OFFSET 1").fetchone()[0]
+        self.assertEqual(original, "今天真是不好竟思")
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM message_revisions").fetchone()[0], 1)
+
+    def test_legacy_pollution_is_quarantined_without_deleting_original(self):
+        original = [("me", None, "claude code 确实猛"), ("me", None, "图灵测试")]
+        self.record(original)
+        conversation_id = self.store.connection.execute("SELECT id FROM conversations").fetchone()[0]
+        with self.store.connection:
+            bad_id = self.store.connection.execute("""
+                INSERT INTO messages(conversation_id, who, sender, text, observed_at, baseline)
+                VALUES (?, 'her', 'ALiGN前端...', '我叫MT4', 999999, 1)
+            """, (conversation_id,)).lastrowid
+        reopened = MessageStore(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.history("wechat", "月仔"), original)
+        self.assertEqual(reopened.connection.execute(
+            "SELECT text FROM messages WHERE id = ?", (bad_id,)).fetchone()[0], "我叫MT4")
+        revision = reopened.connection.execute(
+            "SELECT reason FROM message_revisions WHERE message_id = ?", (bad_id,)).fetchone()
+        self.assertEqual(revision[0], "legacy_unanchored_batch")
+        latest = reopened.record_snapshot("wechat", "月仔", "月仔",
+                                         original + [("her", None, "6机器人都用上了")], self.area)
+        self.assertEqual(latest["new"], [("her", None, "6机器人都用上了")])
+
+    def test_oscillating_ocr_does_not_revise_original(self):
+        original = [("me", None, "刚刚怎么了"), ("her", None, "今天真是不好竟思"),
+                    ("me", None, "没事的")]
+        changed = [original[0], ("her", None, "今天真是不好意思"), original[2]]
+        self.record(original)
+        self.record(changed)
+        self.record(original)
+        snapshot = self.record(changed)
+        self.assertFalse(snapshot["corrected"])
+        self.assertEqual(snapshot["history"], original)
+
+    def test_absent_messages_are_not_rejected_as_ocr_errors(self):
+        original = [("her", None, "第一条"), ("me", None, "第二条"), ("her", None, "第三条")]
+        self.record(original)
+        self.record(original[1:])
+        self.record(original[:2])
+        self.assertEqual(self.store.history("wechat", "月仔"), original)
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM message_revisions").fetchone()[0], 0)
+
     def test_identical_snapshot_is_not_inserted_repeatedly(self):
         visible = [("her", None, "你好")]
         first = self.record(visible)

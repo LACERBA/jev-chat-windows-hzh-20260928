@@ -139,6 +139,9 @@ class Reader:
             kind, bg, h = who_said(chat, box, self.app)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+            if kind == "her" and min(xs) > W * 0.55:
+                self.last_boxes.append(rect + ("image", text))
+                continue
             on_pane = bg is not None and np.abs(bg - pane_bg).sum() <= 6
             if kind == "gray" or (on_pane and kind == "her"):
                 taken = bool(on_pane and box[0][0] < 0.25 * W and len(text) <= 16

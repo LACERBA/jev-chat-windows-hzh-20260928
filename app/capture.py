@@ -95,7 +95,8 @@ def chat_area(full, header_h=60):
     认不出（窗口太小 / 拖到一半布局没铺好）返回 None。
     ponytail: 输入框拉高超过面板一半会认错；header_h 按 100% DPI 给的，缩放了按比例调。"""
     H, W = full.shape[:2]
-    right = full[::8, W // 2::8].reshape(-1, 3)
+    margin = max(8, min(24, W // 60))
+    right = full[H // 8:H * 7 // 8:4, W - margin:W - 2].reshape(-1, 3)
     vals, cnt = np.unique(right, axis=0, return_counts=True)
     bg = vals[cnt.argmax()]
     isbg = np.abs(full.astype(int) - bg).sum(-1) <= 6

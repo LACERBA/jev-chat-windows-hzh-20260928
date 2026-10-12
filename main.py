@@ -433,6 +433,8 @@ def restore_history():
         for title in store.conversations(app_key):
             if not chat_is_ignored(title):
                 sync_history(title, store.history(app_key, title))
+                chat = chat_of(title)
+                chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
     except Exception as e:
         ov.set_status(f"本地消息历史读取失败：{type(e).__name__}", "warning")
     finally:
@@ -750,7 +752,22 @@ def drain():
                 ov.set_status("会话标题尚未识别清楚，暂不处理消息", "warning")
                 continue
             sync_history(title, snapshot["history"])
-            ov.set_read_state(title, snapshot["read_at"], len(snapshot["new"]), snapshot["status"])
+            read_status = ("corrected" if snapshot.get("corrected") else "pending"
+                           if snapshot.get("discontinuous") else snapshot["status"])
+            ov.set_read_state(title, snapshot["read_at"], len(snapshot["new"]), read_status)
+            if snapshot.get("corrected"):
+                chat = chat_of(title)
+                chat["rev"] += 1
+                chat["auto_blocked_rev"] = chat["rev"]
+                chat["result"] = None
+                if state["rerun"] and state["rerun"][0] == title:
+                    state["rerun"] = None
+                if title == ov.current_chat():
+                    ov.show_cached(None)
+                    ov.invalidate_replies()
+                    ov.set_status("本地消息已按连续 OCR 证据修订，旧回复建议已作废", "success")
+                if conversation_controller._matches(title, raw_title):
+                    conversation_controller.release()
             if snapshot.get("discontinuous"):
                 chat = chat_of(title)
                 chat["rev"] += 1
@@ -758,9 +775,15 @@ def drain():
                 ov.invalidate_replies()
                 if conversation_controller._matches(title, raw_title):
                     conversation_controller.release()
-                ov.set_status("当前画面与历史缺少连续锚点，已保存文本但不自动回复", "warning")
+                chat["result"] = None
+                if title == ov.current_chat():
+                    ov.show_cached(None)
+                    ov.set_status("当前画面与历史缺少连续锚点，文本已隔离待确认，不进入回复上下文", "warning")
                 continue
             if not snapshot["new"]:
+                if snapshot["initial"]:
+                    chat = chat_of(title)
+                    chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
                 conversation_controller.on_snapshot(snapshot)
                 continue
             msg = ("lines", title, snapshot["new"], snapshot["area"],

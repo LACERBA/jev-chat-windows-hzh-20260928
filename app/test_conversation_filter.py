@@ -540,6 +540,26 @@ class ConversationFilterTests(unittest.TestCase):
             self.controller._confirm_switch()
         event.set.assert_called_once()
 
+    def test_corrected_history_invalidates_cached_result_and_delayed_send(self):
+        chat = main.chat_of("月仔")
+        chat["rev"] = 3
+        chat["result"] = {"candidates": ["旧的错误回复"]}
+        self.controller.phase = "waiting_send"
+        self.controller.active = {"id": "person:1", "title": "月仔", "raw": "月仔"}
+        self.controller.send_revision = 3
+        self._drain_packets([("snapshot", self._snapshot(corrected=True))])
+        self.assertEqual(chat["rev"], 4)
+        self.assertIsNone(chat["result"])
+        self.assertEqual(chat["auto_blocked_rev"], 4)
+        with patch.object(main, "auto_send_reply") as send:
+            main.auto_send_and_track("月仔", {}, 3)
+        send.assert_not_called()
+
+    def test_initial_cached_snapshot_blocks_sending_restored_history(self):
+        self._drain_packets([("snapshot", self._snapshot(initial=True))])
+        chat = main.chat_of("月仔")
+        self.assertEqual(chat["auto_blocked_rev"], chat["rev"])
+
     def test_send_requires_recent_confirmed_snapshot(self):
         self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
         self.state["ocr_confirmed"] = True
@@ -831,6 +851,14 @@ class OverlayFilterTests(unittest.TestCase):
         self.assertIn("新增 0 条", self.overlay.readState.text())
         self.overlay.set_chat("其他人")
         self.assertNotIn("新增 0 条", self.overlay.readState.text())
+
+    def test_corrected_history_without_incoming_clears_previous_latest_text(self):
+        self.overlay.set_chat("月仔")
+        self.overlay.replace_history("月仔", [("her", "我叫MT4", None)])
+        self.assertEqual(self.overlay.latest.text(), "我叫MT4")
+        self.overlay.replace_history("月仔", [("me", "正常的自己消息", None)])
+        self.assertEqual(self.overlay.latest.text(), "")
+        self.assertTrue(self.overlay.context.isHidden())
 
     def test_regular_chat_retains_auto_reply_controls(self):
         self.overlay.set_chat("月仔")

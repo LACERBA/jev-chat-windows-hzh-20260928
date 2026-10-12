@@ -1174,11 +1174,16 @@ class Overlay:
         for who, text, name in messages:
             self.log_message(who, text, name, timestamp="已采集", chat=title)
         if title == self._shown:
+            if title not in self.hers:
+                self.latest.clear()
+                self.context.hide()
             self._history_title()
 
     def set_read_state(self, title, read_at, new_count, status):
         moment = datetime.fromtimestamp(read_at).strftime("%H:%M:%S")
-        text = (f"本地已保存 · {moment} · 新增 {new_count} 条" if status == "read"
+        text = (f"本地消息已修订 · {moment} · 新增 {new_count} 条" if status == "corrected"
+                else f"识别文本已隔离待确认 · {moment}" if status == "pending"
+                else f"本地已保存 · {moment} · 新增 {new_count} 条" if status == "read"
                 else f"OCR 暂未识别到文本消息 · {moment}")
         self.read_states[title] = text
         if title == self._shown:
