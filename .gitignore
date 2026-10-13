@@ -20,3 +20,5 @@ wechat_probe.png
 build/
 dist/
 *.spec.bak
+
+ai-docs/
