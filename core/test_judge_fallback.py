@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from core import engine, llm_judge
+from core import draft, engine, llm_judge
 from core.engine import analyze
 from core.jev_client import JevError
 from core.questions import JUDGE_QUESTIONS, build_rank_question
@@ -62,6 +62,21 @@ class LlmJudgeTests(unittest.TestCase):
         self.assertEqual(chat.call_args.kwargs["what"], "通用判断")
         self.assertEqual(chat.call_args.kwargs["temperature"], 0.1)
         self.assertNotIn("judge-key", chat.call_args.args[-1])
+
+
+class MediaReplyPromptTests(unittest.TestCase):
+    def test_uncertain_media_prompt_asks_natural_questions_without_technical_messages(self):
+        messages = [("her", "[图片消息] 可见文字：游戏；不确定信息：画面模糊")]
+        candidates = ["你发的是这个游戏吗？", "你是想说哪个好玩吗？", "这张图想表达啥呀？"]
+        with patch.object(draft, "_api_key", return_value="test-key"), \
+                patch.object(draft, "chat", return_value=json.dumps(candidates, ensure_ascii=False)) as chat:
+            result = draft.draft_candidates(messages, "friends")
+        self.assertEqual(result, candidates)
+        system = chat.call_args.args[4]
+        self.assertIn("不要求完整识别才回复", system)
+        self.assertIn("自然的疑问句确认", system)
+        self.assertIn("不要编造没识别到的细节", system)
+        self.assertIn("不要回复 OCR、模型错误", system)
 
 
 class EngineFallbackTests(unittest.TestCase):

@@ -20,8 +20,8 @@ from app import settings, update, worker
 from app.capture import find_chat_hwnd, switch_debug
 from app.fill import click, fill, fill_and_send
 from app.ocr import similar
-from app.message_store import MessageStore
-from app.media import describe_media
+from app.message_store import MessageStore, align_messages
+from app.media import describe_media, media_token
 from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
@@ -43,6 +43,7 @@ update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, 
 _AUTO_REPLY_COOLDOWN = 8.0
 _AUTO_REPLY_ECHO_WINDOW = 12.0
 _AUTO_REPLY_SEND_DELAY_MS = 1200
+_MEDIA_REPLY_WAIT = 5.0
 read_requested = None
 
 
@@ -133,7 +134,8 @@ class ConversationController:
         if not settings.analysis_enabled():
             self.release(f"已读取「{raw_title}」的消息并保存到本地，仅采集模式", "success")
         elif not snapshot["new"]:
-            self.release(f"已读取「{raw_title}」的可见消息，与本地历史一致，暂无新增", "idle")
+            if not resume_cached_reply(snapshot):
+                self.release(f"已读取「{raw_title}」的可见消息，与本地历史一致，暂无新增", "idle")
         elif visible[-1][0] == "me":
             self.release("你已回复，等待对方的新消息", "idle")
 
@@ -143,6 +145,11 @@ class ConversationController:
         if chat_is_ignored(title, raw_title):
             return "skip"
         if self.phase == "send_failed":
+            if (self._matches(title, raw_title) and latest_who == "her"
+                    and revision > self.active.get("revision", -1)):
+                self.phase = "analyzing"
+                self.active["revision"] = revision
+                return "analyze"
             return "skip"
         if self.phase == "switching":
             if self._matches_switch_target(title, raw_title):
@@ -177,8 +184,6 @@ class ConversationController:
             return "normal"
         if not settings.auto_reply_config(raw_title, "wechat")["enabled"]:
             return "skip"
-        if initial:
-            return "normal"
         self.active = {"id": f"current:{raw_title}:{revision}", "title": title, "raw": raw_title,
                        "authorized": True, "revision": revision}
         self.phase = "analyzing"
@@ -213,7 +218,7 @@ class ConversationController:
         if not sent:
             self.phase = "send_failed"
             self.deadline = 0.0
-            ov.set_status("自动回复未完成，已暂停切换；请检查当前会话后再切换", "warning")
+            ov.set_status("本次自动发送未完成，当前会话有新消息时将继续尝试", "warning")
             return
         self.phase = "verifying"
         self.expected_text = chat_of(title)["last_auto_sent_text"]
@@ -413,9 +418,11 @@ conversation_controller = ConversationController()
 def chat_of(title):
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
                                     "target": None, "senders": [], "auto_sent_rev": -1,
-                                    "auto_blocked_rev": -1, "last_auto_sent_at": 0.0,
+                                    "last_auto_sent_at": 0.0,
                                     "last_auto_sent_text": "", "media_states": {},
-                                    "media_waiting": False, "latest_id": None, "history_ids": []})
+                                    "media_waiting": False, "media_wait_started": None,
+                                    "latest_id": None, "history_ids": [], "analysis_requested_rev": -1,
+                                    "auto_sent_key": None, "auto_retry_rev": None, "media_fallback_rev": -1})
 
 
 def sync_history(title, history):
@@ -462,12 +469,6 @@ def context_media(title):
 
 def media_pending(title):
     return any(value["status"] == "pending" for value in context_media(title))
-
-
-def media_unreadable(title):
-    values = context_media(title)
-    return any(value.get("who") == "her" and (value["status"] in ("pending", "failed", "partial")
-               or not value.get("summary")) for value in values)
 
 
 def start_media_jobs(snapshot):
@@ -530,17 +531,14 @@ def drain_media():
         chat = chat_of(title)
         if event.get("error"):
             if title == ov.current_chat():
-                ov.set_status("媒体识别结果保存失败，暂不自动回复；请重新开启采集后重试", "warning")
+                ov.set_status("媒体识别结果保存失败，将根据已有内容生成确认问题", "warning")
             continue
         sync_media(title, event["media_state"])
         if event["changed"]:
             sync_media_history(title, event["history"], event.get("history_ids", []))
             relevant = not chat["history_ids"] or event["message_id"] in chat["history_ids"][-settings.context():]
             if relevant:
-                blocked = chat["rev"] <= chat["auto_blocked_rev"]
                 chat["rev"] += 1
-                if blocked:
-                    chat["auto_blocked_rev"] = chat["rev"]
                 chat["result"] = None
                 if title == ov.current_chat():
                     ov.invalidate_replies()
@@ -548,7 +546,9 @@ def drain_media():
         if media_pending(title) or not chat["media_waiting"]:
             continue
         chat["media_waiting"] = False
-        if not settings.analysis_enabled() or chat_is_ignored(title) or not chat["history"] or chat["history"][-1][0] != "her":
+        chat["media_wait_started"] = None
+        if (not settings.analysis_enabled() or chat_is_ignored(title) or not chat["history"]
+                or chat["history"][-1][0] != "her" or chat["auto_sent_key"] == reply_key(title)):
             continue
         msgs = list(chat["history"])
         if conversation_controller.active and conversation_controller._matches(title, state.get("raw_chat", "")):
@@ -557,6 +557,43 @@ def drain_media():
             state["rerun"] = (title, msgs)
         else:
             start_analyze(title, msgs)
+
+
+def reply_key(title):
+    chat = chat_of(title)
+    if chat["history_ids"]:
+        return chat["history_ids"][-1]
+    return tuple(chat["history"][-1]) if chat["history"] else None
+
+
+def resume_cached_reply(snapshot):
+    """授权会话的最后一条对方消息无需等待新消息；当前轮次只请求一次分析。"""
+    title, raw_title = snapshot["title"], snapshot["raw_title"]
+    chat = chat_of(title)
+    visible = snapshot["visible"]
+    if (not settings.analysis_enabled() or not settings.auto_reply_config(raw_title, state.get("app", "wechat"))["enabled"]
+            or not snapshot["title_confirmed"] or snapshot.get("discontinuous")
+            or title != state.get("chat") or raw_title != state.get("raw_chat")
+            or chat_is_ignored(title, raw_title) or not visible or not chat["history"]
+            or visible[-1][0] != "her" or chat["history"][-1][0] != "her"
+            or chat["analysis_requested_rev"] == chat["rev"] or chat["auto_sent_key"] == reply_key(title)):
+        return False
+    who, text, name = chat["history"][-1]
+    media = chat["media_states"].get(reply_key(title))
+    expected = (who, name, media_token(media["fingerprint"]) if media else text)
+    if not align_messages([expected], [visible[-1]]):
+        return False
+    action = conversation_controller.route_lines(title, raw_title, chat["rev"], False, "her")
+    if action in ("skip", "verify"):
+        return False
+    if state["busy"]:
+        state["rerun"] = (title, list(chat["history"]))
+        chat["analysis_requested_rev"] = chat["rev"]
+        return True
+    started = start_analyze(title, list(chat["history"]))
+    if started:
+        chat["analysis_requested_rev"] = chat["rev"]
+    return started
 
 
 def restore_history():
@@ -571,8 +608,6 @@ def restore_history():
                 context = store.context(app_key, title)
                 sync_media(title, context["media_state"])
                 sync_media_history(title, context["history"], context["history_ids"])
-                chat = chat_of(title)
-                chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
     except Exception as e:
         ov.set_status(f"本地消息历史读取失败：{type(e).__name__}", "warning")
     finally:
@@ -588,8 +623,10 @@ def on_processing_changed():
     ov.set_busy(False)
     for chat in chats.values():
         chat["rev"] += 1
-        chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
+        chat["analysis_requested_rev"] = -1
         chat["media_waiting"] = False
+        chat["media_wait_started"] = None
+        chat["auto_retry_rev"] = None
     ov.invalidate_replies()
 
 
@@ -617,6 +654,26 @@ def fill_reply(text):
     fill(state["hwnd"], state["area"], reply_text(ov.current_chat(), text))
 
 
+def defer_auto_send(title, result, revision, delay_ms, announce):
+    """冷却或等待新快照时延后同一轮发送，不丢弃回复，也不重复安排定时器。"""
+    chat = chat_of(title)
+    if chat["auto_retry_rev"] == revision:
+        return
+    chat["auto_retry_rev"] = revision
+    tracked = conversation_controller.send_is_pending(title, revision)
+
+    def retry():
+        if chat["auto_retry_rev"] != revision:
+            return
+        chat["auto_retry_rev"] = None
+        if tracked:
+            auto_send_and_track(title, result, revision)
+        else:
+            auto_send_reply(title, result, revision, announce)
+
+    ov.after(max(250, int(delay_ms)), retry)
+
+
 def auto_send_reply(title, result, revision, announce=True):
     if not settings.send_enabled() or not settings.analysis_enabled():
         return False
@@ -632,41 +689,37 @@ def auto_send_reply(title, result, revision, announce=True):
     chat = chat_of(title)
     if not config["enabled"] or title != state["chat"] or revision != chat["rev"]:
         return False
-    if media_unreadable(title):
-        if title == ov.current_chat():
-            ov.set_status("媒体内容尚未完整识别，本次候选仅供手动选择，不自动发送", "warning")
-        return False
     if settings.auto_switch() and not raw_config["enabled"]:
         return False
-    if (state["hwnd"] is None or state["area"] is None or not capture_on.is_set()
-            or not state.get("ocr_confirmed", True)):
+    if state["hwnd"] is None or state["area"] is None or not capture_on.is_set():
         return False
-    if "read_at" in state and time.time() - state["read_at"] > 2.0:
+    if not state.get("ocr_confirmed", True) or "read_at" in state and time.time() - state["read_at"] > 2.0:
         request_read()
         if title == ov.current_chat():
-            ov.set_status("发送前的当前会话读取尚未确认，本次不自动发送", "warning")
-        return False
+            ov.set_status("正在刷新当前会话，读取确认后继续自动发送", "busy")
+        defer_auto_send(title, result, revision, 350, announce)
+        return None
     if chat["auto_sent_rev"] == revision:
         return False
-    if revision <= chat["auto_blocked_rev"]:
-        if title == ov.current_chat():
-            ov.set_status("启动时已有的聊天记录只生成建议，不自动发送", "warning")
+    key = reply_key(title)
+    if key is not None and chat["auto_sent_key"] == key:
+        return False
+    if chat["history"] and chat["history"][-1][0] != "her":
         return False
     elapsed = time.monotonic() - chat["last_auto_sent_at"]
     if elapsed < _AUTO_REPLY_COOLDOWN:
         if title == ov.current_chat():
-            ov.set_status(f"自动回复冷却中，已跳过本次发送（{_AUTO_REPLY_COOLDOWN:.0f} 秒保护）", "warning")
-        return False
+            ov.set_status("自动回复正在等待发送间隔，稍后继续发送本次回复", "busy")
+        defer_auto_send(title, result, revision, (_AUTO_REPLY_COOLDOWN - elapsed) * 1000 + 50, announce)
+        return None
     candidates = result.get("candidates") or []
-    if (not result.get("ranking_valid", False)
-            and not result.get("auto_send_fallback", False)):
-        if title == ov.current_chat():
-            ov.set_status("候选未完成有效排序，本次不会自动发送", "warning")
-        return False
     best = result.get("best_index")
-    if not isinstance(best, int) or best not in range(len(candidates)):
+    if (not isinstance(best, int) or best not in range(len(candidates))
+            or not isinstance(candidates[best], str) or not candidates[best].strip()):
+        best = next((index for index, text in enumerate(candidates) if isinstance(text, str) and text.strip()), None)
+    if best is None:
         if title == ov.current_chat():
-            ov.set_status("自动回复已跳过：本次没有选出最佳回复", "warning")
+            ov.set_status("本次没有可发送的候选，等待下一条消息", "warning")
         return False
     score = None
     if result.get("ranking_valid"):
@@ -688,6 +741,8 @@ def auto_send_reply(title, result, revision, announce=True):
             ov.log(f"[自动回复失败] {type(e).__name__}: {e}")
         return False
     chat["auto_sent_rev"] = revision
+    chat["auto_sent_key"] = key
+    chat["auto_retry_rev"] = None
     chat["last_auto_sent_at"] = time.monotonic()
     chat["last_auto_sent_text"] = text
     if title == ov.current_chat():
@@ -707,7 +762,8 @@ def auto_send_and_track(title, result, revision):
                      phase=conversation_controller.phase)
         return
     sent = auto_send_reply(title, result, revision, announce=False)
-    conversation_controller.on_send_attempt(title, revision, sent)
+    if sent is not None:
+        conversation_controller.on_send_attempt(title, revision, sent)
 
 
 def spawn_worker():
@@ -799,15 +855,21 @@ def start_analyze(title, msgs):
         ov.set_busy(False)
         ov.set_status("当前会话已忽略，不参与自动处理", "idle")
         return False
+    chat = chat_of(title)
     if media_pending(title):
-        chat_of(title)["media_waiting"] = True
-        if title == ov.current_chat():
-            ov.set_status("正在识别目标媒体消息，完成后再生成回复", "busy")
-        return True
+        if chat["media_wait_started"] is None:
+            chat["media_wait_started"] = time.monotonic()
+        if time.monotonic() - chat["media_wait_started"] < _MEDIA_REPLY_WAIT:
+            chat["media_waiting"] = True
+            chat["analysis_requested_rev"] = chat["rev"]
+            if title == ov.current_chat():
+                ov.set_status("正在识别媒体；若未能识别，将根据已有内容提问回复", "busy")
+            return True
     if not settings.models_ready():
         ov.set_status("请先在设置中补全当前判断策略和起草模型配置", "warning")
         return False
-    chat_of(title)["media_waiting"] = False
+    chat["media_waiting"] = media_pending(title)
+    chat["analysis_requested_rev"] = chat["rev"]
     state["busy"] = True
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
@@ -913,7 +975,6 @@ def drain():
             if snapshot.get("corrected"):
                 chat = chat_of(title)
                 chat["rev"] += 1
-                chat["auto_blocked_rev"] = chat["rev"]
                 chat["result"] = None
                 if state["rerun"] and state["rerun"][0] == title:
                     state["rerun"] = None
@@ -926,7 +987,6 @@ def drain():
             if snapshot.get("discontinuous"):
                 chat = chat_of(title)
                 chat["rev"] += 1
-                chat["auto_blocked_rev"] = chat["rev"]
                 ov.invalidate_replies()
                 if conversation_controller._matches(title, raw_title):
                     conversation_controller.release()
@@ -936,10 +996,8 @@ def drain():
                     ov.set_status("当前画面与历史缺少连续锚点，文本已隔离待确认，不进入回复上下文", "warning")
                 continue
             if not snapshot["new"]:
-                if snapshot["initial"]:
-                    chat = chat_of(title)
-                    chat["auto_blocked_rev"] = max(chat["auto_blocked_rev"], chat["rev"])
                 conversation_controller.on_snapshot(snapshot)
+                resume_cached_reply(snapshot)
                 continue
             msg = ("lines", title, snapshot["new"], snapshot["area"],
                    snapshot["initial"], raw_title)
@@ -980,9 +1038,6 @@ def drain():
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         action = conversation_controller.route_lines(
             title, raw_title, chat["rev"], initial, normalized[-1][0])
-        if (initial and action != "analyze_fresh"
-                and not conversation_controller.buffers_fresh_message(title, raw_title, chat["rev"])):
-            chat["auto_blocked_rev"] = chat["rev"]  # 首帧是屏幕旧记录，只展示建议，绝不自动发送
         if snapshot is not None:
             conversation_controller.on_snapshot(snapshot)
         if not settings.analysis_enabled():
@@ -1000,8 +1055,12 @@ def drain():
             if state["busy"]:
                 state["rerun"] = (title, msgs)
                 ov.set_busy(True)
-            elif not start_analyze(title, msgs) and action in ("analyze", "analyze_fresh"):
-                conversation_controller.result_abandoned(title)
+            else:
+                started = start_analyze(title, msgs)
+                if started:
+                    chat["analysis_requested_rev"] = chat["rev"]
+                elif action in ("analyze", "analyze_fresh"):
+                    conversation_controller.result_abandoned(title)
         else:
             state["rerun"] = None
             ov.set_busy(False)
@@ -1013,6 +1072,17 @@ def tick():
     try:
         drain()
         drain_media()
+        for title, chat in list(chats.items()):
+            if (chat["media_waiting"] and chat["media_wait_started"] is not None
+                    and time.monotonic() - chat["media_wait_started"] >= _MEDIA_REPLY_WAIT
+                    and chat["media_fallback_rev"] != chat["rev"] and title == state.get("chat")
+                    and chat["history"] and chat["history"][-1][0] == "her"
+                    and chat["auto_sent_key"] != reply_key(title)):
+                chat["media_fallback_rev"] = chat["rev"]
+                if state["busy"]:
+                    state["rerun"] = (title, list(chat["history"]))
+                else:
+                    start_analyze(title, list(chat["history"]))
         while not update_result.empty():
             latest, url = update_result.get()
             ov.set_update(latest, url)
@@ -1043,18 +1113,10 @@ def tick():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
-                if media_unreadable(title):
+                if not r.get("candidates"):
                     conversation_controller.result_abandoned(title)
-                    if title == ov.current_chat():
-                        ov.set_status("媒体内容未完整识别，回复建议仅供手动选择", "warning")
                     continue
-                if (not r.get("ranking_valid", False)
-                        and not r.get("auto_send_fallback", False)):
-                    if (conversation_controller.active
-                            and conversation_controller.active.get("title") == title):
-                        conversation_controller.release(
-                            "候选未完成有效排序", "warning")
-                elif conversation_controller.mark_result_ready(title, revision):
+                if conversation_controller.mark_result_ready(title, revision):
                     request_read()
                     ov.after(_AUTO_REPLY_SEND_DELAY_MS,
                              lambda t=title, result=r, rev=revision: auto_send_and_track(t, result, rev))

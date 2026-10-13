@@ -702,7 +702,7 @@ class Overlay:
         box.addWidget(self._hint(
             "默认仅本地 OCR。开启图片上传后，只发送单条目标消息裁剪图（内存 Base64），不保存原图；"
             "视频只看封面。照片和表情需要支持图像输入的模型，模糊缩略图可能无法完整识别；"
-            "仅 OCR 或识别失败的媒体回复建议需手动选择，不自动发送。"
+            "仅 OCR 或识别失败时仍可自动回复，信息不确定的部分会用自然的疑问句确认。"
         ))
         self.vision = self._model_group(box, "视觉识别 · 独立模型", "vision", providers.VISION_PROVIDERS)
         self.visionTestButton = PushButton("验证图像输入能力")
@@ -1286,7 +1286,7 @@ class Overlay:
         if sending and not settings.send_enabled():
             answer = QMessageBox.warning(
                 self.win, "允许自动发送",
-                "开启后，已明确授权自动回复的会话可以发送新消息的回复。\n"
+                "开启后，已明确授权的会话会回复最后一条对方消息，包括进入会话前已有的消息。\n"
                 "仅采集和仅生成建议都不需要开启。是否继续？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
@@ -1347,6 +1347,7 @@ class Overlay:
             answer = QMessageBox.warning(
                 self.win, "开启自动回复",
                 f"开启后，「{title}」生成的最佳回复会覆盖输入框已有文字并直接发送。\n\n"
+                "进入会话前已有的最后一条对方消息也会回复，识别不清楚时会提问确认。\n"
                 "请确认发送快捷键与微信设置一致。是否继续？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
@@ -1360,6 +1361,8 @@ class Overlay:
             self.set_status("自动回复设置保存失败，请检查配置文件是否可写。", "error")
             self._render_auto_reply()
             return
+        if self.on_processing_change:
+            self.on_processing_change()
         self.set_status(f"「{title}」自动回复已{'开启' if on else '关闭'}",
                         "warning" if on else "success")
 

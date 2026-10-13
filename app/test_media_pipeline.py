@@ -60,6 +60,38 @@ class MediaPipelineTests(unittest.TestCase):
         thread.assert_not_called()
         self.assertTrue(self.chat["media_waiting"])
 
+    def test_pending_media_wait_is_bounded_and_can_generate_question_reply(self):
+        self.chat["media_wait_started"] = 100
+        with patch.object(main.time, "monotonic", return_value=106), \
+                patch.object(settings, "models_ready", return_value=True), patch.object(main.threading, "Thread") as thread:
+            self.assertTrue(main.start_analyze("目标会话", list(self.chat["history"])))
+        thread.assert_called_once()
+        thread.return_value.start.assert_called_once()
+        self.assertEqual(self.chat["analysis_requested_rev"], self.chat["rev"])
+
+    def test_pending_media_timeout_starts_only_one_fallback_per_revision(self):
+        self.chat["media_wait_started"] = 100
+
+        def started(*args):
+            self.state["busy"] = True
+            return True
+
+        with patch.object(main.time, "monotonic", return_value=106), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"), \
+                patch.object(main, "results", queue.Queue()), patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "start_analyze", side_effect=started) as analyze:
+            main.tick()
+            main.tick()
+        analyze.assert_called_once()
+        self.assertIsNone(self.state["rerun"])
+
+    def test_late_visual_result_does_not_repeat_an_already_sent_reply(self):
+        self.chat["auto_sent_key"] = main.reply_key("目标会话")
+        self.finish()
+        with patch.object(main, "start_analyze") as analyze:
+            main.drain_media()
+        analyze.assert_not_called()
+
     def test_disabled_upload_never_calls_visual_model(self):
         self.config["vision_upload"] = False
         recognize = self.finish()
@@ -67,13 +99,12 @@ class MediaPipelineTests(unittest.TestCase):
         self.assertEqual(self.store.media_state("wechat", "目标会话")[self.job["message_id"]]["status"], "ocr")
         self.assertNotIn("image", self.job)
 
-    def test_baseline_remains_auto_blocked_after_visual_enrichment(self):
-        self.chat["auto_blocked_rev"] = 1
+    def test_baseline_visual_enrichment_does_not_add_auto_send_block(self):
         self.finish()
         with patch.object(main, "start_analyze") as analyze:
             main.drain_media()
         self.assertEqual(self.chat["rev"], 2)
-        self.assertEqual(self.chat["auto_blocked_rev"], 2)
+        self.assertNotIn("auto_blocked_rev", self.chat)
         self.assertIn("照片画面", self.chat["history"][0][1])
         analyze.assert_called_once()
 
@@ -135,13 +166,13 @@ class MediaPipelineTests(unittest.TestCase):
         recognize = self.finish()
         recognize.assert_not_called()
 
-    def test_visual_failure_falls_back_to_ocr_and_blocks_auto_send(self):
+    def test_visual_failure_falls_back_to_ocr_and_still_generates_reply(self):
         self.slots.acquire()
         with patch.object(main, "recognize_media", side_effect=JevError("offline", 529)):
             main.recognize_media_bg("wechat", "目标会话", self.job)
-        with patch.object(main, "start_analyze"):
+        with patch.object(main, "start_analyze", return_value=True) as analyze:
             main.drain_media()
-        self.assertTrue(main.media_unreadable("目标会话"))
+        analyze.assert_called_once()
         self.assertEqual(self.store.media_state("wechat", "目标会话")[self.job["message_id"]]["source"], "ocr")
 
 

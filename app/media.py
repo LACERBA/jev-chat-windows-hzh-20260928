@@ -28,6 +28,8 @@ def describe_media(media):
         parts.append("范围：仅封面，未读取视频正文")
     if media.get("status") == "pending":
         parts.append("状态：视觉识别中")
+    elif media.get("status") == "partial":
+        parts.append("状态：内容仅部分可辨认，不确定的部分需要提问确认")
     elif not media.get("summary"):
         parts.append("限制：仅提取文字，未理解画面；无文字不代表图片没有内容")
     return "\n".join(parts)

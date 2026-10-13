@@ -76,4 +76,4 @@ Jev 接口、题目口径都跟 `core/` 里一致。
 - 微信媒体定位和内存 PNG 编码在 `app/media.py`；`message_media` 关联原消息 ID，保存类型、感知指纹、OCR 原文、视觉描述、来源和状态，不保存图片。原始 `messages.text` 中的媒体标识仅用于顺序对齐，媒体上下文必须通过 `MessageStore.history()` 展开，不能直接消费 `effective_messages` 中的标识。
 - `core/vision.py` 只识别单条裁剪图；`core/llm.py` 分别适配 OpenAI Base64 Data URL、Anthropic Base64 source、Gemini inline bytes。视觉模型配置默认关闭，SenseNova 参数按图像接口使用 `reasoning_effort: none`，其他兼容模型需要验证图像输入能力。
 - 媒体回归追加：`.venv\Scripts\python.exe -m unittest app.test_media app.test_media_pipeline core.test_vision`。设置 `JEV_MEDIA_TEST_DIR` 为用户提供的四张示例图目录可执行本地截图回归；设置 `JEV_MEDIA_BUG_IMAGE` 为窄窗口问题截图可验证表情、图片新增入库和重复读取去重。不复制图片、不发网络请求。完整回归同时执行上面的六个模块。
-- 待识别的媒体暂缓生成回复；识别失败或只有 OCR 的媒体上下文不允许自动发送。异步更新按消息 ID、会话、指纹和 pending 状态校验，历史基线的自动发送禁用状态不能因视觉补充而解除。
+- 媒体仅短暂等待视觉识别，超过 5 秒仍未完成时基于已有内容回复；只有 OCR、识别不完整或识别失败不拦截自动发送，起草提示词要求用自然疑问句确认不确定部分，不编造内容。已授权会话进入前已有的最后一条对方消息同样可自动回复；同一轮快照只生成一次，同一消息 ID 不因视觉补充重复发送。8 秒发送间隔及快照刷新改为延后重试，不丢弃回复；仍校验全局与会话授权、目标窗口、当前会话和 revision。
