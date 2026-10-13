@@ -83,6 +83,27 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertEqual(kind, "warning")
         self.assertNotIn("自动处理未完成", text)
 
+    def test_analysis_retry_is_reported_to_ui_queue(self):
+        from core import retry
+        from core.jev_client import JevError
+
+        main.chat_of("月仔")["rev"] = 4
+        calls = Mock(side_effect=[JevError("限流", 429), "ok"])
+
+        def limited(*args, **kwargs):
+            retry.call_with_retry(calls, what="起草")
+            return {"candidates": []}
+
+        with patch.object(main, "analyze", side_effect=limited), patch.object(retry.time, "sleep", Mock()), \
+                patch.object(settings, "general_judge_config", return_value={
+                    "provider": "deepseek", "model": "", "base_url": "", "api_key": "k"}):
+            main.analyze_bg([("her", "你好", None)], "月仔", 4)
+        self.assertEqual(main.results.get_nowait()[0], "ok")  # 清掉结果，避免污染其他用例共用的全局队列
+        title, revision, text = main.retry_notices.get_nowait()
+        self.assertEqual((title, revision), ("月仔", 4))
+        self.assertIn("起草被限流", text)
+        self.assertIn("第 1/5 次", text)
+
     def test_stale_analysis_does_not_wait_for_model_retries(self):
         from core import retry
         from core.jev_client import JevError

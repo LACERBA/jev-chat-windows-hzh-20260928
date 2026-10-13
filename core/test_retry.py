@@ -105,6 +105,28 @@ class RetryCoreTests(unittest.TestCase):
         self.assertEqual(self.sleeps, [])
         self.assertIn("会话内容已更新", str(caught.exception))
 
+    def test_notify_guard_reports_each_retry_with_reason(self):
+        notices = []
+        operation = Flaky(2, JevError("通用判断失败: Request timed out.", None, retryable=True))
+        with retry.retry_notify_guard(notices.append):
+            self.assertEqual(retry.call_with_retry(operation, what="通用判断"), "ok")
+        self.assertEqual(len(notices), 2)
+        self.assertIn("请求超时", notices[0])
+        self.assertIn("第 1/5 次", notices[0])
+        self.assertIn("第 2/5 次", notices[1])
+
+    def test_retry_notice_describes_rate_limit_and_server_errors(self):
+        self.assertIn("被限流", retry.retry_notice("起草", 1, 5, 3.3, transient(429)))
+        self.assertIn("HTTP 503", retry.retry_notice("起草", 1, 5, 3.3, transient(503)))
+
+    def test_notify_failure_does_not_break_retry(self):
+        def broken(_):
+            raise RuntimeError("ui gone")
+
+        operation = Flaky(1, transient())
+        with retry.retry_notify_guard(broken):
+            self.assertEqual(retry.call_with_retry(operation), "ok")
+
     def test_cancel_after_first_failure_keeps_original_error(self):
         operation = Flaky(99, transient())
         checks = iter([False, True])

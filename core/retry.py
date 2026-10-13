@@ -20,6 +20,7 @@ RETRY_AFTER_CAP = 60.0  # 服务端要求的等待时间最多采纳 60 秒
 _SLICE = 0.25  # 等待时分片检查是否已被取消
 _RETRY_STATUSES = {408, 409, 425, 429}
 _cancel_check = ContextVar("retry_cancel_check", default=None)
+_notify = ContextVar("retry_notify", default=None)
 CANCEL_NOTE = "会话内容已更新（新消息、媒体识别结果等）"
 
 
@@ -35,6 +36,32 @@ def retry_cancel_guard(check):
         yield
     finally:
         _cancel_check.reset(token)
+
+
+@contextmanager
+def retry_notify_guard(callback):
+    """当前线程内每次进入重试等待前调用 callback(提示文案)，让界面能看到"正在重试"而不是干等。
+
+    callback 在调用线程里执行，必须自己保证线程安全（比如只往队列里放东西）。"""
+    token = _notify.set(callback)
+    try:
+        yield
+    finally:
+        _notify.reset(token)
+
+
+def retry_notice(what: str, retry: int, max_retries: int, delay: float, error: BaseException) -> str:
+    """生成给用户看的重试提示：失败原因 + 第几次重试，如"通用判断请求超时，正在自动重试（第 1/5 次，3 秒后发出）…"。"""
+    status = getattr(error, "status", None)
+    if status == 429:
+        reason = "被限流"
+    elif isinstance(status, int):
+        reason = f"服务异常（HTTP {status}）"
+    elif "timed out" in str(error).lower() or "超时" in str(error):
+        reason = "请求超时"
+    else:
+        reason = "网络异常"
+    return f"{what}{reason}，正在自动重试（第 {retry}/{max_retries} 次，{round(delay)} 秒后发出）…"
 
 
 def is_retryable(error: BaseException) -> bool:
@@ -78,6 +105,17 @@ def _log(event, **fields):
         pass
 
 
+def _notify_retry(what, retry, max_retries, delay, error) -> None:
+    """通知界面即将重试；提示失败不能影响模型调用本身。"""
+    callback = _notify.get()
+    if callback is None:
+        return
+    try:
+        callback(retry_notice(what, retry, max_retries, delay, error))
+    except Exception:
+        pass
+
+
 def _annotate(error: BaseException, retries: int, note: str = "") -> None:
     """在最终错误信息后补上重试次数，界面和日志一眼能看出已经重试过。"""
     if not retries and not note:
@@ -106,6 +144,7 @@ def call_with_retry(operation, *, what: str = "模型调用", max_retries: int |
                 _annotate(error, retries)
                 raise
             delay = retry_delay(retries, getattr(error, "retry_after", None))
+            _notify_retry(what, retries + 1, limit, delay, error)
             if not _wait(delay, cancelled):
                 _log("model.retry.cancelled", what=what, retry=retries + 1, max_retries=limit,
                      http_status=getattr(error, "status", None), error_type=type(error).__name__,

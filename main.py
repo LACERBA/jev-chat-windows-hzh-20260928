@@ -29,7 +29,7 @@ from core.vision import recognize as recognize_media
 from core.jev_client import JevError
 from core.diagnostics import (configure_logging, log_context, log_event, log_step,
                               redact_text, shutdown_logging)
-from core.retry import retry_cancel_guard
+from core.retry import retry_cancel_guard, retry_notify_guard
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
@@ -40,6 +40,7 @@ state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "", "
          "ocr_confirmed": False, "read_at": 0.0}
 results = queue.Queue()
 media_results = queue.Queue()
+retry_notices = queue.Queue()  # 后台分析线程的重试提示 (title, revision, text)，由 tick 在主线程里显示
 media_slots = threading.BoundedSemaphore(3)
 media_inflight = set()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
@@ -894,7 +895,8 @@ def on_toggle_capture(on):
 def analyze_bg(msgs, title, revision, reply_to=None, message_id=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
     with log_context(chat=title, revision=revision, message_id=message_id), \
-            retry_cancel_guard(lambda: chat_of(title)["rev"] != revision):  # 会话有新消息，别再等旧请求重试
+            retry_cancel_guard(lambda: chat_of(title)["rev"] != revision), \
+            retry_notify_guard(lambda text: retry_notices.put((title, revision, text))):  # 会话内容已更新，别再等旧请求重试；重试时告诉界面
         try:
             judge = settings.general_judge_config()
             with log_step("analysis", message_count=len(msgs), judge_mode=settings.judge_mode()):
@@ -1187,6 +1189,10 @@ def tick():
         while not update_result.empty():
             latest, url = update_result.get()
             ov.set_update(latest, url)
+        while not retry_notices.empty():
+            title, revision, text = retry_notices.get()
+            if state["busy"] and title == ov.current_chat() and revision == chat_of(title)["rev"]:
+                ov.set_status(text, "warning")  # 只给还有效、正看着的会话提示，过期分析的重试不打扰
         while not results.empty():
             kind, r, title, revision = results.get()
             state["busy"] = False
