@@ -50,6 +50,51 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(text.count("application.started"), 1)
         self.assertIn("application.stopped {}", text)
 
+    def test_disabled_logging_does_not_write_and_can_be_enabled_again(self):
+        self.assertIsNone(diagnostics.configure_logging(directory=self.path, enabled=False))
+        diagnostics.log_event("test.disabled")
+        self.assertFalse(self.path.exists())
+        diagnostics.configure_logging(directory=self.path, enabled=True, level="INFO")
+        diagnostics.log_event("test.enabled")
+        diagnostics.shutdown_logging()
+        self.assertIn("test.enabled", self.contents())
+        self.assertNotIn("test.disabled", self.contents())
+
+    def test_level_filtering_and_step_detail_classification(self):
+        diagnostics.configure_logging(directory=self.path, level="INFO")
+        diagnostics.log_event("test.debug", level="debug")
+        diagnostics.log_event("test.info")
+        try:
+            with diagnostics.log_step("test.failure"):
+                raise ValueError("保留错误堆栈")
+        except ValueError:
+            pass
+        diagnostics.shutdown_logging()
+        text = self.contents()
+        self.assertNotIn("test.debug", text)
+        self.assertNotIn("test.failure.started", text)
+        self.assertNotIn("test.failure.completed", text)
+        self.assertIn("test.info", text)
+        self.assertIn("test.failure.failed", text)
+        self.assertIn("ValueError: 保留错误堆栈", text)
+
+    def test_worker_follows_shared_enabled_state_and_level(self):
+        log_queue = queue.Queue()
+        control = multiprocessing.Value("i", logging.INFO)
+        diagnostics.configure_logging(log_queue, worker=True, control=control)
+        diagnostics.log_event("worker.info")
+        control.value = 0
+        diagnostics.log_event("worker.disabled", level="error")
+        control.value = logging.WARNING
+        diagnostics.log_event("worker.filtered")
+        diagnostics.log_event("worker.warning", level="warning")
+        diagnostics.shutdown_logging()
+        messages = [log_queue.get_nowait().getMessage() for _ in range(log_queue.qsize())]
+        self.assertTrue(any("worker.info" in message for message in messages))
+        self.assertTrue(any("worker.warning" in message for message in messages))
+        self.assertFalse(any("worker.disabled" in message for message in messages))
+        self.assertFalse(any("worker.filtered" in message for message in messages))
+
     def test_secrets_are_redacted_in_fields_messages_and_tracebacks(self):
         diagnostics.configure_logging(directory=self.path)
         diagnostics.register_secret("provided-secret-987")

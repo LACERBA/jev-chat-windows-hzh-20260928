@@ -49,11 +49,17 @@ _AUTO_REPLY_SEND_DELAY_MS = 1200
 _MEDIA_REPLY_WAIT = 5.0
 read_requested = None
 logging_queue = None
+logging_control = None
 
 
 def request_read():
     if read_requested is not None:
         read_requested.set()
+
+
+def on_logging_settings_changed():
+    configure_logging(logging_queue, enabled=settings.logging_enabled(),
+                      level=settings.logging_level(), control=logging_control)
 
 
 def chat_is_ignored(title, raw_title=""):
@@ -836,7 +842,7 @@ def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
     p = multiprocessing.Process(target=worker.run,
                                 args=(q, state["hwnd"], capture_on, debug_on, state.get("app"),
-                                      read_requested, logging_queue),
+                                      read_requested, logging_queue, logging_control),
                                 daemon=True)
     p.start()
     log_event("capture.worker_spawned", pid=p.pid, hwnd=state["hwnd"], app=state.get("app"))
@@ -944,7 +950,7 @@ def start_analyze(title, msgs):
         if chat["media_wait_started"] is None:
             chat["media_wait_started"] = time.monotonic()
         if time.monotonic() - chat["media_wait_started"] < _MEDIA_REPLY_WAIT:
-            log_event("analysis.waiting_media", chat=title, revision=chat["rev"],
+            log_event("analysis.waiting_media", level="debug", chat=title, revision=chat["rev"],
                       message_id=chat["latest_id"], wait_seconds=_MEDIA_REPLY_WAIT)
             chat["media_waiting"] = True
             chat["analysis_requested_rev"] = chat["rev"]
@@ -1130,7 +1136,7 @@ def drain():
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         action = conversation_controller.route_lines(
             title, raw_title, chat["rev"], initial, normalized[-1][0])
-        log_event("messages.routed", chat=title, raw_chat=raw_title, revision=chat["rev"],
+        log_event("messages.routed", level="debug", chat=title, raw_chat=raw_title, revision=chat["rev"],
                   message_id=chat["latest_id"], new_count=len(new), latest_who=normalized[-1][0],
                   action=action, phase=conversation_controller.phase, busy=state["busy"])
         if snapshot is not None:
@@ -1249,7 +1255,9 @@ def tick():
 if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本文件，没这行就无限套娃开进程
     multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
     logging_queue = multiprocessing.Queue()
-    log_directory = configure_logging(logging_queue)
+    logging_control = multiprocessing.Value("i", 0)
+    log_directory = configure_logging(logging_queue, enabled=settings.logging_enabled(),
+                                      level=settings.logging_level(), control=logging_control)
     log_event("application.started", version=VERSION, log_directory=log_directory,
               analysis_enabled=settings.analysis_enabled(), send_enabled=settings.send_enabled(),
               auto_switch=settings.auto_switch(), media_mode=settings.media_mode())
@@ -1272,7 +1280,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  app_key_of=lambda: state.get("app", "wechat"),
                  result_of=lambda t: chats.get(t, {}).get("result"),
-                 on_processing_change=on_processing_changed)
+                 on_processing_change=on_processing_changed,
+                 on_logging_change=on_logging_settings_changed)
     child = dbg = None
     try:
         state["hwnd"], found = find_chat_hwnd()

@@ -208,12 +208,12 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
     her_recent = _her_recent(messages)
     parsed = _parse_candidates(content)
     cands = _sanitize(parsed, suspects, her_recent)
-    log_event("draft.filtered", parsed_count=len(parsed), usable_count=len(cands),
+    log_event("draft.filtered", level="debug", parsed_count=len(parsed), usable_count=len(cands),
               suspect_count=len(suspects))
     if len(cands) < 3:
         # 模型偶尔只给 1~2 条（V4.1 Flash 实测会把三条揉成一条）。带着它的回答追问一次，要补齐的那几条。
         need = 3 - len(cands)
-        log_event("draft.supplement_requested", missing_count=need)
+        log_event("draft.supplement_requested", level="debug", missing_count=need)
         try:
             extra = _parse_candidates(call([
                 user, content,
@@ -224,7 +224,7 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
                       remaining_count=len(cands))
             extra = []
         cands = _sanitize(cands + extra, suspects, her_recent)
-        log_event("draft.supplement_filtered", extra_count=len(extra), usable_count=len(cands))
+        log_event("draft.supplement_filtered", level="debug", extra_count=len(extra), usable_count=len(cands))
     return cands[:3]  # 可能仍不足 3 条，下游按实际条数处理
 
 

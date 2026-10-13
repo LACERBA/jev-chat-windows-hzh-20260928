@@ -42,6 +42,9 @@ _JUDGE_MODES = [
 
 _MEDIA_MODES = [("仅本地 OCR，不上传图片", "ocr"), ("视觉模型识别，失败回退 OCR", "vision"),
                 ("OCR + 视觉模型互补", "hybrid")]
+_LOG_LEVEL_LABELS = [("调试（DEBUG）", "DEBUG"), ("信息（INFO）", "INFO"),
+                     ("警告（WARNING）", "WARNING"), ("错误（ERROR）", "ERROR"),
+                     ("严重（CRITICAL）", "CRITICAL")]
 
 
 def _choice(answers, name):
@@ -232,7 +235,7 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None, app_key_of=None, on_processing_change=None):
+                 on_toggle_debug=None, app_key_of=None, on_processing_change=None, on_logging_change=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -246,6 +249,7 @@ class Overlay:
         self.app_key_of = app_key_of or (lambda: "wechat")
         self.result_of = result_of
         self.on_processing_change = on_processing_change
+        self.on_logging_change = on_logging_change
         self.read_states = {}
         self.cands = []
         self.cards = []
@@ -646,6 +650,24 @@ class Overlay:
             "另开一个窗口实时显示截到的画面和识别框：粉 = 未读候选、绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
             "红 = 当成图片丢掉、黄 = 小字丢掉。只在内存里画，不存图。"
         ))
+        logging_row = QHBoxLayout()
+        logging_row.addWidget(_label("记录诊断日志", 13), 1)
+        self.loggingSwitch = SwitchButton()
+        self.loggingSwitch.setOnText("开")
+        self.loggingSwitch.setOffText("关")
+        self.loggingSwitch.setAccessibleName("记录诊断日志")
+        self.loggingSwitch.checkedChanged.connect(self._logging_changed)
+        logging_row.addWidget(self.loggingSwitch)
+        box.addLayout(logging_row)
+        self.loggingLevelBox = ComboBox()
+        self.loggingLevelBox.addItems([label for label, _ in _LOG_LEVEL_LABELS])
+        self.loggingLevelBox.setAccessibleName("诊断日志级别")
+        self.loggingLevelBox.currentIndexChanged.connect(self._logging_changed)
+        box.addWidget(self.loggingLevelBox)
+        box.addWidget(self._hint(
+            "DEBUG 排查细节；INFO 关键运行事件；WARNING 可恢复问题；ERROR 操作失败及异常堆栈；"
+            "CRITICAL 未捕获的严重异常。关闭后停止新日志记录，已有日志文件不会删除。"
+        ))
         body.addWidget(preference)
 
         models = _Surface()
@@ -981,8 +1003,19 @@ class Overlay:
         self.ignoredChatsEdit.setPlainText("\n".join(settings.ignored_chats("wechat")))
         self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
+        self._load_logging_settings()
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
+
+    def _load_logging_settings(self):
+        logging_switch_blocked = self.loggingSwitch.blockSignals(True)
+        logging_level_blocked = self.loggingLevelBox.blockSignals(True)
+        self.loggingSwitch.setChecked(settings.logging_enabled())
+        self.loggingLevelBox.setCurrentIndex(next(
+            i for i, (_, value) in enumerate(_LOG_LEVEL_LABELS) if value == settings.logging_level()))
+        self.loggingLevelBox.setEnabled(settings.logging_enabled())
+        self.loggingSwitch.blockSignals(logging_switch_blocked)
+        self.loggingLevelBox.blockSignals(logging_level_blocked)
 
     def _save(self):
         previous_media = (settings.media_mode(), settings.vision_upload(), settings.vision_provider(),
@@ -1069,6 +1102,20 @@ class Overlay:
         if not ignored and not self.cands and not self._busy:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
+
+    def _logging_changed(self, *_):
+        enabled = self.loggingSwitch.isChecked()
+        level = _LOG_LEVEL_LABELS[max(0, self.loggingLevelBox.currentIndex())][1]
+        self.loggingLevelBox.setEnabled(enabled)
+        try:
+            settings.save(logging_enabled_on=enabled, logging_level_text=level)
+            if self.on_logging_change:
+                self.on_logging_change()
+            self.settingsFeedback.hide()
+        except Exception:
+            log_event("settings.logging_save_failed", level="error", exc_info=True)
+            self._settings_feedback("日志设置保存或应用失败，请检查配置文件和 log 目录是否可写。", error=True)
+            self._load_logging_settings()
 
     def _debug_toggled(self, on):
         """调试视图独立于「保存设置」：拨一下就开窗/收窗，顺手落盘，重启还在。"""

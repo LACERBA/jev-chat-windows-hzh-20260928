@@ -12,6 +12,7 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
+from core.diagnostics import LOG_LEVELS
 from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, JUDGE_ENV,
                             LEGACY, LLM_ENV, VISION_ENV, VISION_PROVIDERS)
 
@@ -140,6 +141,14 @@ def check_update() -> bool:
 def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))
+
+def logging_enabled() -> bool:
+    value = _read("logging_enabled", True)
+    return value if isinstance(value, bool) else True
+
+def logging_level() -> str:
+    value = str(_read("logging_level", "INFO") or "INFO").strip().upper()
+    return value if value in LOG_LEVELS else "INFO"
 
 def auto_switch() -> bool:
     return bool(_read("auto_switch", False))
@@ -305,6 +314,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
+         logging_enabled_on: bool | None = None, logging_level_text: str | None = None,
          auto_switch_on: bool | None = None, auto_reply_chats_value: dict | None = None,
          ignored_chats_value: list[str] | None = None,
          analysis_enabled_on: bool | None = None, send_enabled_on: bool | None = None,
@@ -356,6 +366,10 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
+        "logging_enabled": flag(logging_enabled_on, logging_enabled),
+        "logging_level": (logging_level_text.strip().upper()
+                          if isinstance(logging_level_text, str) and logging_level_text.strip().upper() in LOG_LEVELS
+                          else logging_level()),
         "auto_switch": flag(auto_switch_on, auto_switch),
         "analysis_enabled": flag(analysis_enabled_on, analysis_enabled),
         "send_enabled": flag(send_enabled_on, send_enabled),

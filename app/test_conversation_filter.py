@@ -1009,6 +1009,19 @@ class OverlayFilterTests(unittest.TestCase):
             self.overlay._save()
         self.assertEqual(save.call_args.kwargs["ignored_chats_value"], ["银行通知", "文件传输助手"])
 
+    def test_logging_controls_save_and_apply_immediately(self):
+        callback = Mock()
+        self.overlay.on_logging_change = callback
+        with patch.object(settings, "save") as save:
+            self.overlay.loggingLevelBox.setCurrentIndex(0)
+        save.assert_called_once_with(logging_enabled_on=True, logging_level_text="DEBUG")
+        callback.assert_called_once()
+        with patch.object(settings, "save") as save:
+            self.overlay.loggingSwitch.setChecked(False)
+        save.assert_called_once_with(logging_enabled_on=False, logging_level_text="DEBUG")
+        self.assertEqual(callback.call_count, 2)
+        self.assertFalse(self.overlay.loggingLevelBox.isEnabled())
+
     def test_judge_strategy_enables_only_relevant_model_groups(self):
         self.assertTrue(self.overlay.jev.providerBox.isEnabled())
         self.assertFalse(self.overlay.judge.providerBox.isEnabled())

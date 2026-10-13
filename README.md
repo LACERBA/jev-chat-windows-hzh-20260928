@@ -293,6 +293,7 @@ pyinstaller --noconfirm --clean jev.spec
 | 自动切换新消息会话 | 串行切换程序运行后新增的红色未读；未授权会话不分析，授权会话完成发送确认后再处理下一个 | `config.json` → `auto_switch`（默认关） |
 | 启动时检查更新 | 开了才在启动时查一次 GitHub 最新版本号，有新版本就在标题栏下面提示 | `config.json` → `check_update`（默认开） |
 | 调试视图 | 另开一个窗口实时显示截到的画面和识别框，看识别在哪一步认错。拨一下立刻生效，不用点保存；关掉那个窗口等于关掉开关 | `config.json` → `debug_view`（默认关） |
+| 记录诊断日志 | 开关加级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），拨一下立刻生效并同步到采集子进程；关闭后不再写新日志，已有文件保留。DEBUG 为排查细节，INFO 为关键运行事件，WARNING 为可恢复问题，ERROR 为操作失败及堆栈，CRITICAL 为未捕获的严重异常 | `config.json` → `logging_enabled`（默认开）、`logging_level`（默认 `INFO`） |
 | 判断策略 | Jev 优先自动兜底 / 仅 Jev / 仅通用模型 | `config.json` → `judge_mode` |
 | 判断 · Jev | 来源、密钥、模型 | `jev_provider` / `jev_model` + 注册表 `JEV_API_KEY` |
 | 通用判断复用起草配置 | 开启时无需第三把密钥 | `config.json` → `judge_reuse_draft`（默认开） |

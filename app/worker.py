@@ -36,12 +36,13 @@ def _packet(full, area, title, reader, lines, unread):
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
 
-def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None, log_queue=None):
+def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None, log_queue=None, logging_control=None):
     """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
     恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
     debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
     if log_queue is not None:
-        configure_logging(log_queue, worker=True)
+        configure_logging(log_queue, worker=True, enabled=settings.logging_enabled(),
+                          level=settings.logging_level(), control=logging_control)
     ctypes.windll.user32.SetProcessDPIAware()
     app = chatapps.get(app_key)
     switch_debug("worker_started", hwnd=hwnd, app=app.key)

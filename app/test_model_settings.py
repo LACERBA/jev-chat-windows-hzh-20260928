@@ -57,6 +57,27 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertFalse(data["judge_reuse_draft"])
         self.assertNotIn("judge-secret", str(data))
 
+    def test_logging_defaults_and_invalid_values(self):
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
+            self.assertTrue(settings.logging_enabled())
+            self.assertEqual(settings.logging_level(), "INFO")
+        config = {"logging_enabled": "false", "logging_level": "TRACE"}
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)):
+            self.assertTrue(settings.logging_enabled())
+            self.assertEqual(settings.logging_level(), "INFO")
+
+    def test_logging_settings_are_saved_and_invalid_level_keeps_current_value(self):
+        config = {"logging_enabled": True, "logging_level": "DEBUG"}
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(logging_enabled_on=False, logging_level_text="warning")
+            data = dump.call_args.args[0]
+            self.assertFalse(data["logging_enabled"])
+            self.assertEqual(data["logging_level"], "WARNING")
+            settings.save(logging_level_text="TRACE")
+            self.assertEqual(dump.call_args.args[0]["logging_level"], "DEBUG")
+
     def test_processing_defaults_keep_sending_disabled(self):
         with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
             self.assertTrue(settings.analysis_enabled())

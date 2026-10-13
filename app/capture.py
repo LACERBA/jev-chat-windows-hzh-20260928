@@ -15,7 +15,7 @@ u32 = ctypes.windll.user32
 
 
 def switch_debug(stage, **fields):
-    log_event("conversation." + stage, **fields)
+    log_event("conversation." + stage, level="debug", **fields)
     if os.environ.get("JEV_DEBUG_AUTO_SWITCH") == "1":
         print(redact_text(f"[自动切换 {time.monotonic():.3f}] {stage} {fields}"), flush=True)
 
