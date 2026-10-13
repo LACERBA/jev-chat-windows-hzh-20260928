@@ -104,6 +104,35 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             generic_available = False
             warnings.append("判断服务暂时不可用，本次仅生成手动候选")
 
+    intent = (answers.get("true_intent") or {}).get("choice")
+    need = (answers.get("she_needs") or {}).get("choice")
+    decision = (answers.get("reply_decision") or {}).get("choice")
+    reply_required = not (judge_backend and decision == "no_reply"
+                          and intent == "close_topic" and need == "nothing")
+    log_event("judgment.reply_decision", judge_backend=judge_backend, decision=decision,
+              true_intent=intent, she_needs=need, reply_required=reply_required)
+    if not reply_required:
+        reason = "对方已平和结束话题，没有待回答或待确认事项，本轮无需回复"
+        log_event("engine.no_reply", judge_backend=judge_backend, reason=reason,
+                  fallback_used=fallback_used)
+        return {
+            "reply_required": False,
+            "no_reply_reason": reason,
+            "candidates": [],
+            "best_index": None,
+            "best_reply": "",
+            "scores": [],
+            "answers": answers,
+            "usage": usage,
+            "reply_to": reply_to,
+            "ranking_valid": False,
+            "auto_send_fallback": False,
+            "judge_backend": judge_backend,
+            "ranking_backend": "",
+            "fallback_used": fallback_used,
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+
     with log_step("draft", provider=provider, model=model, timeout=timeout, thinking=thinking):
         candidates = draft_candidates(messages, relationship, provider=provider, model=model,
                                       base_url=base_url, timeout=timeout, keep=context,
@@ -195,6 +224,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
               ranking_valid=ranking_valid, fallback_used=fallback_used,
               warnings=list(dict.fromkeys(warnings)))
     return {
+        "reply_required": True,
+        "no_reply_reason": "",
         "candidates": candidates,
         "best_index": best_index,
         "best_reply": candidates[best_index],

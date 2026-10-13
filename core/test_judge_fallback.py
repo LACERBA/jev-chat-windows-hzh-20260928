@@ -16,6 +16,7 @@ JUDGMENT = {
     "best_action": {"type": "choice", "choice": "acknowledge"},
     "she_needs": {"type": "choice", "choice": "nothing"},
     "tension_resolved": {"type": "noul", "noul": 0.9},
+    "reply_decision": {"type": "choice", "choice": "reply"},
 }
 CANDIDATES = ["候选甲", "候选乙", "候选丙"]
 
@@ -83,6 +84,82 @@ class EngineFallbackTests(unittest.TestCase):
     def _analyze(self, **kwargs):
         return analyze([("her", "你好")], "friends", llm_judge_provider="deepseek",
                        llm_judge_model="deepseek-chat", llm_judge_api_key="judge-key", **kwargs)
+
+    def _closing_judgment(self):
+        return {**JUDGMENT,
+                "true_intent": {"type": "choice", "choice": "close_topic"},
+                "best_action": {"type": "choice", "choice": "say_less"},
+                "should_reply_now": {"type": "noul", "noul": 0.0},
+                "reply_decision": {"type": "choice", "choice": "no_reply"}}
+
+    def test_jev_close_topic_finishes_without_drafting_or_ranking(self):
+        for mode in ("jev_only", "jev_fallback"):
+            with self.subTest(mode=mode), \
+                    patch.object(engine, "ask_jev", return_value={
+                        "answers": self._closing_judgment(), "usage": {"input_tokens": 12}}) as jev, \
+                    patch.object(engine, "ask_llm_judge") as generic, \
+                    patch.object(engine, "draft_candidates") as draft, \
+                    patch.object(engine, "select_best") as selector:
+                result = self._analyze(judge_mode=mode)
+            jev.assert_called_once()
+            generic.assert_not_called()
+            draft.assert_not_called()
+            selector.assert_not_called()
+            self.assertFalse(result["reply_required"])
+            self.assertEqual(result["candidates"], [])
+            self.assertIsNone(result["best_index"])
+            self.assertEqual(result["usage"], {"input_tokens": 12})
+            self.assertEqual(result["judge_backend"], "jev")
+            self.assertIn("无需回复", result["no_reply_reason"])
+
+    def test_llm_close_topic_finishes_without_drafting_or_ranking(self):
+        with patch.object(engine, "ask_jev") as jev, \
+                patch.object(engine, "ask_llm_judge", return_value={
+                    "answers": self._closing_judgment(), "usage": {}}) as generic, \
+                patch.object(engine, "draft_candidates") as draft:
+            result = self._analyze(judge_mode="llm_only")
+        jev.assert_not_called()
+        generic.assert_called_once()
+        draft.assert_not_called()
+        self.assertFalse(result["reply_required"])
+        self.assertEqual(result["judge_backend"], "llm")
+
+    def test_jev_failure_can_fall_back_to_llm_no_reply_decision(self):
+        with patch.object(engine, "ask_jev", side_effect=JevError("overloaded", 529)), \
+                patch.object(engine, "ask_llm_judge", return_value={
+                    "answers": self._closing_judgment(), "usage": {}}) as generic, \
+                patch.object(engine, "draft_candidates") as draft:
+            result = self._analyze(judge_mode="jev_fallback")
+        generic.assert_called_once()
+        draft.assert_not_called()
+        self.assertFalse(result["reply_required"])
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["judge_backend"], "llm")
+
+    def test_saying_less_or_closing_one_topic_does_not_force_silence(self):
+        judgment = {**self._closing_judgment(),
+                    "reply_decision": {"type": "choice", "choice": "reply"}}
+        with patch.object(engine, "ask_llm_judge", side_effect=[
+                    {"answers": judgment, "usage": {}},
+                    {"answers": {"best_reply": {"type": "choice", "choice": "reply_a"}}, "usage": {}}]), \
+                patch.object(engine, "draft_candidates", return_value=CANDIDATES) as draft:
+            result = self._analyze(judge_mode="llm_only")
+        draft.assert_called_once()
+        self.assertTrue(result["reply_required"])
+        self.assertEqual(result["candidates"], CANDIDATES)
+
+    def test_conflicting_intent_or_pending_need_does_not_end_conversation(self):
+        for field, choice in (("true_intent", "vent_anger"), ("true_intent", "request_action"),
+                              ("she_needs", "action")):
+            judgment = {**self._closing_judgment(), field: {"type": "choice", "choice": choice}}
+            with self.subTest(field=field, choice=choice), \
+                    patch.object(engine, "ask_llm_judge", side_effect=[
+                        {"answers": judgment, "usage": {}},
+                        {"answers": {"best_reply": {"type": "choice", "choice": "reply_a"}}, "usage": {}}]), \
+                    patch.object(engine, "draft_candidates", return_value=CANDIDATES) as draft:
+                result = self._analyze(judge_mode="llm_only")
+            draft.assert_called_once()
+            self.assertTrue(result["reply_required"])
 
     def test_jev_initial_failure_switches_whole_round_to_llm(self):
         llm_results = [

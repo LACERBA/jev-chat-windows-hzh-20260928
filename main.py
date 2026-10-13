@@ -210,6 +210,18 @@ class ConversationController:
         if self.active and self.active.get("title") == title:
             self.release(f"「{title}」{reason}；继续监听新消息", kind)
 
+    def complete_without_reply(self, title, revision, reason):
+        chat = chat_of(title)
+        chat["analysis_requested_rev"] = revision
+        chat["no_reply_rev"] = revision
+        chat["auto_retry_rev"] = None
+        chat["media_waiting"] = False
+        chat["media_wait_started"] = None
+        log_event("reply.completed_without_send", chat=title, revision=revision,
+                  message_id=chat["latest_id"], phase=self.phase, reason=reason)
+        if self.active and self.active.get("title") == title:
+            self.release(f"「{title}」{reason}；继续监听新消息", "success")
+
     def send_is_pending(self, title, revision):
         return (self.phase == "waiting_send" and self.active is not None
                 and self.active.get("title") == title
@@ -435,7 +447,7 @@ def chat_of(title):
                                     "media_waiting": False, "media_wait_started": None,
                                     "latest_id": None, "history_ids": [], "analysis_requested_rev": -1,
                                     "auto_sent_key": None, "auto_retry_rev": None, "media_fallback_rev": -1,
-                                    "analysis_block_reason": "", "auto_send_block_reason": ""})
+                                    "analysis_block_reason": "", "auto_send_block_reason": "", "no_reply_rev": -1})
 
 
 def sync_history(title, history):
@@ -717,6 +729,10 @@ def auto_send_reply(title, result, revision, announce=True):
         return False
 
     log_event("send.requested", chat=title, revision=revision, message_id=chat["latest_id"])
+    if result.get("reply_required") is False or chat["no_reply_rev"] == revision:
+        log_event("send.skipped_no_reply", chat=title, revision=revision,
+                  reason=result.get("no_reply_reason") or "本轮无需回复")
+        return False
     if not settings.send_enabled() or not settings.analysis_enabled():
         return blocked("生成建议或允许发送开关已关闭")
     if os.environ.get("JEV_DISABLE_AUTO_SEND") == "1":
@@ -888,7 +904,8 @@ def analyze_bg(msgs, title, revision, reply_to=None, message_id=None):
                                  llm_judge_base_url=judge["base_url"] or None,
                                  llm_judge_api_key=judge["api_key"])
             log_event("analysis.result_queued", candidate_count=len(result.get("candidates") or []),
-                      ranking_valid=result.get("ranking_valid"), warnings=result.get("warnings"))
+                      ranking_valid=result.get("ranking_valid"), reply_required=result.get("reply_required", True),
+                      warnings=result.get("warnings"))
             results.put(("ok", result, title, revision))
         except Exception as e:
             log_event("analysis.error_queued", level="error", exc_info=True,
@@ -1196,10 +1213,15 @@ def tick():
                     ov.set_busy(False)
                 log_event("analysis.result_accepted", chat=title, revision=revision,
                           candidate_count=len(r.get("candidates") or []), ranking_valid=r.get("ranking_valid"),
-                          warnings=r.get("warnings"))
+                          reply_required=r.get("reply_required", True), warnings=r.get("warnings"))
+                if r.get("reply_required") is False:
+                    conversation_controller.complete_without_reply(
+                        title, revision, r.get("no_reply_reason") or "对方已结束话题，本轮无需回复")
+                    continue
                 if not r.get("candidates"):
                     conversation_controller.result_abandoned(title, "模型没有生成可用候选回复，本次不发送")
                     continue
+                chat_of(title)["no_reply_rev"] = -1
                 if conversation_controller.mark_result_ready(title, revision):
                     request_read()
                     ov.after(_AUTO_REPLY_SEND_DELAY_MS,

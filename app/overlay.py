@@ -251,6 +251,7 @@ class Overlay:
         self.cards = []
         self._busy = False
         self._current = False
+        self._no_reply_reason = ""
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
         self._pageLayouts = []
         self._hintLabels = []
@@ -1191,6 +1192,11 @@ class Overlay:
             self.emptyHint.setText("不调用模型，不自动发送。\n需要回复建议时，开启上方的生成建议。")
             self.setupButton.hide()
             return
+        if self._no_reply_reason:
+            self.emptyTitle.setText("本轮无需回复")
+            self.emptyHint.setText(self._no_reply_reason + "\n继续监听，对方有新消息时会重新判断。")
+            self.setupButton.hide()
+            return
         configured = settings.has_key()
         self.emptyTitle.setText("等待对方的新消息" if configured else "先设置，再开始")
         self.emptyHint.setText("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
@@ -1199,6 +1205,7 @@ class Overlay:
 
     def invalidate_replies(self):
         self._current = False
+        self._no_reply_reason = ""
         if self.cands:
             self.updated.setText("上次建议")
         for card in self.cards:
@@ -1490,6 +1497,7 @@ class Overlay:
         if result and not ignored:
             self.show(result)
         else:
+            self._no_reply_reason = ""
             self.cands = []
             self._clear_cards()
             self.insight.hide()
@@ -1511,7 +1519,10 @@ class Overlay:
             self.show_cached(None)
             self.set_busy(False)
             return
-        self.cands = result["candidates"]
+        no_reply = result.get("reply_required") is False
+        self._no_reply_reason = (redact_text(result.get("no_reply_reason") or "对方已结束话题，本轮无需回复")
+                                 if no_reply else "")
+        self.cands = [] if no_reply else result["candidates"]
         self.set_busy(False)
         self._current = bool(self.cands)
         self._clear_cards()
@@ -1534,7 +1545,7 @@ class Overlay:
         reply_to = result.get("reply_to")
         self.insightTitle.setText(f"对话参考 · 回复给 {reply_to}" if reply_to else "对话参考")
         answers = result.get("answers") or {}
-        self.summary.setText("建议：" + _choice(answers, "best_action"))
+        self.summary.setText("建议：本轮无需回复" if no_reply else "建议：" + _choice(answers, "best_action"))
         self.intent.setText("可能意图 · " + _choice(answers, "true_intent") +
                             "\n可能需要 · " + _choice(answers, "she_needs"))
         score = (answers.get("danger_level") or {}).get("score")
@@ -1546,11 +1557,13 @@ class Overlay:
         qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
         setCustomStyleSheet(self.tension, qss, qss)
         self.empty.setVisible(not self.cands)
-        self.insight.setVisible(bool(self.cands))
-        self.referenceNote.setVisible(bool(self.cands) and not self._compact)
+        self.insight.setVisible(bool(self.cands) or no_reply)
+        self.referenceNote.setVisible((bool(self.cands) or no_reply) and not self._compact)
         self.updated.setText(datetime.now().strftime("%H:%M") + " 更新")
         warnings = result.get("warnings") or []
-        if self.cands and not ranking_valid:
+        if no_reply:
+            self.set_status(self._no_reply_reason, "success")
+        elif self.cands and not ranking_valid:
             self.set_status("排序不可用，第一条候选将作为默认选项", "warning")
         elif self.cands and result.get("fallback_used"):
             self.set_status("Jev 暂时不可用，本次已由通用判断模型接管", "warning")

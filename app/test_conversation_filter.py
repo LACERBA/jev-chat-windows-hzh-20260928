@@ -83,6 +83,62 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertEqual(kind, "warning")
         self.assertNotIn("自动处理未完成", text)
 
+    def test_no_reply_result_completes_round_without_sending_or_failure(self):
+        import queue
+
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        chat = main.chat_of("月仔")
+        chat["rev"] = 3
+        chat["auto_retry_rev"] = 3
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "current:3", "title": "月仔", "raw": "月仔"}
+        result = {"reply_required": False, "no_reply_reason": "对方已平和结束话题，本轮无需回复",
+                  "candidates": [], "answers": {}}
+        results = queue.Queue()
+        results.put(("ok", result, "月仔", 3))
+        with patch.object(main, "results", results), \
+                patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"), \
+                patch.object(self.controller, "result_abandoned") as abandoned, \
+                patch.object(main, "auto_send_reply") as send:
+            main.tick()
+        abandoned.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertIsNone(self.controller.active)
+        self.assertIsNone(chat["auto_retry_rev"])
+        self.assertEqual(chat["analysis_requested_rev"], 3)
+        self.assertEqual(chat["auto_sent_rev"], -1)
+        self.assertTrue(settings.send_enabled())
+        self.assertFalse(any(call.args[1] == "error" for call in self.overlay.set_status.call_args_list))
+        self.assertIn("无需回复", self.overlay.set_status.call_args.args[0])
+        self.assertEqual(self.controller.route_lines("月仔", "月仔", 4, False, "her"), "analyze")
+
+    def test_no_reply_result_blocks_send_even_if_candidates_are_present(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        result = {"reply_required": False, "candidates": ["回头聊"], "best_index": 0}
+        with patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply("月仔", result, 0))
+        send.assert_not_called()
+        self.assertEqual(main.chat_of("月仔")["auto_sent_rev"], -1)
+
+    def test_old_send_callback_is_blocked_after_no_reply_completion(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self.controller.complete_without_reply("月仔", 0, "本轮无需回复")
+        with patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply("月仔", {"candidates": ["回头聊"], "best_index": 0}, 0))
+        send.assert_not_called()
+
+    def test_no_reply_cached_message_does_not_restart_analysis(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        chat = main.chat_of("月仔")
+        chat["history"].append(("her", "是吗 哈哈", None))
+        chat["analysis_requested_rev"] = chat["rev"]
+        chat["result"] = {"reply_required": False, "candidates": []}
+        with patch.object(main, "start_analyze") as analyze:
+            self.assertFalse(main.resume_cached_reply(self._snapshot()))
+        analyze.assert_not_called()
+
     def test_builtin_entries_are_ignored_without_affecting_similar_names(self):
         for title in ("公众号", "订阅号", "服务号", " 公 众 号 "):
             with self.subTest(title=title):
@@ -1006,6 +1062,33 @@ class OverlayFilterTests(unittest.TestCase):
         self.overlay.replace_history("月仔", [("me", "正常的自己消息", None)])
         self.assertEqual(self.overlay.latest.text(), "")
         self.assertTrue(self.overlay.context.isHidden())
+
+    def test_no_reply_result_shows_successful_empty_state_and_judgment(self):
+        self.overlay.set_chat("月仔")
+        self.overlay.show({"reply_required": False, "no_reply_reason": "对方已结束话题，本轮无需回复",
+                           "candidates": [], "best_index": None, "ranking_valid": False,
+                           "answers": {"true_intent": {"choice": "close_topic"},
+                                       "she_needs": {"choice": "nothing"},
+                                       "best_action": {"choice": "say_less"}}})
+        self.assertEqual(self.overlay.cands, [])
+        self.assertFalse(self.overlay._current)
+        self.assertEqual(self.overlay.emptyTitle.text(), "本轮无需回复")
+        self.overlay.set_busy(False)
+        self.assertEqual(self.overlay.emptyTitle.text(), "本轮无需回复")
+        self.assertIn("新消息", self.overlay.emptyHint.text())
+        self.assertIn("无需回复", self.overlay.status.text())
+        self.assertFalse(self.overlay.insight.isHidden())
+        self.assertIn("平和结束话题", self.overlay.intent.text())
+        self.assertTrue(self.overlay.setupButton.isHidden())
+
+    def test_new_reply_result_replaces_previous_no_reply_state(self):
+        self.overlay.set_chat("月仔")
+        self.overlay.show({"reply_required": False, "candidates": [], "answers": {}})
+        self.overlay.show({"reply_required": True, "candidates": ["几点出发？"], "best_index": 0})
+        self.assertEqual(self.overlay.cands, ["几点出发？"])
+        self.assertTrue(self.overlay._current)
+        self.assertTrue(self.overlay.empty.isHidden())
+        self.assertIn("建议已更新", self.overlay.status.text())
 
     def test_regular_chat_retains_auto_reply_controls(self):
         self.overlay.set_chat("月仔")

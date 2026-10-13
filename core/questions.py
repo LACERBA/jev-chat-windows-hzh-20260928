@@ -201,6 +201,31 @@ JUDGE_QUESTIONS: dict = {
             ),
         },
     },
+    "reply_decision": {
+        "type": "choice",
+        "instructions": (
+            "Should we send ANY reply to the other person's latest message, given the full conversation? "
+            "Unlike should_reply_now, this decides whether to send a message at all, not whether it has substance. "
+            "Choose no_reply only for a genuine peaceful end of the exchange, with no unanswered question, "
+            "unresolved request, or confirmation that still needs a conversational response. "
+            "A final thanks, got it, goodbye, OK, or an acknowledgment emoji can close the exchange, "
+            "but those words or symbols alone are not enough: use context and any reliable media description. "
+            "Closing one topic while asking a new question still requires reply. "
+            "Sarcasm, anger, a loyalty test, or a breakup is not a peaceful ending. "
+            "Unclear or unfinished media recognition is not evidence that the conversation ended. "
+            "If uncertain, choose reply. For no_reply, true_intent must be close_topic and she_needs must be nothing."
+        ),
+        "criteria": {
+            "reply": (
+                "Continue normally: there is a question, request, expected acknowledgment, ongoing conversation, "
+                "or insufficient evidence that the other person genuinely finished the exchange."
+            ),
+            "no_reply": (
+                "The other person has peacefully finished the exchange and needs nothing further. "
+                "Sending even a short filler reply would unnecessarily reopen an already completed conversation."
+            ),
+        },
+    },
 }
 
 
@@ -221,6 +246,7 @@ CHOICE_LABELS: dict = {
         "apology": "真诚道歉", "action": "具体行动或安排", "explanation": "清楚的解释",
         "care": "关注与在意", "nothing": "可能无需补充回应",
     },
+    "reply_decision": {"reply": "继续回复", "no_reply": "结束本轮，无需回复"},
 }
 
 _GUIDE_FIELDS = (("true_intent", "对方意图"), ("she_needs", "对方需要"),
