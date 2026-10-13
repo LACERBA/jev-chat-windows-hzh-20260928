@@ -133,6 +133,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None, log_queue
                         if name != title or next_raw != raw_title:
                             title, raw_title = name, next_raw
                             last_chat = None
+                            dispatched_media.clear()
                             q.put(("chat", title, raw_title))
                     if (settings.is_ignored_chat(raw_title, app.key)
                             or settings.is_ignored_chat(title, app.key)):

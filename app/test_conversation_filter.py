@@ -38,6 +38,255 @@ class ConversationFilterTests(unittest.TestCase):
         target.start()
         self.addCleanup(target.stop)
 
+    def test_manual_switch_waits_three_seconds_and_buffers_latest_message(self):
+        self.config["auto_reply_chats"] = {"wechat:其他人": {"enabled": True}}
+        with patch.object(main.time, "monotonic", return_value=100), \
+                patch.object(main, "start_analyze", return_value=True) as analyze:
+            self._drain_packets([("chat", "其他人", "其他人"),
+                                 ("snapshot", self._snapshot(title="其他人", raw_title="其他人",
+                                     new=[("her", None, "你好")], visible=[("her", None, "你好")],
+                                     history=[("her", None, "你好")])),
+                                 ("snapshot", self._snapshot(title="其他人", raw_title="其他人",
+                                     new=[("her", None, "在吗")], visible=[("her", None, "在吗")],
+                                     history=[("her", None, "你好"), ("her", None, "在吗")]))])
+            analyze.assert_not_called()
+            self.assertEqual(self.controller.phase, "settling")
+            self.assertEqual(self.controller.deadline, 103)
+        with patch.object(main.time, "monotonic", return_value=102.9), \
+                patch.object(main, "start_analyze") as analyze:
+            self.controller.tick()
+            analyze.assert_not_called()
+        with patch.object(main.time, "monotonic", return_value=103), \
+                patch.object(main, "start_analyze", return_value=True) as analyze:
+            self.controller.tick()
+            self.controller.tick()
+        analyze.assert_called_once_with("其他人", [("her", "你好", None), ("her", "在吗", None)])
+
+    def test_repeated_manual_switch_restarts_delay_and_does_not_click_pending_chat(self):
+        event = {"base": "pending", "id": "pending:1", "name": "待处理", "at": 100}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"pending": {**event, "x": 120, "y": 90}}
+        with patch.object(main.time, "monotonic", return_value=100):
+            self._drain_packets([("chat", "其他人", "其他人")])
+        with patch.object(main.time, "monotonic", return_value=102):
+            self._drain_packets([("chat", "第三人", "第三人")])
+        with patch.object(main.time, "monotonic", return_value=104), patch.object(main, "click") as click:
+            self.controller.tick()
+        click.assert_not_called()
+        self.assertEqual(self.controller.phase, "settling")
+        self.assertEqual(self.controller.deadline, 105)
+        self.assertEqual(self.controller.active["title"], "第三人")
+
+    def test_manual_switch_invalidates_old_analysis_and_pending_send(self):
+        chat = main.chat_of("月仔")
+        chat.update(rev=4, analysis_requested_rev=4, auto_retry_rev=4, media_waiting=True)
+        self.state.update(busy=True, rerun=("月仔", []), analysis_task=("月仔", 4))
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "current:4", "title": "月仔", "raw": "月仔"}
+        self._drain_packets([("chat", "其他人", "其他人")])
+        self.assertEqual(chat["rev"], 5)
+        self.assertEqual(chat["analysis_requested_rev"], -1)
+        self.assertIsNone(chat["auto_retry_rev"])
+        self.assertFalse(chat["media_waiting"])
+        self.assertFalse(self.state["busy"])
+        self.assertIsNone(self.state["rerun"])
+        self.assertIsNone(self.state["analysis_task"])
+        with patch.object(main, "auto_send_reply") as send:
+            main.auto_send_and_track("月仔", {"candidates": ["旧回复"]}, 4)
+        send.assert_not_called()
+
+    def test_cancelled_results_do_not_unlock_or_overwrite_new_analysis(self):
+        import queue
+
+        self.state.update(chat="其他人", raw_chat="其他人", busy=True, analysis_task=("其他人", 2))
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "current:2", "title": "其他人", "raw": "其他人"}
+        results = queue.Queue()
+        results.put(("ok", {"candidates": ["旧回复"]}, "月仔", 1))
+        results.put(("err", "旧请求失败", "月仔", 1))
+        with patch.object(main, "results", results), patch.object(main, "retry_notices", queue.Queue()), \
+                patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"):
+            main.tick()
+        self.assertTrue(self.state["busy"])
+        self.assertEqual(self.state["analysis_task"], ("其他人", 2))
+        self.assertEqual(self.controller.phase, "analyzing")
+        self.overlay.show.assert_not_called()
+        self.overlay.set_busy.assert_not_called()
+        self.overlay.set_status.assert_not_called()
+        self.assertIsNone(main.chat_of("月仔")["result"])
+
+    def test_auto_switch_waits_three_seconds_even_after_badge_disappears(self):
+        self.config["auto_reply_chats"] = {"wechat:其他人": {"enabled": True}}
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 100}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main.time, "monotonic", return_value=100), patch.object(main, "click") as click:
+            self.controller.advance()
+        click.assert_called_once_with(1, 120, 90)
+        with patch.object(main.time, "monotonic", return_value=101), \
+                patch.object(main, "start_analyze", return_value=True) as analyze:
+            self._drain_packets([("chat", "其他人", "其他人"), ("unread_state", []),
+                                 ("snapshot", self._snapshot(title="其他人", raw_title="其他人"))])
+            analyze.assert_not_called()
+            self.assertEqual(self.controller.deadline, 104)
+            self._settle_current_chat()
+        analyze.assert_called_once_with("其他人", [("her", "是吗 哈哈", None)])
+
+    def test_same_chat_notification_and_snapshot_do_not_restart_settle_timer(self):
+        self.config["auto_reply_chats"] = {"wechat:其他人": {"enabled": True}}
+        with patch.object(main.time, "monotonic", return_value=100):
+            self._drain_packets([("chat", "其他人", "其他人")])
+        with patch.object(main.time, "monotonic", return_value=102), \
+                patch.object(main, "start_analyze", return_value=True) as analyze:
+            self._drain_packets([("chat", "其他人", "其他人"),
+                                 ("snapshot", self._snapshot(title="其他人", raw_title="其他人"))])
+            self.assertEqual(self.controller.deadline, 103)
+            self._settle_current_chat()
+        analyze.assert_called_once()
+
+    def test_old_send_stays_invalid_after_switching_away_and_back(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        chat = main.chat_of("月仔")
+        chat["rev"] = 4
+        self.controller.phase = "waiting_send"
+        self.controller.active = {"id": "current:4", "title": "月仔", "raw": "月仔"}
+        self.controller.send_revision = 4
+        self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔")])
+        with patch.object(main, "fill_and_send") as send:
+            main.auto_send_and_track("月仔", {"candidates": ["旧回复"]}, 4)
+            self.assertFalse(main.auto_send_reply("月仔", {"candidates": ["旧回复"]}, 4))
+        send.assert_not_called()
+        self.assertEqual(chat["rev"], 5)
+        self.assertEqual(self.controller.phase, "settling")
+
+    def test_cancelled_retry_does_not_make_another_model_request(self):
+        import queue
+        from core import retry
+
+        main.chat_of("月仔")["rev"] = 4
+        self._drain_packets([("chat", "其他人", "其他人")])
+        request = Mock()
+
+        def limited(*args, **kwargs):
+            return retry.call_with_retry(request)
+
+        with patch.object(main, "results", queue.Queue()), patch.object(main, "analyze", side_effect=limited), \
+                patch.object(settings, "general_judge_config", return_value={
+                    "provider": "deepseek", "model": "", "base_url": "", "api_key": "k"}):
+            main.analyze_bg([("her", "你好", None)], "月仔", 4)
+        request.assert_not_called()
+        self.assertEqual(self.controller.phase, "settling")
+
+    def test_unconfirmed_snapshot_at_settle_end_waits_for_fresh_confirmation(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        with patch.object(main, "start_analyze", return_value=True) as analyze:
+            self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔"),
+                                 ("snapshot", self._snapshot(new=[("her", None, "是吗 哈哈")])),
+                                 ("snapshot", self._snapshot(title_confirmed=False))])
+            self._settle_current_chat()
+            analyze.assert_not_called()
+            self.assertEqual(self.controller.phase, "waiting_lines")
+            self._drain_packets([("snapshot", self._snapshot())])
+        analyze.assert_called_once()
+
+    def test_history_correction_and_discontinuity_keep_switch_protection(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        for changes in ({"corrected": True}, {"discontinuous": True}):
+            with self.subTest(changes=changes), patch.object(main.time, "monotonic", return_value=100), \
+                    patch.object(main, "start_analyze", return_value=True) as analyze:
+                self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔"),
+                                     ("snapshot", self._snapshot(**changes))])
+                self.assertEqual(self.controller.phase, "settling")
+                self.assertEqual(self.controller.deadline, 103)
+                analyze.assert_not_called()
+
+    def test_models_cannot_bypass_settle_period_through_direct_entry(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔")])
+        with patch.object(main.threading, "Thread") as thread, patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.start_analyze("月仔", [("her", "你好", None)]))
+            self.assertFalse(main.auto_send_reply("月仔", {"candidates": ["旧回复"]}, main.chat_of("月仔")["rev"]))
+        thread.assert_not_called()
+        send.assert_not_called()
+
+    def test_media_jobs_are_deferred_and_discarded_on_another_switch(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        job = {"message_id": 7, "kind": "image", "image": b"image"}
+        with patch.object(main.threading, "Thread") as thread, patch.object(main, "media_inflight", set()):
+            self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔"),
+                                 ("snapshot", self._snapshot(media_jobs=[job])),
+                                 ("snapshot", self._snapshot())])
+            thread.assert_not_called()
+            self.assertEqual(list(self.controller.early_media_jobs), [7])
+            self._drain_packets([("chat", "第三人", "第三人")])
+            self.assertFalse(self.controller.early_media_jobs)
+            thread.assert_not_called()
+
+    def test_deferred_media_job_starts_once_after_settle_period(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        job = {"message_id": 7, "kind": "image", "image": b"image"}
+        with patch.object(main.threading, "Thread") as thread, patch.object(main, "media_inflight", set()), \
+                patch.object(main.media_slots, "acquire", return_value=False), \
+                patch.object(main, "start_analyze", return_value=True):
+            self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔"),
+                                 ("snapshot", self._snapshot(media_jobs=[job])),
+                                 ("snapshot", self._snapshot())])
+            thread.assert_not_called()
+            self._settle_current_chat()
+        thread.assert_called_once()
+        self.assertEqual(thread.call_args.kwargs["target"], main.recognize_media_bg)
+        self.assertFalse(self.controller.early_media_jobs)
+
+    def test_read_only_manual_switch_collects_without_model_calls(self):
+        self.config["analysis_enabled"] = False
+        with patch.object(main, "start_analyze") as analyze, patch.object(main.threading, "Thread") as thread:
+            self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔"),
+                                 ("snapshot", self._snapshot(new=[("her", None, "是吗 哈哈")]))])
+            self._settle_current_chat()
+        analyze.assert_not_called()
+        thread.assert_not_called()
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertEqual(list(main.chat_of("月仔")["history"]), [("her", "是吗 哈哈", None)])
+
+    def test_processing_setting_change_does_not_end_settle_period_early(self):
+        with patch.object(main.time, "monotonic", return_value=100):
+            self._drain_packets([("chat", "其他人", "其他人"), ("chat", "月仔", "月仔")])
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        with patch.object(main.time, "monotonic", return_value=101), \
+                patch.object(main, "start_analyze", return_value=True) as analyze:
+            main.on_processing_changed()
+            self._drain_packets([("snapshot", self._snapshot())])
+            self.assertEqual(self.controller.phase, "settling")
+            self.assertEqual(self.controller.deadline, 103)
+            analyze.assert_not_called()
+            self._settle_current_chat()
+        analyze.assert_called_once()
+
+    def test_current_result_is_accepted_when_cancelled_results_arrive_before_and_after_it(self):
+        import queue
+
+        self.state.update(chat="其他人", raw_chat="其他人", busy=True, analysis_task=("其他人", 2))
+        self.overlay.current_chat.return_value = "其他人"
+        main.chat_of("其他人")["rev"] = 2
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "current:2", "title": "其他人", "raw": "其他人"}
+        result = {"candidates": ["新回复"]}
+        results = queue.Queue()
+        results.put(("ok", {"candidates": ["旧回复"]}, "月仔", 1))
+        results.put(("ok", result, "其他人", 2))
+        results.put(("err", "旧请求失败", "月仔", 1))
+        with patch.object(main, "results", results), patch.object(main, "retry_notices", queue.Queue()), \
+                patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"):
+            main.tick()
+        self.overlay.show.assert_called_once_with(result)
+        self.assertEqual(main.chat_of("其他人")["result"], result)
+        self.assertEqual(self.controller.phase, "waiting_send")
+        self.assertFalse(self.state["busy"])
+        self.assertIsNone(self.state["analysis_task"])
+        self.assertFalse(any(call.args[1] == "error" for call in self.overlay.set_status.call_args_list))
+
     def test_analysis_error_is_not_overwritten_by_generic_abandonment(self):
         import queue
 
@@ -322,7 +571,11 @@ class ConversationFilterTests(unittest.TestCase):
         with patch.object(main, "click") as click:
             self.controller.advance()
             click.assert_not_called()
-            self.controller.on_chat("其他人", "其他人")
+            self.state.update(chat="手动会话", raw_chat="手动会话")
+            self.controller.on_chat("手动会话", "手动会话")
+            self.controller.advance()
+            click.assert_not_called()
+            self._settle_current_chat()
             self.controller.advance()
         click.assert_called_once_with(1, 120, 90)
 
@@ -363,6 +616,7 @@ class ConversationFilterTests(unittest.TestCase):
         self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
                                   "candidate_title": "月仔", "candidate_raw": "月仔"}
         self.controller._confirm_switch()
+        self._settle_current_chat()
         self.assertEqual(self.controller.phase, "listening")
         self.assertIsNone(self.controller.active)
         self.overlay.set_status.assert_called_with("已切换到「月仔」，该会话未开启自动回复", "idle")
@@ -461,11 +715,17 @@ class ConversationFilterTests(unittest.TestCase):
                 expected_phase = phase if phase in ("waiting_send", "verifying") else "listening"
                 self.assertEqual(self.controller.phase, expected_phase)
 
-    def test_switch_confirmation_rejects_wrong_chat(self):
+    def test_switch_confirmation_follows_manual_chat_without_target_mismatch_warning(self):
         self.controller.phase = "switching"
         self.controller.active = {"id": "normal:1", "base": "normal", "name": "月仔",
                                   "candidate_title": "其他人", "candidate_raw": "其他人"}
+        self.state.update(chat="其他人", raw_chat="其他人")
         self.controller._confirm_switch()
+        self.assertEqual(self.controller.phase, "settling")
+        self.assertEqual(self.controller.active["title"], "其他人")
+        self.assertIn("normal:1", self.controller.processed_set)
+        self.assertNotIn("目标不符", self.overlay.set_status.call_args.args[0])
+        self._settle_current_chat()
         self.assertEqual(self.controller.phase, "listening")
         self.assertIsNone(self.controller.active)
 
@@ -475,6 +735,8 @@ class ConversationFilterTests(unittest.TestCase):
         self.controller.active = {"id": "normal:1", "base": "normal", "name": "月仔",
                                   "candidate_title": "月仔", "candidate_raw": "月仔"}
         self.controller._confirm_switch()
+        self.assertEqual(self.controller.phase, "settling")
+        self._settle_current_chat()
         self.assertEqual(self.controller.phase, "waiting_lines")
         self.assertEqual(self.controller.route_lines("月仔", "月仔", 1, True, "her"), "analyze_fresh")
 
@@ -492,6 +754,8 @@ class ConversationFilterTests(unittest.TestCase):
             chat["history"].append(("her", "刚发来的消息", None))
             chat["rev"] = 1
             self.controller.on_unread_state([])
+            analyze.assert_not_called()
+            self._settle_current_chat()
         analyze.assert_called_once_with("月仔", [("her", "刚发来的消息", None)])
         self.assertEqual(self.controller.phase, "analyzing")
         self.assertEqual(self.controller.active["revision"], 1)
@@ -508,7 +772,9 @@ class ConversationFilterTests(unittest.TestCase):
         messages = [
             ("unread_state", [{"base": "person", "name": "月仔", "x": 120, "y": 90}]),
             ("chat", "月仔", "月仔"),
-            ("lines", "月仔", [("her", None, "刚发来的消息")], self.state["area"], True, "月仔"),
+            ("snapshot", self._snapshot(new=[("her", None, "刚发来的消息")],
+                                        visible=[("her", None, "刚发来的消息")],
+                                        history=[("her", None, "刚发来的消息")], initial=True)),
             ("unread_state", []),
             queue_module.Empty,
         ]
@@ -517,6 +783,8 @@ class ConversationFilterTests(unittest.TestCase):
         with patch.object(main, "q", q, create=True), \
                 patch.object(main, "start_analyze", return_value=True) as analyze:
             main.drain()
+            analyze.assert_not_called()
+            self._settle_current_chat()
         analyze.assert_called_once_with("月仔", [("her", "刚发来的消息", None)])
         self.assertEqual(self.controller.phase, "analyzing")
         self.assertEqual(main.chat_of("月仔")["auto_sent_rev"], -1)
@@ -535,6 +803,7 @@ class ConversationFilterTests(unittest.TestCase):
         chat["rev"] = 2
         with patch.object(main, "start_analyze") as analyze:
             self.controller.on_unread_state([])
+            self._settle_current_chat()
         analyze.assert_not_called()
         self.assertEqual(self.controller.phase, "listening")
         self.assertIsNone(self.controller.active)
@@ -553,8 +822,14 @@ class ConversationFilterTests(unittest.TestCase):
             chat["rev"] = 1
             self.controller.on_chat("月仔", "月仔")
             self.controller.on_unread_state([])
+            self._settle_current_chat()
         analyze.assert_not_called()
         self.assertEqual(self.controller.phase, "waiting_lines")
+
+    def _settle_current_chat(self):
+        self.assertEqual(self.controller.phase, "settling")
+        with patch.object(main.time, "monotonic", return_value=self.controller.deadline):
+            self.controller.tick()
 
     def _drain_packets(self, packets):
         import queue as queue_module
@@ -594,6 +869,8 @@ class ConversationFilterTests(unittest.TestCase):
         with patch.object(main, "start_analyze", return_value=True) as analyze:
             self._drain_packets([("chat", "月仔", "月仔"), ("snapshot", self._snapshot()),
                                  ("unread_state", [])])
+            analyze.assert_not_called()
+            self._settle_current_chat()
         analyze.assert_called_once_with("月仔", [("her", "是吗 哈哈", None)])
         self.assertEqual(self.controller.phase, "analyzing")
 
@@ -608,6 +885,8 @@ class ConversationFilterTests(unittest.TestCase):
             self._drain_packets([("chat", "月仔", "月仔"),
                                  ("snapshot", self._snapshot(new=new, initial=True)),
                                  ("snapshot", self._snapshot()), ("unread_state", [])])
+            analyze.assert_not_called()
+            self._settle_current_chat()
         analyze.assert_called_once_with("月仔", [("her", "是吗 哈哈", None)])
         self.assertEqual(self.controller.phase, "analyzing")
         self.assertEqual(main.chat_of("月仔")["auto_sent_rev"], -1)
@@ -618,6 +897,7 @@ class ConversationFilterTests(unittest.TestCase):
         self.controller.active = {"id": "person:1", "base": "person", "name": "月仔",
                                   "candidate_title": "月仔", "candidate_raw": "月仔"}
         self.controller._confirm_switch()
+        self._settle_current_chat()
         self.assertEqual(self.controller.phase, "waiting_lines")
         with patch.object(main, "start_analyze") as analyze:
             self._drain_packets([("snapshot", self._snapshot(new=[("her", None, "是吗 哈哈")]))])

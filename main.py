@@ -37,7 +37,7 @@ from core.retry import retry_cancel_guard, retry_notify_guard
 # senders：这个群里发过言的人，去重、最近的排最前；target：用户挑的回复对象（None = 跟着最近那个走）
 chats = {}
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "", "raw_chat": "",
-         "ocr_confirmed": False, "read_at": 0.0}
+         "ocr_confirmed": False, "read_at": 0.0, "analysis_task": None}
 results = queue.Queue()
 media_results = queue.Queue()
 retry_notices = queue.Queue()  # 后台分析线程的重试提示 (title, revision, text)，由 tick 在主线程里显示
@@ -48,6 +48,7 @@ _AUTO_REPLY_COOLDOWN = 8.0
 _AUTO_REPLY_ECHO_WINDOW = 12.0
 _AUTO_REPLY_SEND_DELAY_MS = 1200
 _MEDIA_REPLY_WAIT = 5.0
+_CONVERSATION_SETTLE_DELAY = 3.0
 read_requested = None
 logging_queue = None
 logging_control = None
@@ -83,7 +84,9 @@ class ConversationController:
         self.pending_current = None
         self.early_lines = None
         self.early_snapshot = None
+        self.early_media_jobs = {}
         self.last_read_request = 0.0
+        self.current_chat = (state.get("chat", ""), state.get("raw_chat", ""))
 
     def mode_enabled(self):
         return (settings.auto_switch() and state.get("app") == "wechat"
@@ -116,25 +119,42 @@ class ConversationController:
     def on_chat(self, title, raw_title):
         switch_debug("chat_changed", title=title, raw_title=raw_title, phase=self.phase,
                      expected=self.active.get("name") if self.active else None)
-        if chat_is_ignored(title, raw_title):
-            if self.active:
-                self.release("当前会话已忽略，继续监听其他新消息", "idle")
+        current = (title, raw_title)
+        switching = self.phase == "switching" and self.active is not None
+        if current == self.current_chat and not switching:
             return
-        if self.phase == "switching" and self.active:
-            if title == self.active["previous_title"] and raw_title == self.active["previous_raw"]:
-                return
+        if switching and current == (self.active.get("previous_title"), self.active.get("previous_raw")):
+            return
+        previous, self.current_chat = self.current_chat, current
+        if previous != current:
+            cancel_chat_analysis(previous[0])
+        self.pending_current = None
+        if switching and self._matches_switch_target(title, raw_title):
             self.active.update(candidate_title=title, candidate_raw=raw_title)
             self._confirm_switch()
             return
-        if self.active and self.phase != "listening":
-            if title != self.active.get("title") or raw_title != self.active.get("raw"):
-                self.release("会话被手动切换，本次自动处理已取消", "warning")
+        self.release()
+        self._begin_settling(title, raw_title)
+
+    def _begin_settling(self, title, raw_title):
+        self.current_chat = (title, raw_title)
+        if self.active is None:
+            self.active = {"id": f"current:{raw_title}:{time.monotonic()}"}
+        self.active.update(title=title, raw=raw_title)
+        self.phase = "settling"
+        self.deadline = time.monotonic() + _CONVERSATION_SETTLE_DELAY
+        self.last_read_request = time.monotonic()
+        request_read()
+        log_event("conversation.settling", chat=title, raw_chat=raw_title,
+                  delay_seconds=_CONVERSATION_SETTLE_DELAY)
+        ov.set_status(f"已切换到「{raw_title}」，停留 3 秒后开始自动处理", "idle")
 
     def on_snapshot(self, snapshot):
         title, raw_title = snapshot["title"], snapshot["raw_title"]
         if not snapshot["title_confirmed"]:
             return
-        if self.phase == "switching" and self._matches_switch_target(title, raw_title):
+        if (self.phase == "switching" and self._matches_switch_target(title, raw_title)
+                or self.phase == "settling" and self._matches(title, raw_title)):
             self.early_snapshot = snapshot
             return
         if self.phase != "waiting_lines" or not self._matches(title, raw_title):
@@ -154,6 +174,12 @@ class ConversationController:
         if not settings.analysis_enabled():
             return "skip"
         if chat_is_ignored(title, raw_title):
+            return "skip"
+        if title != state.get("chat") or raw_title != state.get("raw_chat"):
+            return "skip"
+        if self.phase == "settling":
+            if self._matches(title, raw_title):
+                self.early_lines = (title, raw_title, revision, initial, latest_who)
             return "skip"
         if self.phase == "send_failed":
             if (self._matches(title, raw_title) and latest_who == "her"
@@ -327,9 +353,13 @@ class ConversationController:
         ov.set_status("检测到新消息，正在切换会话", "busy")
 
     def tick(self):
-        if self.phase == "waiting_lines" and time.monotonic() - self.last_read_request >= 1.0:
+        if self.phase in ("settling", "waiting_lines") and time.monotonic() - self.last_read_request >= 1.0:
             request_read()
             self.last_read_request = time.monotonic()
+        if self.phase == "settling":
+            if time.monotonic() >= self.deadline:
+                self._finish_settling()
+            return
         if self.phase in ("switching", "waiting_lines", "waiting_send", "verifying"):
             if self.deadline and time.monotonic() >= self.deadline:
                 switch_debug("conversation_timeout", phase=self.phase,
@@ -365,6 +395,9 @@ class ConversationController:
         self.pending_current = None
         self.early_lines = None
         self.early_snapshot = None
+        self.early_media_jobs.clear()
+        self.current_chat = (state.get("chat", ""), state.get("raw_chat", ""))
+        cancel_chat_analysis(self.current_chat[0])
 
     def release(self, text=None, kind="idle"):
         log_event("conversation.released", phase=self.phase, active=self.active, reason=text, status=kind)
@@ -374,6 +407,7 @@ class ConversationController:
         self.active = None
         self.early_lines = None
         self.early_snapshot = None
+        self.early_media_jobs.clear()
         self.deadline = 0.0
         self.send_revision = None
         self.expected_text = ""
@@ -381,16 +415,23 @@ class ConversationController:
             ov.set_status(text, kind)
 
     def _confirm_switch(self):
-        if (self.phase != "switching" or not self.active or "candidate_title" not in self.active
-                or self.active["base"] in self.badges):
+        if self.phase != "switching" or not self.active or "candidate_title" not in self.active:
             return
         title, raw_title = self.active.pop("candidate_title"), self.active.pop("candidate_raw")
-        if (chat_is_ignored(title, raw_title)
-                or settings.normalize_chat_title(raw_title) != settings.normalize_chat_title(self.active["name"])):
-            self.release("切换后的会话与目标不符，已跳过自动处理", "warning")
+        if not self._matches_switch_target(title, raw_title):
+            self.release()
+        self._begin_settling(title, raw_title)
+
+    def _finish_settling(self):
+        title, raw_title = self.active["title"], self.active["raw"]
+        if title != state.get("chat") or raw_title != state.get("raw_chat"):
+            self.on_chat(state.get("chat", ""), state.get("raw_chat", ""))
             return
-        self.active.update(title=title, raw=raw_title,
-                           authorized=settings.auto_reply_config(raw_title, "wechat")["enabled"])
+        if chat_is_ignored(title, raw_title):
+            self.release("当前会话已忽略，继续监听其他新消息", "idle")
+            return
+        self.active["authorized"] = (not settings.auto_switch()
+                                     or settings.auto_reply_config(raw_title, state.get("app", "wechat"))["enabled"])
         if not self.active["authorized"] and settings.analysis_enabled():
             self.release(f"已切换到「{raw_title}」，该会话未开启自动回复", "idle")
             return
@@ -398,17 +439,21 @@ class ConversationController:
         self.deadline = time.monotonic() + 4.0
         request_read()
         self.last_read_request = time.monotonic()
+        confirmed = state.get("ocr_confirmed", True)
+        if confirmed and self.early_media_jobs:
+            start_media_jobs({"title": title, "raw_title": raw_title, "media_jobs": []})
         snapshot, self.early_snapshot = self.early_snapshot, None
-        early = self.early_lines
-        self.early_lines = None
+        early, self.early_lines = self.early_lines, None
+        if not confirmed:
+            snapshot = early = None
         if early and settings.analysis_enabled():
-            early_title, early_raw, revision, _, latest_who = early
-            if (early_title != title or early_raw != raw_title
-                    or state["chat"] != title or state["raw_chat"] != raw_title
-                    or revision != chat_of(title)["rev"]):
+            early_title, early_raw, _, _, latest_who = early
+            if early_title != title or early_raw != raw_title:
                 self.release("切换期间会话或消息已变化，本次自动处理已取消", "warning")
                 return
-            if latest_who != "her":
+            chat = chat_of(title)
+            revision = chat["rev"]
+            if latest_who != "her" or not chat["history"] or chat["history"][-1][0] != "her":
                 self.release("切换期间你已回复，等待对方的新消息", "idle")
                 return
             self.phase = "analyzing"
@@ -459,6 +504,23 @@ def chat_of(title):
                                     "manual_only": False})  # 画面刚重新定位（跳转/滚动浏览）：只出建议，不自动发送
 
 
+def cancel_chat_analysis(title):
+    chat = chats.get(title)
+    if chat is not None:
+        log_event("analysis.cancelled", chat=title, revision=chat["rev"], reason="当前会话已切换或采集已暂停")
+        chat["rev"] += 1
+        chat["result"] = None
+        chat["analysis_requested_rev"] = -1
+        chat["auto_retry_rev"] = None
+        chat["media_waiting"] = False
+        chat["media_wait_started"] = None
+    state["busy"] = False
+    state["analysis_task"] = None
+    state["rerun"] = None
+    ov.set_busy(False)
+    ov.invalidate_replies()
+
+
 def sync_history(title, history):
     chat = chat_of(title)
     messages = [(who, text, name) for who, name, text in history]
@@ -506,8 +568,19 @@ def media_pending(title):
 
 
 def start_media_jobs(snapshot):
+    title, raw_title = snapshot["title"], snapshot["raw_title"]
+    if title != state.get("chat") or raw_title != state.get("raw_chat"):
+        return
+    if conversation_controller.phase in ("switching", "settling"):
+        if (conversation_controller._matches(title, raw_title)
+                or conversation_controller._matches_switch_target(title, raw_title)):
+            conversation_controller.early_media_jobs.update(
+                (job["message_id"], job) for job in snapshot.get("media_jobs", []))
+        return
+    jobs, conversation_controller.early_media_jobs = conversation_controller.early_media_jobs, {}
+    jobs.update((job["message_id"], job) for job in snapshot.get("media_jobs", []))
     app_key = state.get("app", "wechat")
-    for job in reversed(snapshot.get("media_jobs", [])):
+    for job in reversed(list(jobs.values())):
         identity = (app_key, snapshot["title"], job["message_id"])
         if identity in media_inflight:
             continue
@@ -588,7 +661,8 @@ def drain_media():
                 if title == ov.current_chat():
                     ov.invalidate_replies()
             request_read()
-        if media_pending(title) or not chat["media_waiting"]:
+        if (media_pending(title) or not chat["media_waiting"] or title != state.get("chat")
+                or conversation_controller.phase in ("switching", "settling")):
             continue
         chat["media_waiting"] = False
         chat["media_wait_started"] = None
@@ -666,9 +740,12 @@ def on_processing_changed():
               send_enabled=settings.send_enabled(), auto_switch=settings.auto_switch(),
               judge_mode=settings.judge_mode(), media_mode=settings.media_mode())
     request_read()
-    conversation_controller.release()
+    if conversation_controller.phase != "settling":
+        conversation_controller.release()
     conversation_controller.pending_current = None
     state["rerun"] = None
+    state["busy"] = False
+    state["analysis_task"] = None
     ov.set_busy(False)
     for chat in chats.values():
         chat["rev"] += 1
@@ -759,6 +836,8 @@ def auto_send_reply(title, result, revision, announce=True):
         return blocked("该会话未授权自动回复")
     if title != state["chat"]:
         return blocked("当前会话已切换，取消旧会话发送")
+    if conversation_controller.phase in ("switching", "settling"):
+        return blocked("当前会话尚在切换保护期，暂不自动发送")
     if revision != chat["rev"]:
         return blocked(f"回复已过期（版本 {revision} → {chat['rev']}）")
     if settings.auto_switch() and not raw_config["enabled"]:
@@ -943,6 +1022,10 @@ def start_analyze(title, msgs):
         log_event("analysis.skipped", chat=title, reason=chat["analysis_block_reason"])
         return False
     raw_title = state.get("raw_chat", "") if title == state.get("chat") else ""
+    if title != state.get("chat") or conversation_controller.phase in ("switching", "settling"):
+        chat["analysis_block_reason"] = "当前会话已切换或尚在切换保护期，暂不分析"
+        log_event("analysis.skipped", chat=title, reason=chat["analysis_block_reason"])
+        return False
     if chat_is_ignored(title, raw_title):
         chat["analysis_block_reason"] = "当前会话已忽略，不参与自动处理"
         log_event("analysis.skipped", chat=title, reason=chat["analysis_block_reason"])
@@ -974,6 +1057,7 @@ def start_analyze(title, msgs):
     chat["media_waiting"] = media_pending(title)
     chat["analysis_requested_rev"] = chat["rev"]
     state["busy"] = True
+    state["analysis_task"] = (title, chat["rev"])
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
     threading.Thread(target=analyze_bg, args=(msgs, title, chat["rev"], reply_to, chat["latest_id"]),
@@ -1086,13 +1170,20 @@ def drain():
                     ov.invalidate_replies()
                     ov.set_status("本地消息已按连续 OCR 证据修订，旧回复建议已作废", "success")
                 if conversation_controller._matches(title, raw_title):
-                    conversation_controller.release()
+                    if conversation_controller.phase == "settling":
+                        conversation_controller.early_lines = None
+                    else:
+                        conversation_controller.release()
             if snapshot.get("discontinuous"):
                 chat = chat_of(title)
                 chat["rev"] += 1
                 ov.invalidate_replies()
                 if conversation_controller._matches(title, raw_title):
-                    conversation_controller.release()
+                    if conversation_controller.phase == "settling":
+                        conversation_controller.early_lines = None
+                        conversation_controller.early_snapshot = None
+                    else:
+                        conversation_controller.release()
                 chat["result"] = None
                 if title == ov.current_chat():
                     ov.show_cached(None)
@@ -1187,7 +1278,8 @@ def tick():
                     and time.monotonic() - chat["media_wait_started"] >= _MEDIA_REPLY_WAIT
                     and chat["media_fallback_rev"] != chat["rev"] and title == state.get("chat")
                     and chat["history"] and chat["history"][-1][0] == "her"
-                    and chat["auto_sent_key"] != reply_key(title)):
+                    and chat["auto_sent_key"] != reply_key(title)
+                    and conversation_controller.phase not in ("switching", "settling")):
                 chat["media_fallback_rev"] = chat["rev"]
                 if state["busy"]:
                     state["rerun"] = (title, list(chat["history"]))
@@ -1202,6 +1294,11 @@ def tick():
                 ov.set_status(text, "warning")  # 只给还有效、正看着的会话提示，过期分析的重试不打扰
         while not results.empty():
             kind, r, title, revision = results.get()
+            if (title != state.get("chat") or "analysis_task" in state
+                    and state["analysis_task"] != (title, revision)):
+                log_event("analysis.result_cancelled", chat=title, revision=revision, result_kind=kind)
+                continue
+            state["analysis_task"] = None
             state["busy"] = False
             if not settings.analysis_enabled():
                 state["rerun"] = None

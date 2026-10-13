@@ -92,6 +92,27 @@ class MediaPipelineTests(unittest.TestCase):
             main.drain_media()
         analyze.assert_not_called()
 
+    def test_media_completion_during_settle_period_does_not_start_reply_analysis(self):
+        self.controller.phase = "settling"
+        self.finish()
+        with patch.object(main, "start_analyze") as analyze:
+            main.drain_media()
+        analyze.assert_not_called()
+        self.assertTrue(self.chat["media_waiting"])
+        self.assertEqual(self.chat["rev"], 2)
+
+    def test_media_timeout_cannot_bypass_settle_period(self):
+        self.controller.phase = "settling"
+        self.chat["media_wait_started"] = 100
+        with patch.object(main.time, "monotonic", return_value=106), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"), \
+                patch.object(main, "results", queue.Queue()), patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "start_analyze") as analyze:
+            main.tick()
+        analyze.assert_not_called()
+        self.assertEqual(self.chat["media_fallback_rev"], -1)
+        self.assertIsNone(self.state["rerun"])
+
     def test_disabled_upload_never_calls_visual_model(self):
         self.config["vision_upload"] = False
         recognize = self.finish()

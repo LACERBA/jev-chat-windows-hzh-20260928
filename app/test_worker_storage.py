@@ -118,6 +118,33 @@ class WorkerStorageTests(unittest.TestCase):
         self.assertNotIn("rect", job)
         self.assertEqual(next(iter(snapshots[0]["media_state"].values()))["status"], "pending")
 
+    def test_returning_to_chat_requeues_media_abandoned_during_settle_period(self):
+        from app.media import media_token
+
+        frames = [self.frame.copy() for _ in range(3)]
+        frames[1][:5, 10:] = 240
+        self.capture.alive.side_effect = [True, True, True, False]
+
+        def next_frame():
+            self.capture.latest = frames.pop(0)
+            return self.capture.latest
+
+        def read(*args):
+            self.reader.last_media = [{"fingerprint": "1" * 32, "kind": "image", "ocr_text": "",
+                                      "who": "her", "sender": None, "rect": (0, 0, 4, 4),
+                                      "pixels": np.full((4, 4, 3), 100, dtype=np.uint8)}]
+            return [("her", None, media_token("1" * 32), 10)]
+
+        self.capture.settled.side_effect = next_frame
+        self.reader.read.side_effect = read
+        with patch.object(worker, "read_title", side_effect=["月仔", "阿梅", "月仔"]), \
+                patch.object(settings, "vision_upload", return_value=True), \
+                patch.object(settings, "media_mode", return_value="hybrid"):
+            snapshots = self.run_worker()
+        self.assertEqual([item["title"] for item in snapshots], ["月仔", "阿梅", "月仔"])
+        self.assertEqual([len(item["media_jobs"]) for item in snapshots], [1, 1, 1])
+        self.assertEqual(snapshots[0]["media_jobs"][0]["message_id"], snapshots[2]["media_jobs"][0]["message_id"])
+
     def test_only_collection_does_not_queue_visual_requests(self):
         from app.media import media_token
 
