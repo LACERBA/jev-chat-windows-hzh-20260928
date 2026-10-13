@@ -113,6 +113,57 @@ class MessageStoreTests(unittest.TestCase):
         self.assertEqual(latest["new"], [("her", None, "6机器人都用上了")])
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 4)
 
+    def test_stable_unanchored_screen_becomes_new_baseline_and_can_reply(self):
+        old = [("her", None, "很久以前的消息")]
+        screen = [("her", None, "现在屏幕上第一条"), ("her", None, "现在屏幕上最后一条")]
+        self.record(old)
+        first = self.record(screen)
+        self.assertTrue(first["discontinuous"])
+        self.assertEqual(first["new"], [])
+        self.assertEqual(first["history"], old)
+        second = self.record(screen)
+        self.assertFalse(second["discontinuous"])
+        self.assertTrue(second["rebaselined"])
+        self.assertFalse(first["rebaselined"])
+        self.assertEqual(second["new"], screen)
+        self.assertEqual(second["history"], screen)
+        self.assertEqual(self.record(screen)["new"], [])
+        later = self.record(screen + [("her", None, "又来一条")])
+        self.assertEqual(later["new"], [("her", None, "又来一条")])
+        original = self.store.connection.execute("SELECT COUNT(*) FROM messages WHERE text = '很久以前的消息'").fetchone()[0]
+        self.assertEqual(original, 1)  # 旧消息只是被取代，不删除
+        self.assertEqual(self.store.connection.execute(
+            "SELECT reason FROM message_revisions WHERE reason = 'rebaseline_stable_unanchored'").fetchone()[0],
+            "rebaseline_stable_unanchored")
+
+    def test_clipped_edge_bubble_jitter_still_counts_as_stable_but_scrolling_does_not(self):
+        self.record([("her", None, "很久以前的消息")])
+        middle, last = ("her", None, "中间气泡内容"), ("her", None, "最后一个气泡")
+        self.record([("her", None, "顶部被裁切一"), middle, last])
+        stable = self.record([("her", None, "顶部被裁切二"), middle, last])
+        self.assertTrue(stable["rebaselined"])
+        self.assertEqual(len(stable["new"]), 3)
+
+        other = MessageStore(Path(self.directory.name) / "other.sqlite3")
+        self.addCleanup(other.close)
+        record = lambda visible: other.record_snapshot("wechat", "月仔", "月仔", visible, self.area)
+        record([("her", None, "很久以前的消息")])
+        a, b, c, d = (("her", None, text) for text in ("今天天气真不错", "我们去爬山吧", "带上水和零食", "晚上一起吃饭"))
+        record([a, b, c])
+        scrolled = record([b, c, d])  # 向下滚动一格：位置错开，不能当作稳定画面
+        self.assertTrue(scrolled["discontinuous"])
+        self.assertFalse(scrolled["rebaselined"])
+
+    def test_unstable_unanchored_frames_stay_quarantined(self):
+        self.record([("her", None, "之前的消息")])
+        self.record([("her", None, "画面甲")])
+        changing = self.record([("her", None, "画面乙完全不同")])
+        self.assertTrue(changing["discontinuous"])
+        self.assertEqual(changing["history"], [("her", None, "之前的消息")])
+        unconfirmed = self.record([("her", None, "画面乙完全不同")], title_confirmed=False)
+        self.assertEqual(unconfirmed["new"], [])
+        self.assertEqual(unconfirmed["history"], [("her", None, "之前的消息")])
+
     def test_stable_ocr_correction_keeps_original_and_audit(self):
         self.record([("me", None, "刚刚怎么了"), ("her", None, "今天真是不好竟思"),
                      ("me", None, "没事的")])

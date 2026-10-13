@@ -670,6 +670,23 @@ class ConversationFilterTests(unittest.TestCase):
                                                                  **changes))])
             analyze.assert_not_called()
 
+    def test_rebaselined_snapshot_analyzes_but_blocks_auto_send_until_real_new_message(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        message = [("her", None, "滚动后停住的消息")]
+        with patch.object(main, "start_analyze", return_value=True) as analyze:
+            self._drain_packets([("snapshot", self._snapshot(new=message, baseline=True, rebaselined=True))])
+        analyze.assert_called_once()  # 仍然生成建议
+        self.assertTrue(main.chat_of("月仔")["manual_only"])
+        result = {"candidates": ["收到"], "best_index": 0}
+        with patch.object(main, "fill_and_send") as send:
+            self.assertFalse(main.auto_send_reply("月仔", result, main.chat_of("月仔")["rev"]))
+        send.assert_not_called()
+        self.assertIn("仅生成建议", main.chat_of("月仔")["auto_send_block_reason"])
+        with patch.object(main, "start_analyze", return_value=True):
+            self._drain_packets([("snapshot", self._snapshot(new=[("her", None, "真正的新消息")],
+                                                             baseline=False))])
+        self.assertFalse(main.chat_of("月仔")["manual_only"])
+
     def test_switch_confirmation_requests_fresh_ocr_even_if_pixels_unchanged(self):
         self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
         self.controller.phase = "switching"

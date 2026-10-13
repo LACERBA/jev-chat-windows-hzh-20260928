@@ -455,7 +455,8 @@ def chat_of(title):
                                     "media_waiting": False, "media_wait_started": None,
                                     "latest_id": None, "history_ids": [], "analysis_requested_rev": -1,
                                     "auto_sent_key": None, "auto_retry_rev": None, "media_fallback_rev": -1,
-                                    "analysis_block_reason": "", "auto_send_block_reason": "", "no_reply_rev": -1})
+                                    "analysis_block_reason": "", "auto_send_block_reason": "", "no_reply_rev": -1,
+                                    "manual_only": False})  # 画面刚重新定位（跳转/滚动浏览）：只出建议，不自动发送
 
 
 def sync_history(title, history):
@@ -741,6 +742,8 @@ def auto_send_reply(title, result, revision, announce=True):
         log_event("send.skipped_no_reply", chat=title, revision=revision,
                   reason=result.get("no_reply_reason") or "本轮无需回复")
         return False
+    if chat["manual_only"]:  # 可能只是在滚动浏览旧消息，等锚点连续的真正新消息出现后才恢复自动发送
+        return blocked("画面刚重新定位（可能在浏览历史），仅生成建议，不自动发送")
     if not settings.send_enabled() or not settings.analysis_enabled():
         return blocked("生成建议或允许发送开关已关闭")
     if os.environ.get("JEV_DISABLE_AUTO_SEND") == "1":
@@ -1093,8 +1096,12 @@ def drain():
                 chat["result"] = None
                 if title == ov.current_chat():
                     ov.show_cached(None)
-                    ov.set_status("当前画面与历史缺少连续锚点，文本已隔离待确认，不进入回复上下文", "warning")
+                    ov.set_status("当前画面与历史缺少连续锚点，文本暂时隔离；画面稳定后将作为新的起点继续处理", "warning")
                 continue
+            if snapshot.get("rebaselined"):
+                chat_of(title)["manual_only"] = True
+            elif snapshot["new"] and not snapshot.get("baseline"):
+                chat_of(title)["manual_only"] = False
             if not snapshot["new"]:
                 conversation_controller.on_snapshot(snapshot)
                 resume_cached_reply(snapshot)

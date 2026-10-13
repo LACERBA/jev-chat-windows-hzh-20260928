@@ -305,6 +305,20 @@ class MessageStore:
         return [row[0] for row in self.connection.execute(
             "SELECT title FROM conversations WHERE app = ? ORDER BY last_read_at", (app,))]
 
+    @staticmethod
+    def _stable_unanchored(previous, last, visible):
+        """上一帧同样对不上已确认的历史，并且与当前帧互相完全对齐，说明画面稳定停在新位置。"""
+        earlier = [tuple(value) for value in json.loads(last["visible_messages"])]
+        if not earlier or new_messages(previous, earlier)[1]:
+            return False
+        aligned = align_messages(earlier, visible)
+        smaller = min(len(earlier), len(visible))
+        if len(aligned) == smaller:  # 一帧是另一帧的子集（OCR 漏识别了某个气泡）
+            return True
+        # 顶部被裁切的气泡每帧指纹都会变：长度相同、位置不动，只允许一个气泡对不上；滚动会让位置错开，不算稳定
+        return (len(earlier) == len(visible) >= 3 and len(aligned) >= smaller - 1
+                and all(i == j for i, j in aligned))
+
     def record_snapshot(self, app, title, raw_title, visible, area, ocr_ms=0,
                         title_confirmed=True, observed_at=None, media=None, vision=False):
         now = time.time() if observed_at is None else float(observed_at)
@@ -330,6 +344,11 @@ class MessageStore:
                 SELECT id, raw_title, area, visible_messages, title_confirmed, status
                 FROM ocr_snapshots WHERE conversation_id = ? ORDER BY id DESC LIMIT 1
             """, (conversation_id,)).fetchone()
+            stable = bool(discontinuous and title_confirmed and last and last["title_confirmed"]
+                          and self._stable_unanchored(previous, last, visible))
+            if stable:  # 画面连续两帧稳定停在没有锚点的新位置：把它当作新的起点，不再一直隔离
+                discontinuous = False
+                new = list(visible)
             if last and tuple(last)[1:] == (raw_title, rect, encoded, int(title_confirmed), status):
                 snapshot_id = last["id"]
                 self.connection.execute(
@@ -342,6 +361,9 @@ class MessageStore:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (conversation_id, now, raw_title, rect, encoded, len(new), ocr_ms,
                       int(title_confirmed), status)).lastrowid
+            if stable:  # 旧历史标记为已被取代（原文和审计记录都保留），回到底部时才能重新对齐、不吞新消息
+                for row, old in zip(rows, previous):
+                    self._revise(row, old, "superseded", "rebaseline_stable_unanchored", snapshot_id)
             duplicate_pending = discontinuous and last and last["visible_messages"] == encoded
             if not duplicate_pending:
                 for value in new:
@@ -397,6 +419,6 @@ class MessageStore:
                 "history": rendered, "corrected": corrected,
                 "area": tuple(area), "read_at": now, "baseline": baseline,
                 "title_confirmed": bool(title_confirmed), "status": status,
-                "discontinuous": discontinuous, "media_jobs": jobs, "media_state": media_values,
+                "discontinuous": discontinuous, "rebaselined": stable, "media_jobs": jobs, "media_state": media_values,
                 "latest_id": effective[-1]["id"] if effective else None,
                 "history_ids": [row["id"] for row in effective[-60:]]}
