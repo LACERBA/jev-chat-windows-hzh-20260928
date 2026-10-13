@@ -9,13 +9,15 @@ from ctypes import wintypes
 import numpy as np
 
 from app import chatapps
+from core.diagnostics import log_event, redact_text
 
 u32 = ctypes.windll.user32
 
 
 def switch_debug(stage, **fields):
+    log_event("conversation." + stage, **fields)
     if os.environ.get("JEV_DEBUG_AUTO_SWITCH") == "1":
-        print(f"[自动切换 {time.monotonic():.3f}] {stage} {fields}", flush=True)
+        print(redact_text(f"[自动切换 {time.monotonic():.3f}] {stage} {fields}"), flush=True)
 
 
 def find_chat_hwnd(want=None):

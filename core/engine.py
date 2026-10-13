@@ -7,11 +7,13 @@ from __future__ import annotations
 
 try:
     from .draft import draft_candidates
+    from .diagnostics import log_event, log_step
     from .jev_client import JevError, ask as ask_jev
     from .llm_judge import ask as ask_llm_judge, select_best, validate_answers
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
     from draft import draft_candidates
+    from diagnostics import log_event, log_step
     from jev_client import JevError, ask as ask_jev
     from llm_judge import ask as ask_llm_judge, select_best, validate_answers
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
@@ -49,28 +51,38 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     generic_available = True
 
     def generic(questions):
-        return ask_llm_judge(state, questions, timeout=timeout, provider=llm_judge_provider,
-                             model=llm_judge_model, base_url=llm_judge_base_url,
-                             api_key=llm_judge_api_key)
+        step = "ranking.llm" if "best_reply" in questions else "judgment.llm"
+        with log_step(step, provider=llm_judge_provider, model=llm_judge_model, timeout=timeout):
+            return ask_llm_judge(state, questions, timeout=timeout, provider=llm_judge_provider,
+                                model=llm_judge_model, base_url=llm_judge_base_url,
+                                api_key=llm_judge_api_key)
+
+    def jev(questions):
+        step = "ranking.jev" if "best_reply" in questions else "judgment.jev"
+        with log_step(step, provider=jev_provider, model=jev_model, timeout=timeout):
+            return ask_jev(state, questions, timeout=timeout, provider=jev_provider, model=jev_model,
+                           max_retries=1 if judge_mode == "jev_fallback" else 3)
 
     def final_select(candidates):
-        return select_best(state, candidates, timeout=timeout, provider=llm_judge_provider,
-                           model=llm_judge_model, base_url=llm_judge_base_url,
-                           api_key=llm_judge_api_key)
+        with log_step("ranking.final_select", provider=llm_judge_provider,
+                      model=llm_judge_model, candidate_count=len(candidates)):
+            return select_best(state, candidates, timeout=timeout, provider=llm_judge_provider,
+                               model=llm_judge_model, base_url=llm_judge_base_url,
+                               api_key=llm_judge_api_key)
 
     try:
         if judge_mode == "llm_only":
             first = generic(dict(JUDGE_QUESTIONS))
             judge_backend = "llm"
         else:
-            first = ask_jev(state, dict(JUDGE_QUESTIONS), timeout=timeout,
-                            provider=jev_provider, model=jev_model,
-                            max_retries=1 if judge_mode == "jev_fallback" else 3)
+            first = jev(dict(JUDGE_QUESTIONS))
             first["answers"] = validate_answers(first.get("answers"), JUDGE_QUESTIONS)
             judge_backend = "jev"
         answers = first["answers"]
         _add_usage(usage, first.get("usage"))
     except JevError as error:
+        log_event("judgment.failed", level="warning", exc_info=True,
+                  judge_mode=judge_mode, http_status=error.status)
         if error.status in _CONFIG_STATUSES:
             raise
         first = None
@@ -92,10 +104,12 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             generic_available = False
             warnings.append("判断服务暂时不可用，本次仅生成手动候选")
 
-    candidates = draft_candidates(messages, relationship, provider=provider, model=model,
-                                  base_url=base_url, timeout=timeout, keep=context,
-                                  reply_to=reply_to, style=style, thinking=thinking,
-                                  guidance=guidance_text(answers) if answers else None)
+    with log_step("draft", provider=provider, model=model, timeout=timeout, thinking=thinking):
+        candidates = draft_candidates(messages, relationship, provider=provider, model=model,
+                                      base_url=base_url, timeout=timeout, keep=context,
+                                      reply_to=reply_to, style=style, thinking=thinking,
+                                      guidance=guidance_text(answers) if answers else None)
+    log_event("draft.candidates", candidate_count=len(candidates))
     if not candidates:
         raise JevError("起草结果没有可用候选回复")
 
@@ -112,12 +126,12 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                     ranked = generic(rank_question)
                     ranking_backend = "llm"
             else:
-                ranked = ask_jev(state, rank_question, timeout=timeout,
-                                 provider=jev_provider, model=jev_model,
-                                 max_retries=1 if judge_mode == "jev_fallback" else 3)
+                ranked = jev(rank_question)
                 ranked["answers"] = validate_answers(ranked.get("answers"), rank_question)
                 ranking_backend = "jev"
         except JevError as error:
+            log_event("ranking.failed", level="warning", exc_info=True,
+                      backend="llm" if use_generic else "jev", http_status=error.status)
             if use_generic:
                 final_selector_attempted = True
                 try:
@@ -176,6 +190,10 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             except (TypeError, ValueError):
                 scores[idx] = 0.0
 
+    log_event("engine.completed", candidate_count=len(candidates), best_index=best_index,
+              judge_backend=judge_backend, ranking_backend=ranking_backend,
+              ranking_valid=ranking_valid, fallback_used=fallback_used,
+              warnings=list(dict.fromkeys(warnings)))
     return {
         "candidates": candidates,
         "best_index": best_index,

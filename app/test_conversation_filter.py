@@ -38,6 +38,51 @@ class ConversationFilterTests(unittest.TestCase):
         target.start()
         self.addCleanup(target.stop)
 
+    def test_analysis_error_is_not_overwritten_by_generic_abandonment(self):
+        import queue
+
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
+        results = queue.Queue()
+        results.put(("err", "分析失败: 起草 HTTP 429: 被限流", "月仔", 0))
+        with patch.object(main, "results", results), \
+                patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"):
+            main.tick()
+        text, kind = self.overlay.set_status.call_args.args
+        self.assertIn("起草 HTTP 429", text)
+        self.assertEqual(kind, "error")
+        self.assertNotIn("自动处理未完成", text)
+        self.assertEqual(self.controller.phase, "listening")
+
+    def test_stale_analysis_result_reports_both_revisions(self):
+        import queue
+
+        self.controller.phase = "analyzing"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
+        main.chat_of("月仔")["rev"] = 2
+        results = queue.Queue()
+        results.put(("ok", {"candidates": ["收到"]}, "月仔", 1))
+        with patch.object(main, "results", results), \
+                patch.object(main, "update_result", queue.Queue()), \
+                patch.object(main, "drain"), patch.object(main, "drain_media"):
+            main.tick()
+        text, kind = self.overlay.set_status.call_args.args
+        self.assertIn("版本 1 → 2", text)
+        self.assertIn("过期", text)
+        self.assertEqual(kind, "warning")
+        self.assertEqual(self.controller.phase, "listening")
+
+    def test_missing_model_configuration_keeps_specific_block_reason(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        with patch.object(settings, "models_ready", return_value=False):
+            self._drain_packets([("lines", "月仔", [("her", None, "你好")],
+                                  self.state["area"], False, "月仔")])
+        text, kind = self.overlay.set_status.call_args.args
+        self.assertIn("模型配置不完整", text)
+        self.assertEqual(kind, "warning")
+        self.assertNotIn("自动处理未完成", text)
+
     def test_builtin_entries_are_ignored_without_affecting_similar_names(self):
         for title in ("公众号", "订阅号", "服务号", " 公 众 号 "):
             with self.subTest(title=title):

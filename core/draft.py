@@ -12,10 +12,12 @@ import re
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .jev_client import JevError, _api_key  # 复用 key 读取
     from .llm import chat
+    from .diagnostics import log_event
     from .providers import DRAFT_PROVIDERS, LLM_ENV
 except ImportError:
     from jev_client import JevError, _api_key
     from llm import chat
+    from diagnostics import log_event
     from providers import DRAFT_PROVIDERS, LLM_ENV
 
 # 思考模式：V4.1 Flash 默认**开着**（effort=high，max_tokens 64K）——起草三句聊天回复用不上，慢还贵，
@@ -203,18 +205,25 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
 
     content = call([user])
     her_recent = _her_recent(messages)
-    cands = _sanitize(_parse_candidates(content), suspects, her_recent)
+    parsed = _parse_candidates(content)
+    cands = _sanitize(parsed, suspects, her_recent)
+    log_event("draft.filtered", parsed_count=len(parsed), usable_count=len(cands),
+              suspect_count=len(suspects))
     if len(cands) < 3:
         # 模型偶尔只给 1~2 条（V4.1 Flash 实测会把三条揉成一条）。带着它的回答追问一次，要补齐的那几条。
         need = 3 - len(cands)
+        log_event("draft.supplement_requested", missing_count=need)
         try:
             extra = _parse_candidates(call([
                 user, content,
                 f"只给了 {len(cands)} 条能用的。再给 {need} 条跟上面不一样、也别照抄对方原话的候选，"
                 f"只输出这 {need} 条的 JSON 数组。"]))
         except JevError:
+            log_event("draft.supplement_failed", level="warning", exc_info=True,
+                      remaining_count=len(cands))
             extra = []
         cands = _sanitize(cands + extra, suspects, her_recent)
+        log_event("draft.supplement_filtered", extra_count=len(extra), usable_count=len(cands))
     return cands[:3]  # 可能仍不足 3 条，下游按实际条数处理
 
 

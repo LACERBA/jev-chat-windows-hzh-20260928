@@ -13,8 +13,10 @@ import base64
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .jev_client import JevError, _fail
+    from .diagnostics import log_step, register_secret
 except ImportError:
     from jev_client import JevError, _fail
+    from diagnostics import log_step, register_secret
 
 # Anthropic 开思考模式时的预算：起草三句话用不上更多；max_tokens 必须比它大，下面会兜住
 _THINK_BUDGET = 2048
@@ -49,14 +51,17 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
         else:
             parts.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}})
         user_turns = list(user_turns[:-1]) + [parts]
-    if protocol == "anthropic":
-        return _anthropic(base_url, api_key, model, system, user_turns,
-                          temperature, max_tokens, thinking, timeout, what)
-    if protocol == "gemini":
-        return _gemini(base_url, api_key, model, system, user_turns,
-                       temperature, max_tokens, thinking, timeout, what)
-    return _openai(base_url, api_key, model, system, user_turns,
-                   temperature, max_tokens, extra_body, headers, timeout, what)
+    register_secret(api_key)
+    with log_step("model.request", purpose=what, protocol=protocol, model=model,
+                  timeout=timeout, has_image=image is not None, turn_count=len(user_turns)):
+        if protocol == "anthropic":
+            return _anthropic(base_url, api_key, model, system, user_turns,
+                              temperature, max_tokens, thinking, timeout, what)
+        if protocol == "gemini":
+            return _gemini(base_url, api_key, model, system, user_turns,
+                           temperature, max_tokens, thinking, timeout, what)
+        return _openai(base_url, api_key, model, system, user_turns,
+                       temperature, max_tokens, extra_body, headers, timeout, what)
 
 
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,

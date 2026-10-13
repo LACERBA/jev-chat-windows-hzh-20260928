@@ -24,6 +24,7 @@ from app import settings
 from app.version import VERSION
 from core import jev_client, llm, providers, vision
 from core.questions import CHOICE_LABELS
+from core.diagnostics import log_event, redact_text, register_secret
 
 _LOG_LINES = 300
 _MUTED = "#68776f"
@@ -876,6 +877,8 @@ class Overlay:
 
     def _list_models(self, group, provider, key, base):
         """后台线程：判断走 jev_client，起草按协议走 llm；失败把原因一起送回主线程。"""
+        register_secret(key)
+        log_event("settings.models_requested", group=group.kind, provider=provider)
         try:
             if group.kind == "jev":
                 models = jev_client.list_models(provider, key)
@@ -886,7 +889,10 @@ class Overlay:
                     models = [m for m in models if spec.keep(m)]
             reason = "" if models else "这个来源没返回任何模型"
         except Exception as exc:  # 线程里漏异常会静默吞掉，按钮就永远停在禁用态
+            log_event("settings.models_failed", level="error", exc_info=True, group=group.kind, provider=provider)
             models, reason = [], jev_client.redact_secrets(str(exc).replace(key, "[REDACTED]"))[:120]
+        log_event("settings.models_completed", group=group.kind, provider=provider,
+                  model_count=len(models), reason=reason)
         self._fetched.done.emit(group, models, reason)
 
     def _test_vision(self):
@@ -912,7 +918,8 @@ class Overlay:
             result = vision.recognize(buffer.getvalue(), "image", "", config)
             message = "图像输入已通过验证：" + result["summary"] if result["status"] == "ready" else "模型未能识别测试图"
         except Exception as exc:
-            message = "图像输入验证失败：" + jev_client.redact_secrets(str(exc))[:160]
+            log_event("settings.vision_test_failed", level="error", exc_info=True)
+            message = "图像输入验证失败：" + redact_text(str(exc))[:160]
         self._fetched.tested.emit(message)
 
     def _vision_tested(self, message):
@@ -1041,6 +1048,7 @@ class Overlay:
                           auto_switch_on=self.autoSwitch.isChecked(),
                           ignored_chats_value=self.ignoredChatsEdit.toPlainText().splitlines())
         except Exception:
+            log_event("settings.save_failed", level="error", exc_info=True)
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
         current_media = (settings.media_mode(), settings.vision_upload(), settings.vision_provider(),
@@ -1099,6 +1107,7 @@ class Overlay:
         try:
             self.on_fill(self.cands[index])
         except Exception as e:
+            log_event("reply.manual_fill_failed", level="error", exc_info=True, chat=self._shown, candidate_index=index)
             # 状态栏保持友好文案；真实原因和压缩堆栈进聊天记录，认得出是哪一步炸的
             import traceback
             self.set_status("未能填入，请确认聊天窗口可用后重试，或复制回复。", "error")
@@ -1196,6 +1205,12 @@ class Overlay:
             card.set_available(False)
 
     def set_status(self, text, kind="idle"):
+        text = redact_text(text)
+        current = (self._shown, text, kind)
+        if current != getattr(self, "_last_logged_status", None):
+            log_event("ui.status", level=kind, chat=self._shown, status=kind, reason=text)
+            self._last_logged_status = current
+        self.status.setToolTip(text)
         colors = {"idle": _MUTED, "busy": _GREEN, "success": _GREEN,
                   "warning": "#93611d", "error": "#b44832"}
         markers = {"idle": "●", "busy": "●", "success": "✓", "warning": "!", "error": "!"}
@@ -1296,6 +1311,7 @@ class Overlay:
         try:
             settings.save(analysis_enabled_on=self.analysisSwitch.isChecked(), send_enabled_on=sending)
         except Exception:
+            log_event("settings.processing_save_failed", level="error", exc_info=True)
             self._render_processing()
             self.set_status("处理模式保存失败，请检查配置文件是否可写。", "error")
             return
@@ -1358,6 +1374,7 @@ class Overlay:
         try:
             settings.set_auto_reply(title, on, self._auto_send_key(), app_key, confirmed=confirmed)
         except Exception:
+            log_event("settings.auto_reply_save_failed", level="error", exc_info=True, chat=title)
             self.set_status("自动回复设置保存失败，请检查配置文件是否可写。", "error")
             self._render_auto_reply()
             return
@@ -1374,6 +1391,7 @@ class Overlay:
             settings.set_auto_reply(self._shown, self.autoReplySwitch.isChecked(),
                                     self._auto_send_key(), app_key)
         except Exception:
+            log_event("settings.send_shortcut_save_failed", level="error", exc_info=True, chat=self._shown)
             self.set_status("发送快捷键保存失败，请检查配置文件是否可写。", "error")
             self._render_auto_reply()
 

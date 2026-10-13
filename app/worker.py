@@ -13,11 +13,13 @@ from app.capture import Capture, UnreadTracker, chat_area, switch_debug, unminim
 from app.ocr import Reader, read_session_name, read_title, similar
 from app.message_store import MessageStore
 from app.media import encode_crop
+from core.diagnostics import configure_logging, log_event, redact_text
 
 
-def _err(q):
+def _err(q, **fields):
     """异常压成一行发给父进程，子进程的 stderr 一般没人看得见。"""
-    q.put(("status", " ".join(traceback.format_exc().split())[-200:]))
+    log_event("capture.frame_failed", level="error", exc_info=True, **fields)
+    q.put(("status", redact_text(" ".join(traceback.format_exc().split())[-200:])))
 
 
 def _packet(full, area, title, reader, lines, unread):
@@ -34,10 +36,12 @@ def _packet(full, area, title, reader, lines, unread):
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
 
-def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
+def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None, log_queue=None):
     """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
     恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
     debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
+    if log_queue is not None:
+        configure_logging(log_queue, worker=True)
     ctypes.windll.user32.SetProcessDPIAware()
     app = chatapps.get(app_key)
     switch_debug("worker_started", hwnd=hwnd, app=app.key)
@@ -45,6 +49,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
     try:
         store = MessageStore(settings.message_db_path())
     except Exception:
+        log_event("storage.open_failed", level="error", exc_info=True, app=app.key)
         q.put(("dead", "本地消息数据库无法打开，请检查程序目录的写入权限"))
         enabled.clear()
         return
@@ -62,6 +67,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
             if cap is not None:
                 cap.stop()
                 cap = None
+                log_event("capture.paused", app=app.key)
                 q.put(("paused",))
             enabled.wait()
             continue
@@ -69,11 +75,13 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
             try:
                 cap = Capture(hwnd)
             except Exception as e:
-                q.put(("dead", "无法开始采集：" + (" ".join(str(e).split())[:120] or type(e).__name__)))
+                log_event("capture.start_failed", level="error", exc_info=True, hwnd=hwnd)
+                q.put(("dead", "无法开始采集：" + (redact_text(" ".join(str(e).split())[:120]) or type(e).__name__)))
                 enabled.clear()  # 自己清掉，下一圈就去等着，别一秒重试几十次
                 continue
             head = last_chat = None
             dispatched_media.clear()
+            log_event("capture.resumed", app=app.key, hwnd=hwnd)
             q.put(("resumed",))
         if not cap.alive():
             break
@@ -88,6 +96,7 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
                 area = chat_area(full)  # 每次停稳都重算：拖完窗口微信布局会晚一拍才铺好，只按尺寸变化算一次会锁死
                 if area is None:
                     if not warned:
+                        log_event("capture.area_unrecognized", level="warning", frame_shape=full.shape)
                         q.put(("status", "消息区认不出来（窗口太小？）"))
                         warned = True
                 else:
@@ -137,6 +146,8 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
                         visible = [(who, name, text) for who, name, text, _ in lines]
                         latest = cap.latest
                         if latest is not None and not np.array_equal(crop, latest[y_pane:y0, x0:x1]):
+                            log_event("ocr.discarded", level="warning", chat=title,
+                                      reason="识别期间会话标题变化，重新读取")
                             head = last_chat = None
                             if read_requested is not None:
                                 read_requested.set()
@@ -159,15 +170,23 @@ def run(q, hwnd, enabled, debug_on, app_key=None, read_requested=None):
                         for item in media:
                             item.pop("pixels", None)
                         snapshot["initial"] = initial or snapshot["baseline"]
+                        log_event("snapshot.saved", app=app.key, chat=title, raw_chat=raw_title,
+                                  title_confirmed=title_confirmed, ocr_ms=reader.last_ms,
+                                  visible_count=len(visible), new_count=len(snapshot["new"]),
+                                  latest_id=snapshot.get("latest_id"), status=snapshot["status"],
+                                  corrected=snapshot.get("corrected", False),
+                                  discontinuous=snapshot.get("discontinuous", False),
+                                  media_job_count=len(snapshot["media_jobs"]), requested=requested)
                         q.put(("snapshot", snapshot))
                         dispatched_media.update(job["message_id"] for job in snapshot["media_jobs"])
                         last_chat = chat_pixels if visible and title_confirmed else None
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines, unread)))
         except Exception:
-            _err(q)  # 一帧出错不退出
+            _err(q, chat=title, raw_chat=raw_title, app=app.key)  # 一帧出错不退出
         time.sleep(0.05)
     store.close()
+    log_event("capture.stopped", level="warning", app=app.key, hwnd=hwnd)
     q.put(("dead", "采集停了（聊天窗口关了？）"))
     try:
         cap.wait()  # 采集线程若是报错死的，这里把错抛出来

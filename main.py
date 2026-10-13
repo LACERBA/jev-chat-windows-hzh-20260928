@@ -27,6 +27,8 @@ from app.version import VERSION
 from core.engine import analyze
 from core.vision import recognize as recognize_media
 from core.jev_client import JevError
+from core.diagnostics import (configure_logging, log_context, log_event, log_step,
+                              redact_text, shutdown_logging)
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
@@ -45,6 +47,7 @@ _AUTO_REPLY_ECHO_WINDOW = 12.0
 _AUTO_REPLY_SEND_DELAY_MS = 1200
 _MEDIA_REPLY_WAIT = 5.0
 read_requested = None
+logging_queue = None
 
 
 def request_read():
@@ -200,9 +203,12 @@ class ConversationController:
         self.deadline = time.monotonic() + 5.0
         return True
 
-    def result_abandoned(self, title):
+    def result_abandoned(self, title, reason, kind="warning"):
+        reason = redact_text(reason)
+        log_event("reply.abandoned", level=kind, chat=title, phase=self.phase,
+                  revision=chat_of(title)["rev"], message_id=chat_of(title)["latest_id"], reason=reason)
         if self.active and self.active.get("title") == title:
-            self.release("自动处理未完成，继续监听新消息", "warning")
+            self.release(f"「{title}」{reason}；继续监听新消息", kind)
 
     def send_is_pending(self, title, revision):
         return (self.phase == "waiting_send" and self.active is not None
@@ -218,9 +224,12 @@ class ConversationController:
         if not sent:
             self.phase = "send_failed"
             self.deadline = 0.0
-            ov.set_status("本次自动发送未完成，当前会话有新消息时将继续尝试", "warning")
+            reason = chat_of(title)["auto_send_block_reason"] or "发送未执行，请检查窗口和发送设置"
+            ov.set_status(f"{reason}；当前会话有新消息时将继续尝试", "warning")
+            log_event("send.failed", level="warning", chat=title, revision=revision, reason=reason)
             return
         self.phase = "verifying"
+        log_event("send.verifying", chat=title, revision=revision, timeout_seconds=5.0)
         self.expected_text = chat_of(title)["last_auto_sent_text"]
         self.deadline = time.monotonic() + 5.0
         ov.set_status("已执行发送，正在确认消息气泡", "busy")
@@ -231,6 +240,8 @@ class ConversationController:
         if not any(who == "me" and similar(self.expected_text, text) for who, _, text in lines):
             return False
         raw_title = self.active.get("raw") or title
+        log_event("send.confirmed", chat=title, revision=self.send_revision,
+                  message_id=chat_of(title)["latest_id"])
         self.release(f"「{raw_title}」自动回复已确认发送", "success")
         return True
 
@@ -252,7 +263,7 @@ class ConversationController:
                                "raw": raw_title, "authorized": True, "revision": revision}
                 self.phase = "analyzing"
                 if not start_analyze(title, list(chat_of(title)["history"])):
-                    self.release("模型尚未配置，已跳过自动分析", "warning")
+                    self.result_abandoned(title, chat_of(title)["analysis_block_reason"] or "分析未能启动")
                 return
         candidates = []
         skipped_current = False
@@ -336,6 +347,7 @@ class ConversationController:
         self.early_snapshot = None
 
     def release(self, text=None, kind="idle"):
+        log_event("conversation.released", phase=self.phase, active=self.active, reason=text, status=kind)
         if self.active:
             self._remember(self.active.get("id"))
         self.phase = "listening"
@@ -384,7 +396,7 @@ class ConversationController:
             self.active["revision"] = revision
             switch_debug("replay_buffered_message", title=title, revision=revision)
             if not start_analyze(title, list(chat_of(title)["history"])):
-                self.release("模型尚未配置，已跳过自动分析", "warning")
+                self.result_abandoned(title, chat_of(title)["analysis_block_reason"] or "分析未能启动")
             return
         if snapshot:
             self.on_snapshot(snapshot)
@@ -422,7 +434,8 @@ def chat_of(title):
                                     "last_auto_sent_text": "", "media_states": {},
                                     "media_waiting": False, "media_wait_started": None,
                                     "latest_id": None, "history_ids": [], "analysis_requested_rev": -1,
-                                    "auto_sent_key": None, "auto_retry_rev": None, "media_fallback_rev": -1})
+                                    "auto_sent_key": None, "auto_retry_rev": None, "media_fallback_rev": -1,
+                                    "analysis_block_reason": "", "auto_send_block_reason": ""})
 
 
 def sync_history(title, history):
@@ -480,6 +493,8 @@ def start_media_jobs(snapshot):
         media_inflight.add(identity)
         job["raw_title"] = snapshot["raw_title"]
         admitted = media_slots.acquire(blocking=False)
+        log_event("media.queued", app=app_key, chat=snapshot["title"], message_id=job["message_id"],
+                  kind=job["kind"], admitted=admitted)
         threading.Thread(target=recognize_media_bg,
                          args=(app_key, snapshot["title"], job, admitted), daemon=True).start()
 
@@ -494,23 +509,32 @@ def recognize_media_bg(app_key, title, job, admitted=True):
                    and (not settings.auto_switch() or settings.auto_reply_config(raw_title, app_key)["enabled"]))
         if admitted and allowed and not settings.is_ignored_chat(title, app_key) and not settings.is_ignored_chat(raw_title, app_key):
             try:
-                result = recognize_media(job["image"], job["kind"], job["ocr_text"], settings.vision_config())
+                with log_context(app=app_key, chat=title, message_id=job["message_id"]):
+                    with log_step("media.recognize", kind=job["kind"],
+                                  provider=settings.vision_provider(), model=settings.vision_model()):
+                        result = recognize_media(job["image"], job["kind"], job["ocr_text"], settings.vision_config())
             except JevError as error:
-                result = {**fallback, "uncertainty": str(error) + "；已回退本地 OCR"}
+                result = {**fallback, "uncertainty": redact_text(str(error)) + "；已回退本地 OCR"}
             except Exception:
                 result = fallback
         else:
+            log_event("media.skipped", chat=title, message_id=job["message_id"], admitted=admitted,
+                      allowed=allowed, reason="未允许视觉处理、会话被忽略或并发名额已满")
             result = {**fallback, "status": "ocr" if not allowed else "failed"}
         if not settings.analysis_enabled() or not settings.vision_upload() or settings.media_mode() == "ocr":
             result = {**fallback, "status": "ocr"}
         store = MessageStore(settings.message_db_path())
         try:
             changed = store.update_media(app_key, title, job["message_id"], job["fingerprint"], result)
+            log_event("media.saved", app=app_key, chat=title, message_id=job["message_id"],
+                      status=result.get("status"), source=result.get("source"), changed=changed)
             media_results.put({"app": app_key, "title": title, "message_id": job["message_id"],
                                **store.context(app_key, title), "changed": changed})
         finally:
             store.close()
     except Exception:
+        log_event("media.save_failed", level="error", exc_info=True,
+                  app=app_key, chat=title, message_id=job["message_id"])
         media_results.put({"app": app_key, "title": title, "message_id": job["message_id"], "error": True})
     finally:
         job.pop("image", None)
@@ -609,6 +633,7 @@ def restore_history():
                 sync_media(title, context["media_state"])
                 sync_media_history(title, context["history"], context["history_ids"])
     except Exception as e:
+        log_event("storage.restore_failed", level="error", exc_info=True, app=state.get("app"))
         ov.set_status(f"本地消息历史读取失败：{type(e).__name__}", "warning")
     finally:
         if store is not None:
@@ -616,6 +641,9 @@ def restore_history():
 
 
 def on_processing_changed():
+    log_event("settings.processing_changed", analysis_enabled=settings.analysis_enabled(),
+              send_enabled=settings.send_enabled(), auto_switch=settings.auto_switch(),
+              judge_mode=settings.judge_mode(), media_mode=settings.media_mode())
     request_read()
     conversation_controller.release()
     conversation_controller.pending_current = None
@@ -651,7 +679,8 @@ def fill_reply(text):
         raise RuntimeError("未找到聊天窗口，请确认已经打开")
     if state["area"] is None:
         raise RuntimeError("输入区域尚不可用，请确认聊天窗口可见（不要最小化）")
-    fill(state["hwnd"], state["area"], reply_text(ov.current_chat(), text))
+    with log_step("reply.manual_fill", chat=ov.current_chat(), text_length=len(text)):
+        fill(state["hwnd"], state["area"], reply_text(ov.current_chat(), text))
 
 
 def defer_auto_send(title, result, revision, delay_ms, announce):
@@ -660,6 +689,8 @@ def defer_auto_send(title, result, revision, delay_ms, announce):
     if chat["auto_retry_rev"] == revision:
         return
     chat["auto_retry_rev"] = revision
+    log_event("send.deferred", chat=title, revision=revision, delay_ms=int(delay_ms),
+              ocr_confirmed=state.get("ocr_confirmed"), last_read_at=state.get("read_at"))
     tracked = conversation_controller.send_is_pending(title, revision)
 
     def retry():
@@ -675,24 +706,38 @@ def defer_auto_send(title, result, revision, delay_ms, announce):
 
 
 def auto_send_reply(title, result, revision, announce=True):
-    if not settings.send_enabled() or not settings.analysis_enabled():
+    chat = chat_of(title)
+    chat["auto_send_block_reason"] = ""
+
+    def blocked(reason):
+        chat["auto_send_block_reason"] = reason
+        log_event("send.blocked", level="warning", chat=title, revision=revision,
+                  current_revision=chat["rev"], message_id=chat["latest_id"],
+                  current_chat=state.get("chat"), phase=conversation_controller.phase, reason=reason)
         return False
+
+    log_event("send.requested", chat=title, revision=revision, message_id=chat["latest_id"])
+    if not settings.send_enabled() or not settings.analysis_enabled():
+        return blocked("生成建议或允许发送开关已关闭")
     if os.environ.get("JEV_DISABLE_AUTO_SEND") == "1":
         switch_debug("send_disabled_for_debug", title=title)
-        return False
+        return blocked("调试模式禁止自动发送")
     if chat_is_ignored(title, state.get("raw_chat", "")):
-        return False
+        return blocked("当前会话在忽略列表中")
     if state.get("app") != "wechat":
-        return False
+        return blocked("当前聊天软件不支持自动发送")
     config = settings.auto_reply_config(title, state.get("app"))
     raw_config = settings.auto_reply_config(state.get("raw_chat", ""), state.get("app"))
-    chat = chat_of(title)
-    if not config["enabled"] or title != state["chat"] or revision != chat["rev"]:
-        return False
+    if not config["enabled"]:
+        return blocked("该会话未授权自动回复")
+    if title != state["chat"]:
+        return blocked("当前会话已切换，取消旧会话发送")
+    if revision != chat["rev"]:
+        return blocked(f"回复已过期（版本 {revision} → {chat['rev']}）")
     if settings.auto_switch() and not raw_config["enabled"]:
-        return False
+        return blocked("OCR 会话标题未授权自动回复")
     if state["hwnd"] is None or state["area"] is None or not capture_on.is_set():
-        return False
+        return blocked("聊天窗口、输入区域不可用或采集已暂停")
     if not state.get("ocr_confirmed", True) or "read_at" in state and time.time() - state["read_at"] > 2.0:
         request_read()
         if title == ov.current_chat():
@@ -700,12 +745,12 @@ def auto_send_reply(title, result, revision, announce=True):
         defer_auto_send(title, result, revision, 350, announce)
         return None
     if chat["auto_sent_rev"] == revision:
-        return False
+        return blocked("本版本已自动发送，阻止重复发送")
     key = reply_key(title)
     if key is not None and chat["auto_sent_key"] == key:
-        return False
+        return blocked("该消息已自动回复，阻止重复发送")
     if chat["history"] and chat["history"][-1][0] != "her":
-        return False
+        return blocked("最后一条消息是自己发送，等待对方的新消息")
     elapsed = time.monotonic() - chat["last_auto_sent_at"]
     if elapsed < _AUTO_REPLY_COOLDOWN:
         if title == ov.current_chat():
@@ -720,7 +765,7 @@ def auto_send_reply(title, result, revision, announce=True):
     if best is None:
         if title == ov.current_chat():
             ov.set_status("本次没有可发送的候选，等待下一条消息", "warning")
-        return False
+        return blocked("本次没有可发送的候选回复")
     score = None
     if result.get("ranking_valid"):
         scores = result.get("scores") or []
@@ -732,14 +777,18 @@ def auto_send_reply(title, result, revision, announce=True):
             score = None
     text = reply_text(title, str(candidates[best]).strip())
     if not text:
-        return False
+        return blocked("选中的候选回复为空")
     try:
-        fill_and_send(state["hwnd"], state["area"], text, config["send_key"])
+        with log_context(chat=title, revision=revision, message_id=chat["latest_id"]):
+            with log_step("send.execute", send_shortcut=config["send_key"], candidate_index=best,
+                          text_length=len(text), ranking_valid=result.get("ranking_valid")):
+                fill_and_send(state["hwnd"], state["area"], text, config["send_key"])
     except Exception as e:
+        reason = redact_text(f"发送失败：{type(e).__name__}: {e}")
         if title == ov.current_chat():
-            ov.set_status("自动回复发送失败，请确认聊天窗口和发送快捷键设置。", "error")
-            ov.log(f"[自动回复失败] {type(e).__name__}: {e}")
-        return False
+            ov.set_status(reason, "error")
+            ov.log(reason)
+        return blocked(reason)
     chat["auto_sent_rev"] = revision
     chat["auto_sent_key"] = key
     chat["auto_retry_rev"] = None
@@ -770,9 +819,10 @@ def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
     p = multiprocessing.Process(target=worker.run,
                                 args=(q, state["hwnd"], capture_on, debug_on, state.get("app"),
-                                      read_requested),
+                                      read_requested, logging_queue),
                                 daemon=True)
     p.start()
+    log_event("capture.worker_spawned", pid=p.pid, hwnd=state["hwnd"], app=state.get("app"))
     return p
 
 
@@ -802,6 +852,7 @@ def on_debug_closed():
 def on_toggle_capture(on):
     """标题栏开关。启动时没找到聊天软件就没有子进程，这会儿再找一次，找到了才真开得起来。"""
     global child
+    log_event("capture.toggled", enabled=on)
     if not on:
         capture_on.clear()
         conversation_controller.reset()
@@ -817,26 +868,32 @@ def on_toggle_capture(on):
     capture_on.set()
 
 
-def analyze_bg(msgs, title, revision, reply_to=None):
+def analyze_bg(msgs, title, revision, reply_to=None, message_id=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
-    try:
-        judge = settings.general_judge_config()
-        results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
-                                   model=settings.draft_model() or None,
-                                   provider=settings.draft_provider(),
-                                   base_url=settings.draft_base_url() or None,
-                                   reply_to=reply_to, style=settings.style(),
-                                   thinking=settings.thinking(),
-                                   jev_provider=settings.jev_provider(),
-                                   jev_model=settings.jev_model() or None,
-                                   judge_mode=settings.judge_mode(),
-                                   llm_judge_provider=judge["provider"],
-                                   llm_judge_model=judge["model"] or None,
-                                   llm_judge_base_url=judge["base_url"] or None,
-                                   llm_judge_api_key=judge["api_key"]),
-                     title, revision))
-    except Exception as e:
-        results.put(("err", f"分析失败: {e}", title, revision))
+    with log_context(chat=title, revision=revision, message_id=message_id):
+        try:
+            judge = settings.general_judge_config()
+            with log_step("analysis", message_count=len(msgs), judge_mode=settings.judge_mode()):
+                result = analyze(msgs, settings.relationship(), context=settings.context(),
+                                 model=settings.draft_model() or None,
+                                 provider=settings.draft_provider(),
+                                 base_url=settings.draft_base_url() or None,
+                                 reply_to=reply_to, style=settings.style(),
+                                 thinking=settings.thinking(),
+                                 jev_provider=settings.jev_provider(),
+                                 jev_model=settings.jev_model() or None,
+                                 judge_mode=settings.judge_mode(),
+                                 llm_judge_provider=judge["provider"],
+                                 llm_judge_model=judge["model"] or None,
+                                 llm_judge_base_url=judge["base_url"] or None,
+                                 llm_judge_api_key=judge["api_key"])
+            log_event("analysis.result_queued", candidate_count=len(result.get("candidates") or []),
+                      ranking_valid=result.get("ranking_valid"), warnings=result.get("warnings"))
+            results.put(("ok", result, title, revision))
+        except Exception as e:
+            log_event("analysis.error_queued", level="error", exc_info=True,
+                      error_type=type(e).__name__, http_status=getattr(e, "status", None))
+            results.put(("err", redact_text(f"分析失败: {e}"), title, revision))
 
 
 def check_update_bg():
@@ -847,10 +904,18 @@ def check_update_bg():
 
 
 def start_analyze(title, msgs):
+    chat = chat_of(title)
+    chat["analysis_block_reason"] = ""
+    log_event("analysis.requested", chat=title, revision=chat["rev"], message_id=chat["latest_id"],
+              message_count=len(msgs), phase=conversation_controller.phase, busy=state["busy"])
     if not settings.analysis_enabled():
+        chat["analysis_block_reason"] = "生成建议已关闭，仅采集消息"
+        log_event("analysis.skipped", chat=title, reason=chat["analysis_block_reason"])
         return False
     raw_title = state.get("raw_chat", "") if title == state.get("chat") else ""
     if chat_is_ignored(title, raw_title):
+        chat["analysis_block_reason"] = "当前会话已忽略，不参与自动处理"
+        log_event("analysis.skipped", chat=title, reason=chat["analysis_block_reason"])
         ov.invalidate_replies()
         ov.set_busy(False)
         ov.set_status("当前会话已忽略，不参与自动处理", "idle")
@@ -860,20 +925,28 @@ def start_analyze(title, msgs):
         if chat["media_wait_started"] is None:
             chat["media_wait_started"] = time.monotonic()
         if time.monotonic() - chat["media_wait_started"] < _MEDIA_REPLY_WAIT:
+            log_event("analysis.waiting_media", chat=title, revision=chat["rev"],
+                      message_id=chat["latest_id"], wait_seconds=_MEDIA_REPLY_WAIT)
             chat["media_waiting"] = True
             chat["analysis_requested_rev"] = chat["rev"]
             if title == ov.current_chat():
                 ov.set_status("正在识别媒体；若未能识别，将根据已有内容提问回复", "busy")
             return True
     if not settings.models_ready():
-        ov.set_status("请先在设置中补全当前判断策略和起草模型配置", "warning")
+        chat["analysis_block_reason"] = "模型配置不完整，请在设置中补全当前判断策略和起草模型配置"
+        log_event("analysis.blocked", level="warning", chat=title, reason=chat["analysis_block_reason"],
+                  judge_mode=settings.judge_mode(), draft_model=settings.draft_model(),
+                  draft_key_present=settings.has_llm_key(), jev_model=settings.jev_model(),
+                  jev_key_present=settings.has_jev_key(),
+                  judge_model=settings.general_judge_config()["model"])
+        ov.set_status(chat["analysis_block_reason"], "warning")
         return False
     chat["media_waiting"] = media_pending(title)
     chat["analysis_requested_rev"] = chat["rev"]
     state["busy"] = True
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
-    threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),
+    threading.Thread(target=analyze_bg, args=(msgs, title, chat["rev"], reply_to, chat["latest_id"]),
                      daemon=True).start()
     return True
 
@@ -1038,6 +1111,9 @@ def drain():
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         action = conversation_controller.route_lines(
             title, raw_title, chat["rev"], initial, normalized[-1][0])
+        log_event("messages.routed", chat=title, raw_chat=raw_title, revision=chat["rev"],
+                  message_id=chat["latest_id"], new_count=len(new), latest_who=normalized[-1][0],
+                  action=action, phase=conversation_controller.phase, busy=state["busy"])
         if snapshot is not None:
             conversation_controller.on_snapshot(snapshot)
         if not settings.analysis_enabled():
@@ -1060,7 +1136,7 @@ def drain():
                 if started:
                     chat["analysis_requested_rev"] = chat["rev"]
                 elif action in ("analyze", "analyze_fresh"):
-                    conversation_controller.result_abandoned(title)
+                    conversation_controller.result_abandoned(title, chat_of(title)["analysis_block_reason"] or "分析未能启动，请检查模型设置")
         else:
             state["rerun"] = None
             ov.set_busy(False)
@@ -1094,9 +1170,11 @@ def tick():
                 ov.set_busy(False)
                 continue
             if state["rerun"]:  # 分析期间又来了新消息，接着跑最新的
+                log_event("analysis.rerun", chat=title, revision=revision,
+                          next_chat=state["rerun"][0], result_kind=kind)
                 (t, msgs), state["rerun"] = state["rerun"], None
                 if not start_analyze(t, msgs):
-                    conversation_controller.result_abandoned(t)
+                    conversation_controller.result_abandoned(t, chat_of(t)["analysis_block_reason"] or "最新消息的分析未能启动")
                 continue
             raw_title = state.get("raw_chat", "") if title == state.get("chat") else ""
             if chat_is_ignored(title, raw_title):
@@ -1105,7 +1183,10 @@ def tick():
                 continue
             if revision != chat_of(title)["rev"]:  # 这个会话后来又说话了，这份结果过期了
                 ov.set_busy(False)
-                conversation_controller.result_abandoned(title)
+                log_event("analysis.result_stale", level="warning", chat=title, revision=revision,
+                          current_revision=chat_of(title)["rev"], result_kind=kind)
+                conversation_controller.result_abandoned(
+                    title, f"消息或媒体内容已变化，分析结果过期（版本 {revision} → {chat_of(title)['rev']}）")
                 continue
             if kind == "ok":
                 chat_of(title)["result"] = r  # 先存着；正看着这个会话才立刻贴上去
@@ -1113,8 +1194,11 @@ def tick():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
+                log_event("analysis.result_accepted", chat=title, revision=revision,
+                          candidate_count=len(r.get("candidates") or []), ranking_valid=r.get("ranking_valid"),
+                          warnings=r.get("warnings"))
                 if not r.get("candidates"):
-                    conversation_controller.result_abandoned(title)
+                    conversation_controller.result_abandoned(title, "模型没有生成可用候选回复，本次不发送")
                     continue
                 if conversation_controller.mark_result_ready(title, revision):
                     request_read()
@@ -1126,17 +1210,35 @@ def tick():
                              lambda t=title, result=r, rev=revision: auto_send_reply(t, result, rev))
             else:
                 ov.set_busy(False)
-                ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
-                ov.log(r)
-                conversation_controller.result_abandoned(title)
+                reason = redact_text(r)
+                ov.set_status(reason, "error")
+                ov.log(reason)
+                conversation_controller.result_abandoned(title, reason, "error")
         conversation_controller.tick()
     except Exception:
+        log_event("ui.tick_failed", level="error", exc_info=True,
+                  chat=state.get("chat"), phase=conversation_controller.phase)
         traceback.print_exc()  # 一帧出错不退出
     ov.after(50, tick)
 
 
 if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本文件，没这行就无限套娃开进程
     multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
+    logging_queue = multiprocessing.Queue()
+    log_directory = configure_logging(logging_queue)
+    log_event("application.started", version=VERSION, log_directory=log_directory,
+              analysis_enabled=settings.analysis_enabled(), send_enabled=settings.send_enabled(),
+              auto_switch=settings.auto_switch(), media_mode=settings.media_mode())
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def qt_message_handler(kind, context, message):
+        level = ("critical" if kind == QtMsgType.QtFatalMsg else "error"
+                 if kind == QtMsgType.QtCriticalMsg else "warning"
+                 if kind == QtMsgType.QtWarningMsg else "info")
+        log_event("qt.message", level=level, message=message,
+                  source=context.file, line=context.line)
+
+    qInstallMessageHandler(qt_message_handler)
     ctypes.windll.user32.SetProcessDPIAware()
     q = multiprocessing.Queue()
     read_requested = multiprocessing.Event()
@@ -1172,3 +1274,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     finally:
         if child is not None:
             child.terminate()
+            child.join(timeout=3)
+        log_event("application.stopped")
+        shutdown_logging()
+        logging_queue.close()
+        logging_queue.join_thread()

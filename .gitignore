@@ -11,6 +11,7 @@ config.json
 messages.sqlite3
 messages.sqlite3-wal
 messages.sqlite3-shm
+/log/
 # 根目录下的临时截图（docs/ 里的照常提交）
 /*.png
 wechat_probe.png
