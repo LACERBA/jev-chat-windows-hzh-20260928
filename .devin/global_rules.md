@@ -6,5 +6,6 @@
   - `.\.venv\Scripts\python.exe -m unittest discover -s core -p 'test_*.py'`。
 - 部分截图回归测试需要 `JEV_MEDIA_BUG_IMAGE`、`JEV_MEDIA_TEST_DIR` 或 `JEV_OCR_TEST_IMAGE`；未提供样本时会跳过。
 - 诊断日志统一使用 `core.diagnostics`，采集子进程通过主进程队列写入日志，避免多个进程同时轮转同一文件。
+- 所有大模型调用（Jev、通用判断、起草、视觉识别）的临时故障重试统一在 `core/retry.py`：首次失败后最多重试 5 次，间隔约 3/6/12/24/48 秒并采纳 Retry-After；各 SDK 自带重试已关闭，新增模型调用必须经过 `call_with_retry`，不要自己再写重试循环。
 - 不记录密钥、完整聊天上下文、候选正文或原始截图；会话名、消息 ID、版本号、数量和异常原因用于关联处理链路。
 - 验证时使用 mock（模拟对象）和临时数据库，不启动真实采集，不操作真实聊天窗口或发送消息。

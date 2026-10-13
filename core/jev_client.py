@@ -9,27 +9,32 @@ SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/de
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import time
 import urllib.error
 import urllib.request
+from email.utils import parsedate_to_datetime
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
                             OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+    from .retry import MAX_RETRIES, call_with_retry
 except ImportError:
     from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
-
-MAX_RETRIES = 3
+    from retry import MAX_RETRIES, call_with_retry
 
 
 class JevError(Exception):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, *,
+                 retryable: bool = False, retry_after: float | None = None) -> None:
         super().__init__(message)
         self.status = status
+        self.retryable = retryable  # 没有状态码的网络类临时故障（超时、断网）
+        self.retry_after = retry_after  # 服务端要求的等待秒数
 
 
 def redact_secrets(text: str) -> str:
@@ -53,16 +58,61 @@ def _status_of(exc: Exception) -> int | None:
     return None
 
 
+def _parse_retry_after(headers) -> float | None:
+    """Retry-After（秒或日期）和 retry-after-ms → 秒；没有或无法解析返回 None。"""
+    try:
+        lowered = {str(key).lower(): value for key, value in headers.items()}
+        for name, divisor in (("retry-after-ms", 1000), ("retry-after", 1)):
+            raw = lowered.get(name)
+            if raw is None:
+                continue
+            try:
+                value = float(str(raw).strip()) / divisor
+            except ValueError:
+                if name == "retry-after":
+                    return max(0.0, parsedate_to_datetime(str(raw)).timestamp() - time.time())
+                continue
+            if math.isfinite(value) and value >= 0:
+                return value
+    except Exception:
+        pass
+    return None
+
+
+def _retry_after_of(exc: Exception) -> float | None:
+    """各家 SDK 的异常把响应头放在 headers 或 response.headers 里。"""
+    for source in (exc, getattr(exc, "response", None)):
+        headers = getattr(source, "headers", None)
+        if headers is not None and hasattr(headers, "get"):
+            value = _parse_retry_after(headers)
+            if value is not None:
+                return value
+    return None
+
+
+_TRANSIENT_NAMES = ("Timeout", "Connection", "ConnectError", "ReadError", "WriteError", "RemoteProtocol")
+
+
+def _is_transient(exc: Exception) -> bool:
+    """没有 HTTP 状态码时，按异常类型判断是不是超时、断网这类临时故障。"""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return any(name in cls.__name__ for cls in type(exc).__mro__ for name in _TRANSIENT_NAMES)
+
+
 def _fail(exc: Exception, what: str) -> NoReturn:
     """SDK 抛的异常 → 一句人话的 JevError。消息过脱敏，绝不把 key 带出来。"""
     if isinstance(exc, JevError):
         raise exc
     status = _status_of(exc)
-    hint = {401: "密钥被拒", 403: "没有权限", 404: "模型或地址不对", 422: "请求被拒",
-            429: "被限流", 529: "服务过载"}.get(status, "")
+    hint = {401: "密钥被拒", 403: "没有权限", 404: "模型或地址不对", 408: "请求超时", 422: "请求被拒",
+            429: "被限流", 500: "服务内部错误", 502: "网关错误", 503: "服务暂不可用",
+            504: "网关超时", 529: "服务过载"}.get(status, "")
     detail = redact_secrets(str(exc)).strip()[:300]
     head = f"{what} HTTP {status}" if status else f"{what}失败"
-    raise JevError(f"{head}: {hint or detail or type(exc).__name__}", status) from None
+    raise JevError(f"{head}: {hint or detail or type(exc).__name__}", status,
+                   retryable=status is None and _is_transient(exc),
+                   retry_after=_retry_after_of(exc)) from None
 
 
 def _api_key(env: str = JEV_ENV) -> str:
@@ -91,14 +141,15 @@ def ask(state: dict, questions: dict, timeout: float = 20,
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
     provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    两条路返回的 dict 形状一模一样；限流、过载、超时等临时故障由 core.retry 统一重试，
+    max_retries 是这次调用的重试上限。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
     key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     model = model or spec.default
-    if provider == "typesafe":
-        return _ask_typesafe(state, questions, key, model, timeout, max_retries)
-    return _ask_openrouter(state, questions, key, model, timeout, max_retries)
+    send = _ask_typesafe if provider == "typesafe" else _ask_openrouter
+    return call_with_retry(lambda: send(state, questions, key, model, timeout),
+                           what="Jev 判断", max_retries=max_retries)
 
 
 def _answer(answer) -> dict:
@@ -113,13 +164,12 @@ def _answer(answer) -> dict:
             "probabilities": {str(k): v for k, v in answer.probabilities.items()}}
 
 
-def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: float,
-                  max_retries: int) -> dict:
-    """官方 typesafe_sdk。questions 原样传；重试次数由判断策略控制。"""
+def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
+    """官方 typesafe_sdk，单次请求。questions 原样传；SDK 自带重试已关，统一由 core.retry 负责。"""
     import typesafe_sdk
 
     try:
-        retry = typesafe_sdk.RetryPolicy(max_retries=max_retries, timeout=timeout)
+        retry = typesafe_sdk.RetryPolicy(max_retries=0, timeout=timeout)
         with typesafe_sdk.TypeSafeClient(api_key=key, base_url=TYPESAFE_BASE, model=model,
                                          timeout=timeout, retry=retry) as client:
             result = client.system_one(state, questions, model=model)
@@ -132,59 +182,40 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
     }
 
 
-def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float,
-                    max_retries: int) -> dict:
-    """OpenRouter 的 /api/alpha/decisions，手写 urllib。429/529 退避重试 3 次。"""
+def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
+    """OpenRouter 的 /api/alpha/decisions，手写 urllib，单次请求；重试统一由 core.retry 负责。"""
     payload = json.dumps(
         {"model": model, "state": state, "questions": questions},
         ensure_ascii=False,
     ).encode("utf-8")
-
-    last_status: int | None = None
-    last_body = ""
-    for attempt in range(max_retries + 1):
-        req = urllib.request.Request(
-            OPENROUTER_DECISIONS,
-            data=payload,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            last_status = exc.code
-            last_body = _error_body(exc)
-            if last_status in (429, 529) and attempt < max_retries:
-                time.sleep(2**attempt)
-                continue
-            readable = {
-                401: f"Jev HTTP 401: API key rejected. Check {JEV_ENV}.",
-                422: f"Jev HTTP 422: request body rejected. {last_body}",
-                429: f"Jev HTTP 429: rate limited after {max_retries} retries. {last_body}",
-                529: f"Jev HTTP 529: provider overloaded after {max_retries} retries. {last_body}",
-            }.get(last_status, f"Jev HTTP {last_status}: {last_body}")
-            raise JevError(readable, last_status) from None
-        except (TimeoutError, socket.timeout) as exc:
-            if attempt < max_retries:
-                time.sleep(2**attempt)
-                continue
-            raise JevError(f"Jev request timed out after {timeout}s") from exc
-        except urllib.error.URLError as exc:
-            reason = redact_secrets(getattr(exc, "reason", exc))
-            if attempt < max_retries:
-                time.sleep(2**attempt)
-                continue
-            raise JevError(f"Jev request failed: {reason}") from None
-
-    raise JevError(
-        f"Jev HTTP {last_status}: exhausted retries. {last_body}", last_status
+    req = urllib.request.Request(
+        OPENROUTER_DECISIONS,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+        },
     )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        body = _error_body(exc)
+        readable = {
+            401: f"Jev HTTP 401: API key rejected. Check {JEV_ENV}.",
+            422: f"Jev HTTP 422: request body rejected. {body}",
+            429: f"Jev HTTP 429: rate limited. {body}",
+            529: f"Jev HTTP 529: provider overloaded. {body}",
+        }.get(exc.code, f"Jev HTTP {exc.code}: {body}")
+        raise JevError(readable, exc.code, retry_after=_retry_after_of(exc)) from None
+    except (TimeoutError, socket.timeout) as exc:
+        raise JevError(f"Jev request timed out after {timeout}s", retryable=True) from exc
+    except urllib.error.URLError as exc:
+        reason = redact_secrets(getattr(exc, "reason", exc))
+        raise JevError(f"Jev request failed: {reason}", retryable=True) from None
 
 
 def _check_openrouter_key(key: str, timeout: float) -> None:
@@ -280,7 +311,7 @@ if __name__ == "__main__":
         assert seen["init"] == {"api_key": "ts-key", "base_url": TYPESAFE_BASE, "timeout": 10}
     assert ask_init["api_key"] == "ts-key" and ask_init["base_url"] == TYPESAFE_BASE
     assert ask_init["model"] == "jev-1.13.0" and ask_init["timeout"] == 15
-    assert ask_init["retry"].max_retries == MAX_RETRIES
+    assert ask_init["retry"].max_retries == 0  # SDK 自带重试已关，统一走 core.retry
     assert seen["kw"] == {"model": "jev-1.13.0"}
     # 题目原样进 SDK：它们本身就是 NoulModel / ChoiceModel / ScoreModel，不用再包一层
     assert seen["questions"] is questions
@@ -303,7 +334,7 @@ if __name__ == "__main__":
 
     with patch.object(typesafe_sdk, "TypeSafeClient", lambda **kw: (_ for _ in ()).throw(_Boom("x"))):
         try:
-            ask({"chat": {}}, questions, provider="typesafe")
+            ask({"chat": {}}, questions, provider="typesafe", max_retries=0)
             raise SystemExit("应当抛错")
         except JevError as e:
             assert e.status == 429 and "被限流" in str(e)

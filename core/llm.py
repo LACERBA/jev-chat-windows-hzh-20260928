@@ -14,9 +14,11 @@ import base64
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .jev_client import JevError, _fail
     from .diagnostics import log_step, register_secret
+    from .retry import call_with_retry
 except ImportError:
     from jev_client import JevError, _fail
     from diagnostics import log_step, register_secret
+    from retry import call_with_retry
 
 # Anthropic 开思考模式时的预算：起草三句话用不上更多；max_tokens 必须比它大，下面会兜住
 _THINK_BUDGET = 2048
@@ -32,12 +34,13 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
          user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
          thinking: bool = False, extra_body: dict | None = None,
          headers: dict | None = None, timeout: float = 30, what: str = "起草",
-         image: bytes | None = None) -> str:
+         image: bytes | None = None, max_retries: int | None = None) -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
     thinking: 思考模式。OpenAI 协议没有统一字段，各家自己的开关由调用方经 extra_body 带进来；
               anthropic / gemini 是协议自带的参数，这里直接处理。
+    max_retries: 临时故障（限流、过载、超时）的重试上限，None = core.retry 的统一默认值。
     """
     if image is not None:
         if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > 8 * 1024 * 1024:
@@ -54,14 +57,17 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
     register_secret(api_key)
     with log_step("model.request", purpose=what, protocol=protocol, model=model,
                   timeout=timeout, has_image=image is not None, turn_count=len(user_turns)):
-        if protocol == "anthropic":
-            return _anthropic(base_url, api_key, model, system, user_turns,
-                              temperature, max_tokens, thinking, timeout, what)
-        if protocol == "gemini":
-            return _gemini(base_url, api_key, model, system, user_turns,
-                           temperature, max_tokens, thinking, timeout, what)
-        return _openai(base_url, api_key, model, system, user_turns,
-                       temperature, max_tokens, extra_body, headers, timeout, what)
+        def send():
+            if protocol == "anthropic":
+                return _anthropic(base_url, api_key, model, system, user_turns,
+                                  temperature, max_tokens, thinking, timeout, what)
+            if protocol == "gemini":
+                return _gemini(base_url, api_key, model, system, user_turns,
+                               temperature, max_tokens, thinking, timeout, what)
+            return _openai(base_url, api_key, model, system, user_turns,
+                           temperature, max_tokens, extra_body, headers, timeout, what)
+
+        return call_with_retry(send, what=what, max_retries=max_retries)
 
 
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
@@ -70,7 +76,7 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
 
     try:
         client = openai.OpenAI(base_url=base_url or None, api_key=api_key,
-                               timeout=timeout, max_retries=2,
+                               timeout=timeout, max_retries=0,  # 重试统一由 core.retry 负责
                                **({"default_headers": headers} if headers else {}))
         resp = client.chat.completions.create(
             model=model,
@@ -94,7 +100,7 @@ def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_to
         max_tokens = max(max_tokens, _THINK_BUDGET + 1024)  # max_tokens 得装得下思考 + 正文
     try:
         client = anthropic.Anthropic(base_url=base_url or None, api_key=api_key,
-                                     timeout=timeout, max_retries=2)
+                                     timeout=timeout, max_retries=0)
         message = client.messages.create(model=model, system=system,
                                          messages=_turns(user_turns), max_tokens=max_tokens,
                                          temperature=temperature, **extra)
@@ -109,7 +115,8 @@ def _gemini_client(base_url, api_key, timeout):
     from google.genai import types
 
     # HttpOptions.timeout 的单位是毫秒，不是秒
-    options = types.HttpOptions(timeout=int(timeout * 1000))
+    options = types.HttpOptions(timeout=int(timeout * 1000),
+                                retry_options=types.HttpRetryOptions(attempts=1))  # 不在 SDK 内重试
     if base_url:
         options.base_url = base_url
     return genai.Client(api_key=api_key, http_options=options), types
@@ -211,7 +218,7 @@ if __name__ == "__main__":
                temperature=1.2, max_tokens=400, extra_body={"thinking": {"type": "disabled"}})
     assert out == '["甲","乙","丙"]'
     assert seen["openai.init"]["base_url"] == "https://api.deepseek.com"
-    assert seen["openai.init"]["api_key"] == "sk-ds" and seen["openai.init"]["max_retries"] == 2
+    assert seen["openai.init"]["api_key"] == "sk-ds" and seen["openai.init"]["max_retries"] == 0
     assert seen["openai.call"]["model"] == "deepseek-flash"
     assert seen["openai.call"]["extra_body"] == {"thinking": {"type": "disabled"}}
     assert seen["openai.call"]["temperature"] == 1.2 and seen["openai.call"]["max_tokens"] == 400

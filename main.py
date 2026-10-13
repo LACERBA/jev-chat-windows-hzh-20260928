@@ -29,6 +29,7 @@ from core.vision import recognize as recognize_media
 from core.jev_client import JevError
 from core.diagnostics import (configure_logging, log_context, log_event, log_step,
                               redact_text, shutdown_logging)
+from core.retry import retry_cancel_guard
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
@@ -886,7 +887,8 @@ def on_toggle_capture(on):
 
 def analyze_bg(msgs, title, revision, reply_to=None, message_id=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
-    with log_context(chat=title, revision=revision, message_id=message_id):
+    with log_context(chat=title, revision=revision, message_id=message_id), \
+            retry_cancel_guard(lambda: chat_of(title)["rev"] != revision):  # 会话有新消息，别再等旧请求重试
         try:
             judge = settings.general_judge_config()
             with log_step("analysis", message_count=len(msgs), judge_mode=settings.judge_mode()):

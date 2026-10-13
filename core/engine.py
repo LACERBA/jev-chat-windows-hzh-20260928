@@ -61,7 +61,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         step = "ranking.jev" if "best_reply" in questions else "judgment.jev"
         with log_step(step, provider=jev_provider, model=jev_model, timeout=timeout):
             return ask_jev(state, questions, timeout=timeout, provider=jev_provider, model=jev_model,
-                           max_retries=1 if judge_mode == "jev_fallback" else 3)
+                           max_retries=1 if judge_mode == "jev_fallback" else None)  # 有兜底模型时 Jev 快速失败，否则用统一的 5 次
 
     def final_select(candidates):
         with log_step("ranking.final_select", provider=llm_judge_provider,
