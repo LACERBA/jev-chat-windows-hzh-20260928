@@ -99,11 +99,20 @@ class RetryCoreTests(unittest.TestCase):
 
     def test_cancel_guard_stops_waiting_when_conversation_changed(self):
         operation = Flaky(99, transient())
-        with retry.retry_cancel_guard(lambda: True), self.assertRaises(JevError) as caught:
+        with retry.retry_cancel_guard(lambda: True), self.assertRaises(retry.RetryCancelled) as caught:
+            retry.call_with_retry(operation)
+        self.assertEqual(operation.calls, 0)  # 已过期的请求发出前就放弃
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("会话内容已更新", str(caught.exception))
+
+    def test_cancel_after_first_failure_keeps_original_error(self):
+        operation = Flaky(99, transient())
+        checks = iter([False, True])
+        with retry.retry_cancel_guard(lambda: next(checks)), self.assertRaises(JevError) as caught:
             retry.call_with_retry(operation)
         self.assertEqual(operation.calls, 1)
         self.assertEqual(self.sleeps, [])
-        self.assertIn("会话有新消息", str(caught.exception))
+        self.assertIn("会话内容已更新", str(caught.exception))
 
     def test_cancel_during_wait_stops_before_next_attempt(self):
         state = {"cancel": False}

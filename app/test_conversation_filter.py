@@ -100,7 +100,7 @@ class ConversationFilterTests(unittest.TestCase):
         sleep.assert_not_called()
         kind, message, title, revision = main.results.get_nowait()
         self.assertEqual((kind, title, revision), ("err", "月仔", 4))
-        self.assertIn("会话有新消息", message)
+        self.assertIn("会话内容已更新", message)
 
     def test_no_reply_result_completes_round_without_sending_or_failure(self):
         import queue

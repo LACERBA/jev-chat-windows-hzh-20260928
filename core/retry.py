@@ -20,11 +20,16 @@ RETRY_AFTER_CAP = 60.0  # 服务端要求的等待时间最多采纳 60 秒
 _SLICE = 0.25  # 等待时分片检查是否已被取消
 _RETRY_STATUSES = {408, 409, 425, 429}
 _cancel_check = ContextVar("retry_cancel_check", default=None)
+CANCEL_NOTE = "会话内容已更新（新消息、媒体识别结果等）"
+
+
+class RetryCancelled(Exception):
+    """请求发出前就发现结果已过期（会话内容已更新），不再发起这次模型调用。"""
 
 
 @contextmanager
 def retry_cancel_guard(check):
-    """当前线程内的重试等待期间会轮询 check()；返回 True 就放弃继续重试（比如会话已有新消息）。"""
+    """当前线程内每次发请求前、重试等待期间都会调用 check()；返回 True 就放弃（比如会话内容已更新）。"""
     token = _cancel_check.set(check)
     try:
         yield
@@ -91,6 +96,9 @@ def call_with_retry(operation, *, what: str = "模型调用", max_retries: int |
     cancelled = _cancel_check.get()
     retries = 0
     while True:
+        if cancelled is not None and cancelled():  # 请求发出前先检查，过期的请求不再白占模型额度和时间
+            _log("model.request.cancelled", what=what)
+            raise RetryCancelled(CANCEL_NOTE)
         try:
             return operation()
         except Exception as error:
@@ -98,10 +106,13 @@ def call_with_retry(operation, *, what: str = "模型调用", max_retries: int |
                 _annotate(error, retries)
                 raise
             delay = retry_delay(retries, getattr(error, "retry_after", None))
-            _log("model.retry", what=what, retry=retries + 1, max_retries=limit,
-                 delay_seconds=round(delay, 1), http_status=getattr(error, "status", None),
-                 error_type=type(error).__name__, reason=str(error)[:200])
             if not _wait(delay, cancelled):
-                _annotate(error, retries, f"（已自动重试 {retries} 次，因会话有新消息而停止等待）")
+                _log("model.retry.cancelled", what=what, retry=retries + 1, max_retries=limit,
+                     http_status=getattr(error, "status", None), error_type=type(error).__name__,
+                     reason=str(error)[:200])
+                _annotate(error, retries, f"（已自动重试 {retries} 次，因{CANCEL_NOTE}而停止等待）")
                 raise
             retries += 1
+            _log("model.retry", what=what, retry=retries, max_retries=limit,
+                 delay_seconds=round(delay, 1), http_status=getattr(error, "status", None),
+                 error_type=type(error).__name__, reason=str(error)[:200])
