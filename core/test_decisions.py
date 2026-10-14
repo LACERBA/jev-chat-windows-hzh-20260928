@@ -102,6 +102,13 @@ class DecisionsTests(unittest.TestCase):
         self.assertEqual(factory.call_args.kwargs["max_retries"], 0)
         self.assertEqual(factory.call_args.kwargs["timeout"], 17)
 
+    def test_explicit_key_overrides_environment_without_mutating_it(self):
+        before = jev_client.os.environ["JEV_API_KEY"]
+        with self._transport(self._ok), patch.object(jev_client, "_api_key", side_effect=AssertionError("must not read")):
+            self._ask(api_key="unsaved-test-key")
+        self.assertEqual(self.requests[0].headers["authorization"], "Bearer unsaved-test-key")
+        self.assertEqual(jev_client.os.environ["JEV_API_KEY"], before)
+
     def test_default_official_endpoint_and_model(self):
         with self._transport(self._ok):
             self._ask()

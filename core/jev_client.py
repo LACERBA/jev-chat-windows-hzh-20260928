@@ -3,7 +3,7 @@
 
 TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 这条是唯一自己拼 HTTP 的路——
 SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/decisions`。
-各后端返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
+各后端返回同一个 dict 形状，engine 不关心跑的是哪条。key 默认从环境变量读，验证时可显式传入，绝不打进日志。
 """
 
 from __future__ import annotations
@@ -139,15 +139,15 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 def ask(state: dict, questions: dict, timeout: float = 20,
         provider: str = "openrouter", model: str | None = None,
-        max_retries: int = MAX_RETRIES, base_url: str | None = None) -> dict:
+        max_retries: int = MAX_RETRIES, base_url: str | None = None, api_key: str = "") -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
     provider ∈ JEV_PROVIDERS；model=None 用该来源的默认模型，base_url 仅供 OpenAI Decisions 使用。
     各后端返回的 dict 形状一模一样；限流、过载、超时等临时故障由 core.retry 统一重试，
-    max_retries 是这次调用的重试上限。绝不打印或写出 key。
+    max_retries 是这次调用的重试上限；api_key 可用于验证未保存的密钥，不修改环境变量。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
+    key = api_key.strip() or _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     model = model or spec.default
     if provider == "openai_decisions":
         return call_with_retry(

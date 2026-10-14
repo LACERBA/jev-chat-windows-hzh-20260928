@@ -23,7 +23,8 @@ from qfluentwidgets import (
 from app import settings
 from app.version import VERSION
 from core import jev_client, llm, providers, vision
-from core.questions import CHOICE_LABELS
+from core.questions import CHOICE_LABELS, JUDGE_QUESTIONS, build_state
+from core.llm_judge import validate_answers
 from core.diagnostics import log_event, redact_text, register_secret
 
 _LOG_LINES = 300
@@ -163,6 +164,7 @@ class _Fetched(QObject):
     Qt 不让跨线程碰控件，信号是跨线程唯一干净的路。"""
     done = Signal(object, list, str)
     tested = Signal(str)
+    jevTested = Signal(object, str)
 
 
 class _TitleBar(QWidget):
@@ -675,8 +677,10 @@ class Overlay:
         box.setContentsMargins(16, 16, 16, 18)
         box.setSpacing(12)
         box.addWidget(_label("模型", 16, "#304c3c", True))
+        self._jev_testing = False
         self._fetched = _Fetched()
         self._fetched.done.connect(self._models_fetched)
+        self._fetched.jevTested.connect(self._jev_tested)
         mode_label = _label("判断策略", 13)
         box.addWidget(mode_label)
         self.judgeModeBox = ComboBox()
@@ -689,6 +693,13 @@ class Overlay:
             "推荐 Jev 优先：连接失败、限流或服务过载时由通用模型接管；密钥或地址错误会直接提示。"
         ))
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
+        self.jevTestButton = PushButton("测试判断接口")
+        self.jevTestButton.setAccessibleName("使用内置测试文本验证 Jev 或 Decisions 判断接口")
+        self.jevTestButton.clicked.connect(self._test_jev)
+        box.addWidget(self.jevTestButton)
+        box.addWidget(self._hint(
+            "仅发送内置测试文本，不读取聊天；使用当前填写的配置，无需先保存，调用可能产生少量 API 费用。"
+        ))
         box.addWidget(self._hint(
             "Jev 或 OpenAI Decisions 负责意图、紧张度和候选排序；仅通用模型模式下不调用。"
             "Decisions 地址填到 /v1 即可，留空用官方地址；目前支持 gpt-6-luna，也可手填后续模型。"
@@ -864,6 +875,7 @@ class Overlay:
         active = {"jev": mode != "llm_only", "judge": mode != "jev_only" and not reuse,
                   "draft": True, "vision": visual and self.visionUploadSwitch.isChecked()}
         self.visionTestButton.setEnabled(active["vision"])
+        self.jevTestButton.setEnabled(active["jev"] and not self._jev_testing)
         for group in (self.jev, self.judge, self.draft, self.vision):
             provider = self._provider_of(group)
             name = group.table[provider].name
@@ -921,6 +933,56 @@ class Overlay:
         log_event("settings.models_completed", group=group.kind, provider=provider,
                   model_count=len(models), reason=reason)
         self._fetched.done.emit(group, models, reason)
+
+    def _jev_test_config(self):
+        provider = self._provider_of(self.jev)
+        return {"provider": provider, "model": self.jev.modelBox.text().strip(),
+                "base_url": self.jev.baseEdit.text().strip() if provider == "openai_decisions" else "",
+                "api_key": self.jev.keyEdit.text().strip() or self.jev.stored_key()}
+
+    def _test_jev(self):
+        if self._jev_testing or not self.jevTestButton.isEnabled():
+            return
+        config = self._jev_test_config()
+        if not config["api_key"]:
+            self.jev.status.setText("先填密钥")
+            self.jev.keyEdit.setFocus()
+            return
+        if not config["model"]:
+            self.jev.status.setText("先获取并选择一个模型，或手动填写模型")
+            self.jev.modelBox.setFocus()
+            return
+        self._jev_testing = True
+        self._sync_model_fields()
+        self.jev.status.setText("正在使用内置测试文本验证…")
+        threading.Thread(target=self._test_jev_bg, args=(config,), daemon=True).start()
+
+    def _test_jev_bg(self, config):
+        register_secret(config["api_key"])
+        log_event("settings.jev_test_requested", provider=config["provider"], model=config["model"])
+        # 使用固定文本覆盖概率、分类和评分，不进入真实聊天的起草或发送链路。
+        state = build_state([("her", "你好，今天一起吃午饭吗？")], "friends")
+        questions = {name: JUDGE_QUESTIONS[name] for name in ("literal_question", "true_intent", "danger_level")}
+        try:
+            result = jev_client.ask(state, questions, provider=config["provider"], model=config["model"],
+                                    base_url=config["base_url"] or None, api_key=config["api_key"],
+                                    timeout=20, max_retries=1)
+            answers = validate_answers(result.get("answers"), questions,
+                                       allow_fractional_score=config["provider"] == "openai_decisions")
+            message = (f"判断接口已通过验证：字面概率 {answers['literal_question']['noul']:.0%}，"
+                       f"意图 {_choice(answers, 'true_intent')}，紧张度 {answers['danger_level']['score']:g}/9")
+            log_event("settings.jev_test_completed", provider=config["provider"], model=config["model"])
+        except Exception as exc:
+            log_event("settings.jev_test_failed", level="error", exc_info=True,
+                      provider=config["provider"], model=config["model"])
+            message = "判断接口验证失败：" + redact_text(str(exc))[:160]
+        self._fetched.jevTested.emit(config, message)
+
+    def _jev_tested(self, config, message):
+        self._jev_testing = False
+        self._sync_model_fields()
+        # 测试期间配置可能变更，旧请求的成功结果不能用来证明新配置可用。
+        self.jev.status.setText(message if config == self._jev_test_config() else "配置已变更，请重新测试当前配置。")
 
     def _test_vision(self):
         if not self.visionUploadSwitch.isChecked():

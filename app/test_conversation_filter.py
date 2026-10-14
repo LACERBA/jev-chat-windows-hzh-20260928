@@ -1375,6 +1375,133 @@ class OverlayFilterTests(unittest.TestCase):
             self.overlay._save()
         self.assertEqual(save.call_args.kwargs["jev_base_url_text"], "")
 
+    def _jev_test_result(self):
+        return {"answers": {
+            "literal_question": {"type": "noul", "noul": 0.9},
+            "true_intent": {"type": "choice", "choice": "casual_chat"},
+            "danger_level": {"type": "score", "score": 1.1},
+        }}
+
+    def test_jev_test_button_uses_unsaved_configuration_without_saving(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        group.baseEdit.setText("https://quick-pivot.com/v1")
+        group.modelBox.setText("future-model")
+        group.keyEdit.setText("unsaved-test-key")
+        with patch.object(overlay.threading, "Thread") as thread, patch.object(settings, "save") as save:
+            self.overlay.jevTestButton.click()
+            config = thread.call_args.kwargs["args"][0]
+            thread.return_value.start.assert_called_once()
+            self.assertFalse(self.overlay.jevTestButton.isEnabled())
+            self.overlay._sync_model_fields()
+            self.assertFalse(self.overlay.jevTestButton.isEnabled())
+            self.overlay._test_jev()
+            thread.assert_called_once()
+            save.assert_not_called()
+        self.assertEqual(config, {"provider": "openai_decisions", "model": "future-model",
+                                  "base_url": "https://quick-pivot.com/v1", "api_key": "unsaved-test-key"})
+
+    def test_jev_test_validates_synthetic_text_and_returns_result_to_ui(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        group.keyEdit.setText("unsaved-test-key")
+        with patch.object(overlay.threading, "Thread") as thread:
+            self.overlay._test_jev()
+            config = thread.call_args.kwargs["args"][0]
+        with patch.object(overlay.jev_client, "ask", return_value=self._jev_test_result()) as ask, \
+                patch.object(settings, "save") as save:
+            self.overlay._test_jev_bg(config)
+        self.assertEqual(ask.call_args.kwargs["provider"], "openai_decisions")
+        self.assertEqual(ask.call_args.kwargs["api_key"], "unsaved-test-key")
+        self.assertEqual(ask.call_args.kwargs["model"], "gpt-6-luna")
+        self.assertEqual(ask.call_args.kwargs["base_url"], "https://api.openai.com/v1")
+        self.assertEqual(ask.call_args.kwargs["max_retries"], 1)
+        self.assertEqual(set(ask.call_args.args[1]), {"literal_question", "true_intent", "danger_level"})
+        messages = ask.call_args.args[0]["chat"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn("月仔", str(ask.call_args.args[0]))
+        self.assertIn("已通过验证", group.status.text())
+        self.assertIn("1.1/9", group.status.text())
+        self.assertTrue(self.overlay.jevTestButton.isEnabled())
+        save.assert_not_called()
+
+    def test_jev_test_reports_invalid_response_and_redacts_failure_key(self):
+        from app import overlay
+        from core.jev_client import JevError
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        group.keyEdit.setText("unsaved-test-key")
+        for result in ({"answers": {}}, JevError("bad unsaved-test-key", 401)):
+            with self.subTest(result=result), patch.object(overlay.threading, "Thread") as thread:
+                self.overlay._test_jev()
+                config = thread.call_args.kwargs["args"][0]
+            kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with patch.object(overlay.jev_client, "ask", **kwargs):
+                self.overlay._test_jev_bg(config)
+            self.assertIn("验证失败", group.status.text())
+            self.assertNotIn("unsaved-test-key", group.status.text())
+            self.assertTrue(self.overlay.jevTestButton.isEnabled())
+
+    def test_jev_test_checks_missing_key_model_and_strategy_before_starting(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        with patch.object(overlay.threading, "Thread") as thread, patch.object(group, "stored_key", return_value=""):
+            self.overlay._test_jev()
+            self.assertEqual(group.status.text(), "先填密钥")
+            group.keyEdit.setText("typed-key")
+            group.modelBox.setText("")
+            self.overlay._test_jev()
+            self.assertIn("模型", group.status.text())
+            group.modelBox.setText("test-model")
+            self.overlay.judgeModeBox.setCurrentIndex(2)
+            self.assertFalse(self.overlay.jevTestButton.isEnabled())
+            self.overlay._test_jev()
+            thread.assert_not_called()
+
+    def test_jev_test_uses_saved_key_and_does_not_show_stale_success(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        group.baseEdit.clear()
+        with patch.object(overlay.threading, "Thread") as thread:
+            self.overlay._test_jev()
+            config = thread.call_args.kwargs["args"][0]
+        self.assertEqual(config["api_key"], "demo-key")
+        self.assertEqual(config["base_url"], "")
+        group.modelBox.setText("changed-model")
+        with patch.object(overlay.jev_client, "ask", return_value=self._jev_test_result()):
+            self.overlay._test_jev_bg(config)
+        self.assertNotIn("已通过验证", group.status.text())
+        self.assertIn("配置已变更", group.status.text())
+        self.assertTrue(self.overlay.jevTestButton.isEnabled())
+
+    def test_jev_test_runs_for_existing_providers_and_remains_disabled_in_llm_only_mode(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        for provider in ("openrouter", "typesafe"):
+            with self.subTest(provider=provider):
+                group.providerBox.setCurrentIndex(group.ids.index(provider))
+                with patch.object(overlay.threading, "Thread") as thread:
+                    self.overlay._test_jev()
+                    config = thread.call_args.kwargs["args"][0]
+                result = self._jev_test_result()
+                result["answers"]["danger_level"]["score"] = 1
+                self.overlay.judgeModeBox.setCurrentIndex(2)
+                with patch.object(overlay.jev_client, "ask", return_value=result) as ask:
+                    self.overlay._test_jev_bg(config)
+                self.assertEqual(ask.call_args.kwargs["provider"], provider)
+                self.assertIsNone(ask.call_args.kwargs["base_url"])
+                self.assertFalse(self.overlay.jevTestButton.isEnabled())
+                self.overlay.judgeModeBox.setCurrentIndex(0)
+
     def test_settings_load_ignore_list_and_save_entered_names(self):
         self.overlay._load_settings()
         self.assertEqual(self.overlay.ignoredChatsEdit.toPlainText(), "营销群")
