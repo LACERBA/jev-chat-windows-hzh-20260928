@@ -49,7 +49,7 @@ def _probabilities(value, allowed: set[str], name: str) -> dict:
             for key, score in value.items()}
 
 
-def validate_answers(raw: dict, questions: dict) -> dict:
+def validate_answers(raw: dict, questions: dict, *, allow_fractional_score: bool = False) -> dict:
     """把普通模型输出校验并整理成与 Jev answers 相同的结构。"""
     if not isinstance(raw, dict):
         raise JevError("通用判断结果 answers 不是对象")
@@ -79,9 +79,9 @@ def validate_answers(raw: dict, questions: dict) -> dict:
         if kind == "score":
             highest = len(criteria) - 1
             score = _number(answer.get("score"), name, 0, highest)
-            if not score.is_integer():
+            if not allow_fractional_score and not score.is_integer():
                 raise JevError(f"通用判断结果字段 {name}.score 必须是整数")
-            item = {"type": "score", "score": int(score)}
+            item = {"type": "score", "score": score if allow_fractional_score else int(score)}
             if "confidence" in answer:
                 item["confidence"] = _number(answer["confidence"], f"{name}.confidence", 0, 1)
             probabilities = _probabilities(answer.get("probabilities"),

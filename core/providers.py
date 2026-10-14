@@ -26,10 +26,11 @@ VISION_ENV = "VISION_API_KEY"
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
 
-_Jev = namedtuple("_Jev", "name default")
+_Jev = namedtuple("_Jev", "name default base", defaults=("",))
 JEV_PROVIDERS = {
     "openrouter": _Jev("OpenRouter", "typesafe/jev-1.13"),
     "typesafe": _Jev("TypeSafe 直连", "jev-latest"),
+    "openai_decisions": _Jev("OpenAI Decisions", "gpt-6-luna", "https://api.openai.com/v1"),
 }
 
 # protocol ∈ {openai, anthropic, gemini}：决定 core/llm.py 用哪个官方 SDK

@@ -57,6 +57,51 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertFalse(data["judge_reuse_draft"])
         self.assertNotIn("judge-secret", str(data))
 
+    def test_decisions_configuration_defaults_and_readiness(self):
+        config = self._config(jev_provider="openai_decisions", jev_model="", judge_mode="jev_only")
+        keys = {JEV_ENV: "decision-key", LLM_ENV: "draft-key"}
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", side_effect=lambda name: keys.get(name, "")):
+            self.assertEqual(settings.jev_provider(), "openai_decisions")
+            self.assertEqual(settings.jev_model(), "gpt-6-luna")
+            self.assertEqual(settings.jev_base_url(), "")
+            self.assertTrue(settings.models_ready())
+            config["jev_base_url"] = " https://quick-pivot.com/v1 "
+            config["jev_model"] = "future-model"
+            self.assertEqual(settings.jev_base_url(), "https://quick-pivot.com/v1")
+            self.assertEqual(settings.jev_model(), "future-model")
+            keys[JEV_ENV] = ""
+            self.assertFalse(settings.models_ready())
+
+    def test_saves_decisions_address_and_model_but_not_key_to_config(self):
+        config = self._config()
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), \
+                patch.object(settings, "_set_key") as set_key, \
+                patch.object(settings, "_notify_env"), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(jev_provider_text="openai_decisions", jev_model_text="gpt-6-luna",
+                          jev_base_url_text=" https://quick-pivot.com/v1 ", jev_key_text="decisions-secret")
+        data = dump.call_args.args[0]
+        self.assertEqual(data["jev_provider"], "openai_decisions")
+        self.assertEqual(data["jev_model"], "gpt-6-luna")
+        self.assertEqual(data["jev_base_url"], "https://quick-pivot.com/v1")
+        self.assertNotIn("decisions-secret", str(data))
+        set_key.assert_any_call(JEV_ENV, "decisions-secret")
+
+    def test_decisions_address_survives_unrelated_save_and_provider_switch(self):
+        config = self._config(jev_provider="openai_decisions", jev_model="gpt-6-luna",
+                              jev_base_url="https://quick-pivot.com/v1")
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(logging_level_text="DEBUG")
+            self.assertEqual(dump.call_args.args[0]["jev_base_url"], config["jev_base_url"])
+            settings.save(jev_provider_text="openrouter")
+            self.assertEqual(dump.call_args.args[0]["jev_base_url"], config["jev_base_url"])
+            settings.save(jev_base_url_text="")
+            self.assertEqual(dump.call_args.args[0]["jev_base_url"], "")
+
     def test_logging_defaults_and_invalid_values(self):
         with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
             self.assertTrue(settings.logging_enabled())

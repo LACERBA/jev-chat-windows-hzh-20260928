@@ -40,7 +40,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             thinking: bool = False, jev_provider: str = "openrouter",
             jev_model: str | None = None, judge_mode: str = "jev_fallback",
             llm_judge_provider: str = "deepseek", llm_judge_model: str | None = None,
-            llm_judge_base_url: str | None = None, llm_judge_api_key: str = "") -> dict:
+            llm_judge_base_url: str | None = None, llm_judge_api_key: str = "",
+            jev_base_url: str | None = None) -> dict:
     """按配置用 Jev 或普通模型判断，再起草候选并完成有效排序。"""
     state = build_state(messages, relationship, keep=context, reply_to=reply_to)
     usage: dict = {}
@@ -61,6 +62,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         step = "ranking.jev" if "best_reply" in questions else "judgment.jev"
         with log_step(step, provider=jev_provider, model=jev_model, timeout=timeout):
             return ask_jev(state, questions, timeout=timeout, provider=jev_provider, model=jev_model,
+                           base_url=jev_base_url,
                            max_retries=1 if judge_mode == "jev_fallback" else None)  # 有兜底模型时 Jev 快速失败，否则用统一的 5 次
 
     def final_select(candidates):
@@ -76,7 +78,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             judge_backend = "llm"
         else:
             first = jev(dict(JUDGE_QUESTIONS))
-            first["answers"] = validate_answers(first.get("answers"), JUDGE_QUESTIONS)
+            first["answers"] = validate_answers(first.get("answers"), JUDGE_QUESTIONS,
+                                                allow_fractional_score=jev_provider == "openai_decisions")
             judge_backend = "jev"
         answers = first["answers"]
         _add_usage(usage, first.get("usage"))
@@ -156,7 +159,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                     ranking_backend = "llm"
             else:
                 ranked = jev(rank_question)
-                ranked["answers"] = validate_answers(ranked.get("answers"), rank_question)
+                ranked["answers"] = validate_answers(ranked.get("answers"), rank_question,
+                                                     allow_fractional_score=jev_provider == "openai_decisions")
                 ranking_backend = "jev"
         except JevError as error:
             log_event("ranking.failed", level="warning", exc_info=True,

@@ -689,7 +689,10 @@ class Overlay:
             "推荐 Jev 优先：连接失败、限流或服务过载时由通用模型接管；密钥或地址错误会直接提示。"
         ))
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
-        box.addWidget(self._hint("Jev 负责意图、紧张度和候选排序；仅通用模型模式下不调用。"))
+        box.addWidget(self._hint(
+            "Jev 或 OpenAI Decisions 负责意图、紧张度和候选排序；仅通用模型模式下不调用。"
+            "Decisions 地址填到 /v1 即可，留空用官方地址；目前支持 gpt-6-luna，也可手填后续模型。"
+        ))
         reuse_row = QHBoxLayout()
         reuse_row.addWidget(_label("通用判断复用起草配置", 13), 1)
         self.judgeReuseSwitch = SwitchButton()
@@ -795,15 +798,13 @@ class Overlay:
         group.providerBox.setAccessibleName(f"{title} 来源")
         source_label.setBuddy(group.providerBox)
         box.addWidget(group.providerBox)
-        group.baseLabel = group.baseEdit = None
-        if kind != "jev":
-            group.baseLabel = _label("Base URL", 13)
-            box.addWidget(group.baseLabel)
-            group.baseEdit = LineEdit()
-            group.baseEdit.setPlaceholderText("https://你的服务/v1")
-            group.baseEdit.setAccessibleName(f"{title}自定义来源 Base URL")
-            group.baseLabel.setBuddy(group.baseEdit)
-            box.addWidget(group.baseEdit)
+        group.baseLabel = _label("Base URL（留空使用 OpenAI 官方）" if kind == "jev" else "Base URL", 13)
+        box.addWidget(group.baseLabel)
+        group.baseEdit = LineEdit()
+        group.baseEdit.setPlaceholderText("https://你的服务/v1")
+        group.baseEdit.setAccessibleName(f"{title}自定义来源 Base URL")
+        group.baseLabel.setBuddy(group.baseEdit)
+        box.addWidget(group.baseEdit)
         key_label = _label("密钥", 13)
         box.addWidget(key_label)
         group.keyEdit = PasswordLineEdit()
@@ -812,7 +813,7 @@ class Overlay:
         group.keyEdit.returnPressed.connect(self._save)
         box.addWidget(group.keyEdit)
         box.addWidget(self._hint(
-            "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
+            "按来源填写 OpenRouter、TypeSafe 或 Decisions 服务的 key；密钥只存系统环境变量。" if kind == "jev"
             else "上面选哪家就填哪家的 key；换来源重填一次，只存对应密钥。"))
         model_label = _label("模型", 13)
         box.addWidget(model_label)
@@ -849,6 +850,8 @@ class Overlay:
                   "draft": settings.draft_model, "vision": settings.vision_model}[group.kind]()
         group.modelBox.clear()
         group.modelBox.setText(stored if provider == saved else group.table[provider].default)
+        if group.kind == "jev" and provider == "openai_decisions" and not group.baseEdit.text().strip():
+            group.baseEdit.setText(settings.jev_base_url() or group.table[provider].base)
         group.status.setText("")
         self._sync_model_fields()
 
@@ -877,15 +880,16 @@ class Overlay:
                 name = group.providerBox.fontMetrics().elidedText(name, Qt.ElideRight, 180)
             group.providerBox.setText(name)
             if group.baseLabel:
-                custom = active[group.kind] and provider in providers.CUSTOM
+                custom = active[group.kind] and (provider in providers.CUSTOM
+                                                  or group.kind == "jev" and provider == "openai_decisions")
                 group.baseLabel.setVisible(custom)
                 group.baseEdit.setVisible(custom)
 
     def _fetch_models(self, group):
         """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
         provider = self._provider_of(group)
-        custom = group.kind != "jev" and provider in providers.CUSTOM
-        base = group.baseEdit.text().strip() if custom else None
+        custom = provider in providers.CUSTOM
+        base = group.baseEdit.text().strip() if custom or provider == "openai_decisions" else None
         key = group.keyEdit.text().strip() or group.stored_key()
         if not key:
             group.status.setText("先填密钥")
@@ -904,7 +908,7 @@ class Overlay:
         log_event("settings.models_requested", group=group.kind, provider=provider)
         try:
             if group.kind == "jev":
-                models = jev_client.list_models(provider, key)
+                models = jev_client.list_models(provider, key, base_url=base)
             else:
                 spec = group.table[provider]
                 models = llm.list_models(spec.protocol, base or spec.base, key, headers=spec.headers)
@@ -989,6 +993,7 @@ class Overlay:
                                                    if value == mode))
         self.judgeReuseSwitch.setChecked(settings.judge_reuse_draft())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
+        self.jev.baseEdit.setText(settings.jev_base_url())
         self._set_group(self.judge, settings.judge_provider(), settings.judge_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.judge.baseEdit.setText(settings.judge_base_url())
@@ -1059,6 +1064,7 @@ class Overlay:
                           jev_provider_text=jev_provider,
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
                           jev_model_text=self.jev.modelBox.text().strip(),
+                          jev_base_url_text=self.jev.baseEdit.text().strip(),
                           judge_mode_text=mode,
                           judge_reuse_draft_on=reuse,
                           judge_provider_text=judge_provider,

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Jev 判断 API 客户端：OpenRouter 或 TypeSafe 直连。
+"""Jev 判断 API 客户端：OpenRouter、TypeSafe 直连或 OpenAI Decisions。
 
 TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 这条是唯一自己拼 HTTP 的路——
 SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/decisions`。
-两条路返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
+各后端返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def _is_transient(exc: Exception) -> bool:
     return any(name in cls.__name__ for cls in type(exc).__mro__ for name in _TRANSIENT_NAMES)
 
 
-def _fail(exc: Exception, what: str) -> NoReturn:
+def _fail(exc: Exception, what: str, *, api_key: str = "", include_detail: bool = True) -> NoReturn:
     """SDK 抛的异常 → 一句人话的 JevError。消息过脱敏，绝不把 key 带出来。"""
     if isinstance(exc, JevError):
         raise exc
@@ -108,7 +108,9 @@ def _fail(exc: Exception, what: str) -> NoReturn:
     hint = {401: "密钥被拒", 403: "没有权限", 404: "模型或地址不对", 408: "请求超时", 422: "请求被拒",
             429: "被限流", 500: "服务内部错误", 502: "网关错误", 503: "服务暂不可用",
             504: "网关超时", 529: "服务过载"}.get(status, "")
-    detail = redact_secrets(str(exc)).strip()[:300]
+    detail = str(exc) if include_detail else type(exc).__name__
+    detail = detail.replace(api_key, "[REDACTED]") if api_key else detail
+    detail = redact_secrets(detail).strip()[:300]
     head = f"{what} HTTP {status}" if status else f"{what}失败"
     raise JevError(f"{head}: {hint or detail or type(exc).__name__}", status,
                    retryable=status is None and _is_transient(exc),
@@ -137,19 +139,105 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 def ask(state: dict, questions: dict, timeout: float = 20,
         provider: str = "openrouter", model: str | None = None,
-        max_retries: int = MAX_RETRIES) -> dict:
+        max_retries: int = MAX_RETRIES, base_url: str | None = None) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
-    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样；限流、过载、超时等临时故障由 core.retry 统一重试，
+    provider ∈ JEV_PROVIDERS；model=None 用该来源的默认模型，base_url 仅供 OpenAI Decisions 使用。
+    各后端返回的 dict 形状一模一样；限流、过载、超时等临时故障由 core.retry 统一重试，
     max_retries 是这次调用的重试上限。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
     key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     model = model or spec.default
+    if provider == "openai_decisions":
+        return call_with_retry(
+            lambda: _ask_decisions(state, questions, key, model, timeout, base_url or spec.base),
+            what="Decisions 判断", max_retries=max_retries)
     send = _ask_typesafe if provider == "typesafe" else _ask_openrouter
     return call_with_retry(lambda: send(state, questions, key, model, timeout),
                            what="Jev 判断", max_retries=max_retries)
+
+
+def _decision_questions(questions: dict) -> list[dict]:
+    result = []
+    for name, question in questions.items():
+        kind, criteria = question["type"], question["criteria"]
+        item = {"name": name, "type": kind, "instructions": question["instructions"]}
+        if kind == "noul":
+            item["type"] = "predicate"
+            item["instructions"] += f"\nTrue: {criteria['true']}\nFalse: {criteria['false']}"
+        elif kind == "choice":
+            item["choices"] = [{"value": key, "description": text} for key, text in criteria.items()]
+        elif kind == "score":
+            item["levels"] = [{"label": str(i), "description": text} for i, text in enumerate(criteria)]
+        else:
+            raise JevError("Decisions 不支持此问题类型")
+        result.append(item)
+    return result
+
+
+def _decision_answers(result: dict, questions: dict) -> dict:
+    try:
+        from .llm_judge import validate_answers
+    except ImportError:
+        from llm_judge import validate_answers
+
+    if not isinstance(result, dict) or not isinstance(result.get("answers"), list):
+        raise JevError("Decisions 结果 answers 不是数组")
+    answers = {}
+    for answer in result["answers"]:
+        if not isinstance(answer, dict):
+            raise JevError("Decisions 结果含无效答案")
+        name = answer.get("name")
+        if not isinstance(name, str) or name not in questions or name in answers:
+            raise JevError("Decisions 结果含未知或重复的问题名")
+        kind = questions[name]["type"]
+        if answer.get("type") == "refusal":
+            raise JevError(f"Decisions 拒绝回答问题 {name}")
+        if answer.get("type") != ("predicate" if kind == "noul" else kind):
+            raise JevError(f"Decisions 结果字段 {name} 的类型不匹配")
+        if kind == "noul":
+            answers[name] = {"type": "noul", "noul": answer.get("probability")}
+            continue
+        if kind == "choice" and not isinstance(answer.get("choice"), str):
+            raise JevError(f"Decisions 结果字段 {name}.choice 不是字符串")
+        item = {"type": kind, kind: answer.get(kind)}
+        if "confidence" in answer:
+            item["confidence"] = answer["confidence"]
+        probabilities = answer.get("probabilities", [])
+        if not isinstance(probabilities, list):
+            raise JevError(f"Decisions 结果字段 {name}.probabilities 不是数组")
+        mapped = {}
+        for option in probabilities:
+            if not isinstance(option, dict):
+                raise JevError(f"Decisions 结果字段 {name}.probabilities 含无效选项")
+            value = option.get("value")
+            if (isinstance(value, bool) or not isinstance(value, int if kind == "score" else str)
+                    or str(value) in mapped):
+                raise JevError(f"Decisions 结果字段 {name}.probabilities 含无效或重复选项")
+            mapped[str(value)] = option.get("probability")
+        item["probabilities"] = mapped
+        answers[name] = item
+    # 保留 Decisions 概率加权的小数评分，输出结构仍与 Jev 一致。
+    return {"answers": validate_answers(answers, questions, allow_fractional_score=True),
+            "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {}}
+
+
+def _ask_decisions(state: dict, questions: dict, key: str, model: str,
+                   timeout: float, base_url: str) -> dict:
+    import openai
+
+    payload = {"model": model, "input": json.dumps(state, ensure_ascii=False),
+               "questions": _decision_questions(questions)}
+    try:
+        with openai.OpenAI(base_url=base_url.rstrip("/"), api_key=key,
+                           timeout=timeout, max_retries=0) as client:
+            # 兼容尚未提供 decisions.create 的 SDK，同时复用官方鉴权和连接管理。
+            result = client.post("/decisions", body=payload, cast_to=dict)
+    except Exception as exc:
+        # 网关错误可能回显输入，不把原始响应正文带进日志或界面。
+        _fail(exc, "Decisions 判断", api_key=key, include_detail=False)
+    return _decision_answers(result, questions)
 
 
 def _answer(answer) -> dict:
@@ -236,8 +324,21 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
             f"取模型列表失败: {redact_secrets(getattr(exc, 'reason', exc))}") from None
 
 
-def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
+def list_models(provider: str, key: str, timeout: float = 10,
+                base_url: str | None = None) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+    if provider == "openai_decisions":
+        import openai
+
+        def fetch():
+            try:
+                with openai.OpenAI(base_url=(base_url or JEV_PROVIDERS[provider].base).rstrip("/"),
+                                   api_key=key, timeout=timeout, max_retries=0) as client:
+                    return sorted({model.id for model in client.models.list()})
+            except Exception as exc:
+                _fail(exc, "取模型列表", api_key=key, include_detail=False)
+
+        return call_with_retry(fetch, what="取模型列表")
     if provider == "typesafe":
         import typesafe_sdk
 

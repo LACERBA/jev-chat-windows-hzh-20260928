@@ -54,13 +54,16 @@ def style() -> str:
     return str(_read("style") or "")
 
 def jev_provider() -> str:
-    """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
+    """判断模型来源：OpenRouter（默认）、TypeSafe 或 OpenAI Decisions。"""
     v = _read("jev_provider")
     return v if v in JEV_PROVIDERS else _DEFAULT_JEV
 
 def jev_model() -> str:
     """判断模型 id；空 = 用该来源的默认模型。"""
     return str(_read("jev_model") or "") or JEV_PROVIDERS[jev_provider()].default
+
+def jev_base_url() -> str:
+    return str(_read("jev_base_url") or "").strip()
 
 def judge_mode() -> str:
     value = str(_read("judge_mode") or _DEFAULT_JUDGE_MODE)
@@ -306,7 +309,8 @@ has_key = models_ready
 
 def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
-         jev_model_text: str | None = None, judge_mode_text: str | None = None,
+         jev_model_text: str | None = None, jev_base_url_text: str | None = None,
+         judge_mode_text: str | None = None,
          judge_reuse_draft_on: bool | None = None, judge_provider_text: str | None = None,
          judge_key_text: str | None = None, judge_model_text: str | None = None,
          judge_base_url_text: str | None = None, draft_provider_text: str | None = None,
@@ -351,6 +355,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "relationship": relationship_text or relationship(), "context": n,
         "style": keep(style_text, "style"),
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
+        "jev_base_url": keep(jev_base_url_text, "jev_base_url"),
         "judge_mode": (judge_mode_text if judge_mode_text in _JUDGE_MODES else judge_mode()),
         "judge_reuse_draft": flag(judge_reuse_draft_on, judge_reuse_draft),
         "judge_provider": judge, "judge_model": keep(judge_model_text, "judge_model"),

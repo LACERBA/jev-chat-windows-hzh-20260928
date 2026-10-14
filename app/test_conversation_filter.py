@@ -1319,6 +1319,62 @@ class OverlayFilterTests(unittest.TestCase):
             self.overlay = Overlay(on_fill=Mock())
         self.addCleanup(self.overlay.win.close)
 
+    def test_decisions_controls_switch_load_and_save_custom_configuration(self):
+        group = self.overlay.jev
+        self.assertTrue(group.baseEdit.isHidden())
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        self.assertFalse(group.baseEdit.isHidden())
+        self.assertEqual(group.modelBox.text(), "gpt-6-luna")
+        self.assertEqual(group.baseEdit.text(), "https://api.openai.com/v1")
+        group.baseEdit.setText("https://quick-pivot.com/v1")
+        group.keyEdit.setText("typed-decision-key")
+        group.modelBox.setText("future-model")
+        with patch.object(settings, "save") as save:
+            self.overlay._save()
+        self.assertEqual(save.call_args.kwargs["jev_provider_text"], "openai_decisions")
+        self.assertEqual(save.call_args.kwargs["jev_base_url_text"], "https://quick-pivot.com/v1")
+        self.assertEqual(save.call_args.kwargs["jev_key_text"], "typed-decision-key")
+        self.assertEqual(save.call_args.kwargs["jev_model_text"], "future-model")
+        self.config.update(jev_provider="openai_decisions", jev_base_url="https://quick-pivot.com/v1",
+                           jev_model="future-model")
+        self.overlay._load_settings()
+        self.assertEqual(group.baseEdit.text(), "https://quick-pivot.com/v1")
+        self.assertEqual(group.modelBox.text(), "future-model")
+        self.overlay.judgeModeBox.setCurrentIndex(2)
+        self.assertTrue(group.baseEdit.isHidden())
+        self.assertFalse(group.fetchButton.isEnabled())
+
+    def test_decisions_fetch_uses_typed_address_key_and_preserves_selected_model(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        group.baseEdit.setText("https://quick-pivot.com/v1")
+        group.keyEdit.setText("typed-decision-key")
+        with patch.object(overlay.threading, "Thread") as thread, \
+                patch.object(self.overlay, "_list_models") as listing:
+            self.overlay._fetch_models(group)
+            thread.call_args.kwargs["target"]()
+        listing.assert_called_once_with(group, "openai_decisions", "typed-decision-key",
+                                        "https://quick-pivot.com/v1")
+        with patch.object(overlay.jev_client, "list_models", return_value=["future-model", "gpt-6-luna"]) as models:
+            self.overlay._list_models(group, "openai_decisions", "typed-decision-key", "https://quick-pivot.com/v1")
+        models.assert_called_once_with("openai_decisions", "typed-decision-key",
+                                       base_url="https://quick-pivot.com/v1")
+        self.assertEqual(group.modelBox.text(), "gpt-6-luna")
+        self.assertTrue(group.fetchButton.isEnabled())
+
+    def test_decisions_allows_empty_base_for_official_endpoint_and_retains_hidden_address(self):
+        group = self.overlay.jev
+        self.config["jev_base_url"] = "https://quick-pivot.com/v1"
+        self.overlay._load_settings()
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        self.assertEqual(group.baseEdit.text(), "https://quick-pivot.com/v1")
+        group.baseEdit.clear()
+        with patch.object(settings, "save") as save:
+            self.overlay._save()
+        self.assertEqual(save.call_args.kwargs["jev_base_url_text"], "")
+
     def test_settings_load_ignore_list_and_save_entered_names(self):
         self.overlay._load_settings()
         self.assertEqual(self.overlay.ignoredChatsEdit.toPlainText(), "营销群")
