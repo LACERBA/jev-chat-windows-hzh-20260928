@@ -26,11 +26,18 @@ VISION_ENV = "VISION_API_KEY"
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
 
+# 本地服务使用独立密钥槽，不能把官方 Jev 密钥发给本地服务。
+LAYA_ENV = "LAYA_API_KEY"
+LAYA_MODELS = ("multilingual", "english", "typed-decisions")
+JEV_CUSTOM = ("openai_decisions", "laya")
+JEV_FRACTIONAL_SCORE = ("openai_decisions", "laya")
+
 _Jev = namedtuple("_Jev", "name default base", defaults=("",))
 JEV_PROVIDERS = {
     "openrouter": _Jev("OpenRouter", "typesafe/jev-1.13"),
     "typesafe": _Jev("TypeSafe 直连", "jev-latest"),
     "openai_decisions": _Jev("OpenAI Decisions", "gpt-6-luna", "https://api.openai.com/v1"),
+    "laya": _Jev("Laya · 本地 HTTP", "multilingual", "http://127.0.0.1:8000"),
 }
 
 # protocol ∈ {openai, anthropic, gemini}：决定 core/llm.py 用哪个官方 SDK
@@ -79,7 +86,7 @@ CUSTOM = ("custom_openai", "custom_anthropic")
 # 起草时认思考开关的来源，设置页那句提示照着这里写
 THINKING = ("DeepSeek", "OpenRouter", "Anthropic", "Gemini")
 # 所有可能存 key 的环境变量，脱敏时一次全过一遍（jev_client.redact_secrets）
-ENV_VARS = sorted({JEV_ENV, JUDGE_ENV, LLM_ENV, VISION_ENV, *LEGACY.values()})
+ENV_VARS = sorted({JEV_ENV, JUDGE_ENV, LAYA_ENV, LLM_ENV, VISION_ENV, *LEGACY.values()})
 
 
 if __name__ == "__main__":
@@ -102,6 +109,6 @@ if __name__ == "__main__":
     assert go.keep("deepseek-v4.1-flash") and go.keep("glm-5.3") and go.keep("hy3")
     assert not any(go.keep(m) for m in (
         "minimax-m3", "qwen3.8-max", "grok-4.7", "gpt-6-luna", "muse-spark-1.2-contributor"))
-    assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "JUDGE_API_KEY", "LLM_API_KEY",
-                        "OPENROUTER_API_KEY", "VISION_API_KEY"]
+    assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "JUDGE_API_KEY", "LAYA_API_KEY",
+                        "LLM_API_KEY", "OPENROUTER_API_KEY", "VISION_API_KEY"]
     print("providers ok")

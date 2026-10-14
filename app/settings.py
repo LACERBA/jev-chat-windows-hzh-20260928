@@ -14,7 +14,7 @@ import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目�
 
 from core.diagnostics import LOG_LEVELS
 from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, JUDGE_ENV,
-                            LEGACY, LLM_ENV, VISION_ENV, VISION_PROVIDERS)
+                            LAYA_ENV, LEGACY, LLM_ENV, VISION_ENV, VISION_PROVIDERS)
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,11 +58,16 @@ def jev_provider() -> str:
     v = _read("jev_provider")
     return v if v in JEV_PROVIDERS else _DEFAULT_JEV
 
-def jev_model() -> str:
+def jev_model(provider: str | None = None) -> str:
     """判断模型 id；空 = 用该来源的默认模型。"""
-    return str(_read("jev_model") or "") or JEV_PROVIDERS[jev_provider()].default
+    provider = provider or jev_provider()
+    field = "laya_model" if provider == "laya" else "jev_model"
+    return str(_read(field) or "") or JEV_PROVIDERS[provider].default
 
-def jev_base_url() -> str:
+def jev_base_url(provider: str | None = None) -> str:
+    provider = provider or jev_provider()
+    if provider == "laya":
+        return str(_read("laya_base_url") or JEV_PROVIDERS[provider].base).strip()
     return str(_read("jev_base_url") or "").strip()
 
 def judge_mode() -> str:
@@ -271,6 +276,10 @@ def jev_key() -> str:
     """判断那把 key，两家来源共用。"""
     return _get_key(JEV_ENV)
 
+def laya_key() -> str:
+    """本地服务鉴权可选，独立保存，不回退到官方 Jev 密钥。"""
+    return _get_key(LAYA_ENV)
+
 def has_jev_key() -> bool:
     return bool(jev_key())
 
@@ -298,7 +307,11 @@ def models_ready() -> bool:
     if not has_llm_key() or not draft_model():
         return False
     mode = judge_mode()
-    jev_ready = has_jev_key() and bool(jev_model())
+    if jev_provider() == "laya":
+        laya_key()  # 从注册表恢复可选的本地鉴权密钥，供 core 请求层读取。
+        jev_ready = bool(jev_model() and jev_base_url())
+    else:
+        jev_ready = has_jev_key() and bool(jev_model())
     generic = general_judge_config()
     generic_ready = bool(generic["api_key"] and generic["model"])
     return ((mode == "jev_only" and jev_ready)
@@ -331,7 +344,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
     # 没重填就把老变量里的值抄进新名字，迁移一次性做完（_get_key 已经退回读过老的了）
     wrote_key = False
-    for env, typed in ((JEV_ENV, jev_key_text), (JUDGE_ENV, judge_key_text),
+    for env, typed in ((LAYA_ENV if jev == "laya" else JEV_ENV, jev_key_text), (JUDGE_ENV, judge_key_text),
                        (LLM_ENV, llm_key_text), (VISION_ENV, vision_key_text)):
         value = typed or ("" if _read_env(env) else _get_key(env))
         if value:
@@ -354,8 +367,11 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         # 关系为空 = 只改别的开关（调试视图那种单项保存），别把它写没了
         "relationship": relationship_text or relationship(), "context": n,
         "style": keep(style_text, "style"),
-        "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
-        "jev_base_url": keep(jev_base_url_text, "jev_base_url"),
+        "jev_provider": jev,
+        "jev_model": keep(jev_model_text if jev != "laya" else None, "jev_model"),
+        "jev_base_url": keep(jev_base_url_text if jev != "laya" else None, "jev_base_url"),
+        "laya_model": keep(jev_model_text if jev == "laya" else None, "laya_model"),
+        "laya_base_url": keep(jev_base_url_text if jev == "laya" else None, "laya_base_url"),
         "judge_mode": (judge_mode_text if judge_mode_text in _JUDGE_MODES else judge_mode()),
         "judge_reuse_draft": flag(judge_reuse_draft_on, judge_reuse_draft),
         "judge_provider": judge, "judge_model": keep(judge_model_text, "judge_model"),

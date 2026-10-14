@@ -10,12 +10,14 @@ try:
     from .diagnostics import log_event, log_step
     from .jev_client import JevError, ask as ask_jev
     from .llm_judge import ask as ask_llm_judge, select_best, validate_answers
+    from .providers import JEV_FRACTIONAL_SCORE
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
     from draft import draft_candidates
     from diagnostics import log_event, log_step
     from jev_client import JevError, ask as ask_jev
     from llm_judge import ask as ask_llm_judge, select_best, validate_answers
+    from providers import JEV_FRACTIONAL_SCORE
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
@@ -79,7 +81,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         else:
             first = jev(dict(JUDGE_QUESTIONS))
             first["answers"] = validate_answers(first.get("answers"), JUDGE_QUESTIONS,
-                                                allow_fractional_score=jev_provider == "openai_decisions")
+                                                allow_fractional_score=jev_provider in JEV_FRACTIONAL_SCORE)
             judge_backend = "jev"
         answers = first["answers"]
         _add_usage(usage, first.get("usage"))
@@ -160,7 +162,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             else:
                 ranked = jev(rank_question)
                 ranked["answers"] = validate_answers(ranked.get("answers"), rank_question,
-                                                     allow_fractional_score=jev_provider == "openai_decisions")
+                                                     allow_fractional_score=jev_provider in JEV_FRACTIONAL_SCORE)
                 ranking_backend = "jev"
         except JevError as error:
             log_event("ranking.failed", level="warning", exc_info=True,

@@ -292,5 +292,221 @@ class DecisionsTests(unittest.TestCase):
         self.assertNotIn("unsaved-model-key", str(caught.exception))
 
 
+class LayaTests(unittest.TestCase):
+    def setUp(self):
+        self.state = build_state([("her", "你好")], "friends")
+        self.questions = {name: JUDGE_QUESTIONS[name] for name in
+                          ("literal_question", "true_intent", "danger_level")}
+        self.requests = []
+        self.sleeps = []
+        for target in (patch.dict(jev_client.os.environ, {"JEV_API_KEY": "official-secret",
+                                                       "LAYA_API_KEY": ""}),
+                       patch.object(retry.time, "sleep", side_effect=self.sleeps.append),
+                       patch.object(retry.random, "random", return_value=0.0)):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def _response(self, questions, choices=None):
+        answers = {}
+        for name, question in questions.items():
+            kind = question["type"]
+            answer = {"type": kind}
+            if kind == "noul":
+                answer["noul"] = 0.8
+            elif kind == "score":
+                answer.update(score=1.1, confidence=0.55, x_jev_confidence=0.65,
+                              probabilities={"0": 0.1, "1": 0.7, "2": 0.2})
+            else:
+                choice = (choices or {}).get(name, "reply_b" if name == "best_reply"
+                                             else next(iter(question["criteria"])))
+                answer.update(choice=choice, confidence=0.8, probabilities={choice: 0.8})
+            answers[name] = answer
+        return {"answers": answers, "usage": {"input_tokens": 10, "output_tokens": 0}}
+
+    def _transport(self, handler=None):
+        import io
+
+        def send(request, timeout):
+            self.requests.append((request, timeout))
+            result = handler(request) if handler else self._response(self.questions)
+            return io.BytesIO(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+        opener = unittest.mock.Mock()
+        opener.open.side_effect = send
+        return patch.object(jev_client.urllib.request, "build_opener", return_value=opener)
+
+    def _ask(self, **kwargs):
+        return jev_client.ask(self.state, self.questions, provider="laya", **kwargs)
+
+    def test_local_endpoint_uses_jev_payload_optional_key_and_fractional_scores(self):
+        before = copy.deepcopy(self.questions)
+        with self._transport() as factory:
+            result = self._ask(base_url="http://127.0.0.1:18001/", timeout=17)
+        request, timeout = self.requests[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:18001/v1/systemone")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual(json.loads(request.data), {"model": "multilingual", "state": self.state,
+                                                  "questions": self.questions})
+        self.assertEqual(self.questions, before)
+        self.assertEqual(timeout, 17)
+        self.assertEqual(result["answers"]["danger_level"]["score"], 1.1)
+        self.assertEqual(result["answers"]["danger_level"]["confidence"], 0.65)
+        self.assertEqual(result["usage"]["input_tokens"], 10)
+        self.assertTrue(any(isinstance(arg, jev_client.urllib.request.ProxyHandler) and arg.proxies == {}
+                            for arg in factory.call_args.args))
+
+    def test_default_endpoint_and_separate_saved_or_explicit_bearer_key(self):
+        with self._transport(), patch.object(jev_client, "_api_key", side_effect=AssertionError("official key")):
+            self._ask()
+            with patch.dict(jev_client.os.environ, {"LAYA_API_KEY": "local-secret"}):
+                self._ask()
+                self._ask(api_key="typed-local-secret", model="english")
+        self.assertEqual(self.requests[0][0].full_url, "http://127.0.0.1:8000/v1/systemone")
+        self.assertIsNone(self.requests[0][0].get_header("Authorization"))
+        self.assertEqual(self.requests[1][0].get_header("Authorization"), "Bearer local-secret")
+        self.assertEqual(self.requests[2][0].get_header("Authorization"), "Bearer typed-local-secret")
+        self.assertEqual(json.loads(self.requests[2][0].data)["model"], "english")
+        self.assertEqual(jev_client.os.environ["JEV_API_KEY"], "official-secret")
+
+    def test_models_are_local_presets_without_network_or_official_authentication(self):
+        with patch.object(jev_client.urllib.request, "build_opener") as network, \
+                patch.object(jev_client, "_check_openrouter_key") as auth:
+            self.assertEqual(jev_client.list_models("laya", ""),
+                             ["multilingual", "english", "typed-decisions"])
+        network.assert_not_called()
+        auth.assert_not_called()
+
+    def test_endpoint_normalization_and_invalid_addresses(self):
+        for suffix in ("", "/", "/v1", "/v1/", "/v1/systemone", "/v1/systemone/"):
+            with self.subTest(suffix=suffix), self._transport():
+                self._ask(base_url="http://127.0.0.1:18001/laya" + suffix)
+                self.assertEqual(self.requests[-1][0].full_url, "http://127.0.0.1:18001/laya/v1/systemone")
+        for address in ("127.0.0.1:8000", "ftp://localhost", "http://localhost:0", "http://localhost:65536",
+                        "http://localhost:bad", "http://user:secret@localhost", "http://localhost?secret=key"):
+            with self.subTest(address=address), self._transport(), self.assertRaises(JevError) as caught:
+                self._ask(base_url=address)
+            self.assertEqual(caught.exception.status, 422)
+            self.assertNotIn(address, str(caught.exception))
+
+    def test_authentication_and_redirect_errors_do_not_retry_or_echo_context(self):
+        import io
+
+        for status in (401, 403, 307, 422):
+            error = jev_client.urllib.error.HTTPError("http://localhost", status, "private context local-secret",
+                                                    {}, io.BytesIO(b"private context local-secret"))
+            with self.subTest(status=status), self._transport(lambda request: (_ for _ in ()).throw(error)), \
+                    self.assertRaises(JevError) as caught:
+                self._ask(api_key="local-secret")
+            self.assertEqual(caught.exception.status, status)
+            self.assertNotIn("private context", str(caught.exception))
+            self.assertNotIn("local-secret", str(caught.exception))
+        self.assertEqual(len(self.requests), 4)
+        self.assertEqual(self.sleeps, [])
+        with self._transport() as factory:
+            self._ask()
+        redirect = next(arg for arg in factory.call_args.args if isinstance(arg, jev_client._LayaNoRedirect))
+        self.assertIsNone(redirect.redirect_request(None, None, 307, "", {}, "http://other-host"))
+
+    def test_http_retry_after_and_connection_failure_use_shared_retry(self):
+        attempts = 0
+
+        def handler(request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise jev_client.urllib.error.HTTPError(request.full_url, 503, "busy", {"Retry-After": "7"}, None)
+            return self._response(self.questions)
+
+        with self._transport(handler):
+            self._ask(max_retries=1)
+        self.assertEqual(attempts, 2)
+        self.assertAlmostEqual(sum(self.sleeps), 7)
+        self.requests.clear()
+        error = jev_client.urllib.error.URLError("private connection error")
+        with self._transport(lambda request: (_ for _ in ()).throw(error)), self.assertRaises(JevError) as caught:
+            self._ask(max_retries=1)
+        self.assertEqual(len(self.requests), 2)
+        self.assertTrue(caught.exception.retryable)
+        self.assertNotIn("private connection error", str(caught.exception))
+
+    def test_invalid_json_and_answers_fail_without_retry(self):
+        invalid = [None, [], {}, {"answers": {}}, self._response(self.questions)]
+        invalid[-1]["answers"]["danger_level"]["score"] = float("nan")
+        for response in invalid:
+            with self.subTest(response=response), self._transport(lambda request: response), self.assertRaises(JevError):
+                self._ask()
+        with self._transport() as factory:
+            import io
+
+            factory.return_value.open.side_effect = None
+            factory.return_value.open.return_value = io.BytesIO(b"not JSON private context")
+            with self.assertRaises(JevError) as caught:
+                self._ask()
+        self.assertNotIn("private context", str(caught.exception))
+        self.assertEqual(self.sleeps, [])
+
+    def test_local_failure_retains_existing_fallback_and_configuration_errors_stop_it(self):
+        judgment = self._response(JUDGE_QUESTIONS)
+        judgment["answers"]["danger_level"]["score"] = 1
+        ranking = {"answers": {"best_reply": {"type": "choice", "choice": "reply_b"}}}
+        error = jev_client.urllib.error.URLError("offline")
+        with self._transport(lambda request: (_ for _ in ()).throw(error)), \
+                patch.object(engine, "ask_llm_judge", side_effect=[judgment, ranking]) as generic, \
+                patch.object(engine, "draft_candidates", return_value=["候选甲", "候选乙"]):
+            result = engine.analyze([("her", "你好")], "friends", jev_provider="laya",
+                                    judge_mode="jev_fallback", llm_judge_api_key="generic-key")
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["judge_backend"], "llm")
+        self.assertEqual(result["ranking_backend"], "llm")
+        self.assertEqual(result["best_index"], 1)
+        generic.assert_any_call(unittest.mock.ANY, unittest.mock.ANY, timeout=30, provider="deepseek",
+                                model=None, base_url=None, api_key="generic-key")
+        with patch.object(engine, "ask_llm_judge") as generic, patch.object(engine, "draft_candidates") as draft, \
+                self.assertRaises(JevError):
+            engine.analyze([("her", "你好")], "friends", jev_provider="laya", jev_base_url="invalid")
+        generic.assert_not_called()
+        draft.assert_not_called()
+
+    def test_local_only_failure_does_not_call_remote_judge(self):
+        error = TimeoutError("private timeout")
+        with self._transport(lambda request: (_ for _ in ()).throw(error)), \
+                patch.object(engine, "ask_llm_judge") as generic, patch.object(engine, "select_best") as selector, \
+                patch.object(engine, "draft_candidates", return_value=["候选甲", "候选乙"]):
+            result = engine.analyze([("her", "你好")], "friends", jev_provider="laya", judge_mode="jev_only")
+        self.assertEqual(len(self.requests), 6)
+        self.assertFalse(result["ranking_valid"])
+        self.assertFalse(result["fallback_used"])
+        generic.assert_not_called()
+        selector.assert_not_called()
+
+    def test_local_close_topic_does_not_draft_or_rank(self):
+        def handler(request):
+            return self._response(json.loads(request.data)["questions"], {
+                "true_intent": "close_topic", "she_needs": "nothing", "reply_decision": "no_reply"})
+
+        with self._transport(handler), patch.object(engine, "draft_candidates") as draft:
+            result = engine.analyze([("her", "谢谢，再见")], "friends", jev_provider="laya", judge_mode="jev_only")
+        self.assertFalse(result["reply_required"])
+        self.assertEqual(len(self.requests), 1)
+        draft.assert_not_called()
+
+    def test_engine_local_judgment_and_ranking_preserve_probabilities(self):
+        def handler(request):
+            return self._response(json.loads(request.data)["questions"])
+
+        with self._transport(handler), patch.object(engine, "draft_candidates", return_value=["候选甲", "候选乙"]), \
+                patch.object(engine, "ask_llm_judge") as generic:
+            result = engine.analyze([("her", "你好")], "friends", jev_provider="laya",
+                                    jev_base_url="http://127.0.0.1:18001", judge_mode="jev_only")
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(result["answers"]["danger_level"]["score"], 1.1)
+        self.assertEqual(result["best_index"], 1)
+        self.assertEqual(result["scores"], [0, 0.8, 0])
+        self.assertTrue(result["ranking_valid"])
+        self.assertEqual(result["usage"]["input_tokens"], 20)
+        generic.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,16 +14,17 @@ import os
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from email.utils import parsedate_to_datetime
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
-    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
+    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LAYA_ENV, LAYA_MODELS, LEGACY,
                             OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
     from .retry import MAX_RETRIES, call_with_retry
 except ImportError:
-    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
+    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LAYA_ENV, LAYA_MODELS, LEGACY,
                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
     from retry import MAX_RETRIES, call_with_retry
 
@@ -147,6 +148,11 @@ def ask(state: dict, questions: dict, timeout: float = 20,
     max_retries 是这次调用的重试上限；api_key 可用于验证未保存的密钥，不修改环境变量。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
+    if provider == "laya":
+        key = api_key.strip() or (os.environ.get(LAYA_ENV) or "").strip()
+        return call_with_retry(
+            lambda: _ask_laya(state, questions, key, model or spec.default, timeout, base_url or spec.base),
+            what="Laya 判断", max_retries=max_retries)
     key = api_key.strip() or _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     model = model or spec.default
     if provider == "openai_decisions":
@@ -156,6 +162,59 @@ def ask(state: dict, questions: dict, timeout: float = 20,
     send = _ask_typesafe if provider == "typesafe" else _ask_openrouter
     return call_with_retry(lambda: send(state, questions, key, model, timeout),
                            what="Jev 判断", max_retries=max_retries)
+
+
+class _LayaNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _ask_laya(state: dict, questions: dict, key: str, model: str, timeout: float, base_url: str) -> dict:
+    """本地服务沿用 Jev 协议；绕过系统代理并拒绝重定向，避免聊天内容或密钥被转发。"""
+    try:
+        base = urllib.parse.urlsplit(base_url.strip())
+        port = base.port
+        if (base.scheme not in ("http", "https") or not base.hostname or port == 0
+                or base.username is not None or base.password is not None or base.query or base.fragment):
+            raise ValueError
+    except ValueError:
+        raise JevError("Laya 服务地址无效，请填写 http(s)://主机:端口，不包含密钥、查询参数或片段", 422) from None
+    path = base.path.rstrip("/").removesuffix("/v1/systemone").removesuffix("/v1")
+    url = urllib.parse.urlunsplit((base.scheme, base.netloc, path + "/v1/systemone", "", ""))
+    payload = json.dumps({"model": model, "state": state, "questions": questions},
+                         ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8", "Accept": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LayaNoRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        _fail(exc, "Laya 判断", api_key=key, include_detail=False)
+    except (TimeoutError, socket.timeout):
+        raise JevError(f"Laya 请求超时（{timeout}s），请检查模型是否加载完成", retryable=True) from None
+    except (urllib.error.URLError, ConnectionError):
+        raise JevError("Laya 连接失败，请检查服务地址和服务是否启动", retryable=True) from None
+    try:
+        result = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        raise JevError("Laya 返回的响应不是有效 JSON") from None
+    if not isinstance(result, dict):
+        raise JevError("Laya 返回的响应不是对象")
+    try:
+        from .llm_judge import validate_answers
+    except ImportError:
+        from llm_judge import validate_answers
+    answers = result.get("answers")
+    if isinstance(answers, dict):
+        # 保留 Jev 的置信度语义；Laya score 是概率加权期望，不强制转换为整数。
+        answers = {name: {**answer, "confidence": answer["x_jev_confidence"]}
+                   if isinstance(answer, dict) and "x_jev_confidence" in answer else answer
+                   for name, answer in answers.items()}
+    return {"answers": validate_answers(answers, questions, allow_fractional_score=True),
+            "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {}}
 
 
 def _decision_questions(questions: dict) -> list[dict]:
@@ -327,6 +386,8 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
 def list_models(provider: str, key: str, timeout: float = 10,
                 base_url: str | None = None) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+    if provider == "laya":
+        return list(LAYA_MODELS)  # Laya 没有标准模型列表接口，预设不代表服务已连接。
     if provider == "openai_decisions":
         import openai
 

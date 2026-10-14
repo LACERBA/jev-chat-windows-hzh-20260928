@@ -794,7 +794,12 @@ class Overlay:
                        "draft": settings.llm_key, "vision": settings.vision_key}
         group = SimpleNamespace(kind=kind, table=table, ids=list(table),
                                 keyTitle=key_titles[kind], stored_key=stored_keys[kind],
-                                widgets=[])
+                                widgets=[], keyProvider=None, baseProvider=None, baseUrls={})
+        if kind == "jev":
+            group.stored_key = lambda: (settings.laya_key() if self._provider_of(group) == "laya"
+                                        else settings.jev_key())
+            group.baseUrls = {provider: settings.jev_base_url(provider) or table[provider].base
+                              for provider in providers.JEV_CUSTOM}
         heading = QHBoxLayout()
         heading.addWidget(_label(title, 14, "#304c3c", True), 1)
         group.keyState = _label("", 12, _GREEN)
@@ -817,6 +822,7 @@ class Overlay:
         group.baseLabel.setBuddy(group.baseEdit)
         box.addWidget(group.baseEdit)
         key_label = _label("密钥", 13)
+        group.keyLabel = key_label
         box.addWidget(key_label)
         group.keyEdit = PasswordLineEdit()
         group.keyEdit.setAccessibleName(f"{title} API 密钥")
@@ -824,7 +830,8 @@ class Overlay:
         group.keyEdit.returnPressed.connect(self._save)
         box.addWidget(group.keyEdit)
         box.addWidget(self._hint(
-            "按来源填写 OpenRouter、TypeSafe 或 Decisions 服务的 key；密钥只存系统环境变量。" if kind == "jev"
+            "本地 Laya 需独立启动 HTTP 服务；未启用鉴权可不填 key，模型预设不代表连接成功。"
+            "密钥只存系统环境变量，本地与官方密钥独立。" if kind == "jev"
             else "上面选哪家就填哪家的 key；换来源重填一次，只存对应密钥。"))
         model_label = _label("模型", 13)
         box.addWidget(model_label)
@@ -860,9 +867,19 @@ class Overlay:
         stored = {"jev": settings.jev_model, "judge": settings.judge_model,
                   "draft": settings.draft_model, "vision": settings.vision_model}[group.kind]()
         group.modelBox.clear()
-        group.modelBox.setText(stored if provider == saved else group.table[provider].default)
-        if group.kind == "jev" and provider == "openai_decisions" and not group.baseEdit.text().strip():
-            group.baseEdit.setText(settings.jev_base_url() or group.table[provider].base)
+        if group.kind == "jev" and provider == "laya":
+            stored = settings.jev_model(provider)
+        group.modelBox.setText(stored if provider == saved or provider == "laya" else group.table[provider].default)
+        if group.kind == "jev":
+            # 切换到本地服务时清掉未保存的官方密钥，地址分别保留在各自来源下。
+            if (provider == "laya") != (group.keyProvider == "laya"):
+                group.keyEdit.clear()
+            group.keyProvider = provider
+            if provider in providers.JEV_CUSTOM:
+                if group.baseProvider in providers.JEV_CUSTOM:
+                    group.baseUrls[group.baseProvider] = group.baseEdit.text()
+                group.baseProvider = provider
+                group.baseEdit.setText(group.baseUrls[provider])
         group.status.setText("")
         self._sync_model_fields()
 
@@ -880,12 +897,15 @@ class Overlay:
             provider = self._provider_of(group)
             name = group.table[provider].name
             configured = bool(group.stored_key())
+            local = group.kind == "jev" and provider == "laya"
+            group.keyLabel.setText("密钥（可选）" if local else "密钥")
+            group.fetchButton.setText("模型预设" if local else "获取模型")
             if group.kind == "judge" and mode != "jev_only" and reuse:
                 group.keyState.setText("复用起草配置")
             else:
-                group.keyState.setText("已配置" if configured else "未配置")
+                group.keyState.setText("已配置" if configured else "可不配置" if local else "未配置")
             group.keyEdit.setPlaceholderText(
-                "已配置，留空保留" if configured else f"输入 {name} API 密钥")
+                "已配置，留空保留" if configured else "未启用鉴权可留空" if local else f"输入 {name} API 密钥")
             for widget in group.widgets:
                 widget.setEnabled(active[group.kind])
             if self._compact:
@@ -893,7 +913,11 @@ class Overlay:
             group.providerBox.setText(name)
             if group.baseLabel:
                 custom = active[group.kind] and (provider in providers.CUSTOM
-                                                  or group.kind == "jev" and provider == "openai_decisions")
+                                                  or group.kind == "jev" and provider in providers.JEV_CUSTOM)
+                if group.kind == "jev":
+                    group.baseLabel.setText("服务地址（不含 /v1/systemone）" if local
+                                            else "Base URL（留空使用 OpenAI 官方）")
+                    group.baseEdit.setPlaceholderText("http://127.0.0.1:8000" if local else "https://你的服务/v1")
                 group.baseLabel.setVisible(custom)
                 group.baseEdit.setVisible(custom)
 
@@ -901,8 +925,11 @@ class Overlay:
         """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
         provider = self._provider_of(group)
         custom = provider in providers.CUSTOM
-        base = group.baseEdit.text().strip() if custom or provider == "openai_decisions" else None
+        base = group.baseEdit.text().strip() if custom or provider in providers.JEV_CUSTOM else None
         key = group.keyEdit.text().strip() or group.stored_key()
+        if group.kind == "jev" and provider == "laya":
+            self._models_fetched(group, jev_client.list_models(provider, key, base_url=base), "")
+            return
         if not key:
             group.status.setText("先填密钥")
             return
@@ -937,14 +964,18 @@ class Overlay:
     def _jev_test_config(self):
         provider = self._provider_of(self.jev)
         return {"provider": provider, "model": self.jev.modelBox.text().strip(),
-                "base_url": self.jev.baseEdit.text().strip() if provider == "openai_decisions" else "",
+                "base_url": self.jev.baseEdit.text().strip() if provider in providers.JEV_CUSTOM else "",
                 "api_key": self.jev.keyEdit.text().strip() or self.jev.stored_key()}
 
     def _test_jev(self):
         if self._jev_testing or not self.jevTestButton.isEnabled():
             return
         config = self._jev_test_config()
-        if not config["api_key"]:
+        if config["provider"] == "laya" and not config["base_url"]:
+            self.jev.status.setText("先填 Laya 服务地址")
+            self.jev.baseEdit.setFocus()
+            return
+        if config["provider"] != "laya" and not config["api_key"]:
             self.jev.status.setText("先填密钥")
             self.jev.keyEdit.setFocus()
             return
@@ -968,7 +999,7 @@ class Overlay:
                                     base_url=config["base_url"] or None, api_key=config["api_key"],
                                     timeout=20, max_retries=1)
             answers = validate_answers(result.get("answers"), questions,
-                                       allow_fractional_score=config["provider"] == "openai_decisions")
+                                       allow_fractional_score=config["provider"] in providers.JEV_FRACTIONAL_SCORE)
             message = (f"判断接口已通过验证：字面概率 {answers['literal_question']['noul']:.0%}，"
                        f"意图 {_choice(answers, 'true_intent')}，紧张度 {answers['danger_level']['score']:g}/9")
             log_event("settings.jev_test_completed", provider=config["provider"], model=config["model"])
@@ -1028,7 +1059,8 @@ class Overlay:
             group.modelBox.setCurrentIndex(models.index(current))
         else:
             group.modelBox.setText(current)  # 手打的没在列表里也不清掉
-        group.status.setText(f"共 {len(models)} 个")
+        local = group.kind == "jev" and self._provider_of(group) == "laya"
+        group.status.setText("内置模型预设；请点击测试判断接口验证服务" if local else f"共 {len(models)} 个")
 
     def _set_group(self, group, provider, model):
         """把存下来的来源和模型放回一组控件里；填充不算用户操作，别触发换来源的重置。"""
@@ -1036,6 +1068,7 @@ class Overlay:
         group.providerBox.setCurrentIndex(group.ids.index(provider))
         group.providerBox.blockSignals(False)
         group.keyEdit.clear()
+        group.keyProvider = provider
         group.modelBox.clear()
         group.modelBox.setText(model)
         group.status.setText("")
@@ -1055,6 +1088,9 @@ class Overlay:
                                                    if value == mode))
         self.judgeReuseSwitch.setChecked(settings.judge_reuse_draft())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
+        self.jev.baseUrls = {provider: settings.jev_base_url(provider) or self.jev.table[provider].base
+                             for provider in providers.JEV_CUSTOM}
+        self.jev.baseProvider = settings.jev_provider() if settings.jev_provider() in providers.JEV_CUSTOM else None
         self.jev.baseEdit.setText(settings.jev_base_url())
         self._set_group(self.judge, settings.judge_provider(), settings.judge_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
@@ -1113,7 +1149,12 @@ class Overlay:
                 self._settings_feedback(f"{group.keyTitle}的自定义来源要填 Base URL。", error=True)
                 group.baseEdit.setFocus()
                 return
-            if not group.keyEdit.text().strip() and not group.stored_key():
+            local = group.kind == "jev" and provider == "laya"
+            if local and not group.baseEdit.text().strip():
+                self._settings_feedback("请先填写 Laya 服务地址。", error=True)
+                group.baseEdit.setFocus()
+                return
+            if not local and not group.keyEdit.text().strip() and not group.stored_key():
                 self._settings_feedback(f"请先填写 {group.keyTitle} 的 API 密钥。", error=True)
                 group.keyEdit.setFocus()
                 return

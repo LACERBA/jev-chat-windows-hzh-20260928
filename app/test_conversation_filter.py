@@ -1308,6 +1308,7 @@ class OverlayFilterTests(unittest.TestCase):
                             ("has_key", lambda: True), ("models_ready", lambda: True),
                             ("has_jev_key", lambda: True), ("has_judge_key", lambda: True),
                             ("has_llm_key", lambda: True), ("jev_key", lambda: "demo-key"),
+                            ("laya_key", lambda: ""),
                             ("judge_key", lambda: "demo-key"), ("llm_key", lambda: "demo-key")):
             target = patch.object(settings, name, value)
             target.start()
@@ -1318,6 +1319,85 @@ class OverlayFilterTests(unittest.TestCase):
         with patch.object(QWidget, "show"):
             self.overlay = Overlay(on_fill=Mock())
         self.addCleanup(self.overlay.win.close)
+
+    def test_laya_controls_save_load_and_test_without_key(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.keyEdit.setText("unsaved-official-key")
+        group.providerBox.setCurrentIndex(group.ids.index("laya"))
+        self.assertEqual(group.keyEdit.text(), "")
+        self.assertEqual(group.stored_key(), "")
+        self.assertFalse(group.baseEdit.isHidden())
+        self.assertEqual(group.baseEdit.text(), "http://127.0.0.1:8000")
+        self.assertEqual(group.modelBox.text(), "multilingual")
+        self.assertEqual(group.keyLabel.text(), "密钥（可选）")
+        self.assertEqual(group.fetchButton.text(), "模型预设")
+        group.baseEdit.setText("http://127.0.0.1:18001")
+        with patch.object(settings, "save", side_effect=lambda *args, **kwargs: self.config.update(
+                jev_provider=kwargs["jev_provider_text"], laya_model=kwargs["jev_model_text"],
+                laya_base_url=kwargs["jev_base_url_text"])) as save:
+            self.overlay._save()
+        self.assertEqual(save.call_args.kwargs["jev_provider_text"], "laya")
+        self.assertEqual(save.call_args.kwargs["jev_base_url_text"], "http://127.0.0.1:18001")
+        self.assertIsNone(save.call_args.kwargs["jev_key_text"])
+        with patch.object(overlay.threading, "Thread") as thread:
+            self.overlay._test_jev()
+            config = thread.call_args.kwargs["args"][0]
+        self.assertEqual(config["api_key"], "")
+        self.assertEqual(config["base_url"], "http://127.0.0.1:18001")
+        with patch.object(overlay.jev_client, "ask", return_value=self._jev_test_result()) as ask:
+            self.overlay._test_jev_bg(config)
+        self.assertEqual(ask.call_args.kwargs["provider"], "laya")
+        self.assertIn("已通过验证", group.status.text())
+        self.assertIn("1.1/9", group.status.text())
+        self.config.update(jev_provider="laya", laya_base_url="http://127.0.0.1:18001", laya_model="english")
+        self.overlay._load_settings()
+        self.assertEqual(group.baseEdit.text(), "http://127.0.0.1:18001")
+        self.assertEqual(group.modelBox.text(), "english")
+
+    def test_laya_switch_preserves_separate_addresses_and_clears_unsaved_keys(self):
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        group.baseEdit.setText("https://quick-pivot.com/v1")
+        group.keyEdit.setText("official-key")
+        group.providerBox.setCurrentIndex(group.ids.index("laya"))
+        group.baseEdit.setText("http://127.0.0.1:18001")
+        group.keyEdit.setText("local-key")
+        group.providerBox.setCurrentIndex(group.ids.index("openai_decisions"))
+        self.assertEqual(group.baseEdit.text(), "https://quick-pivot.com/v1")
+        self.assertEqual(group.keyEdit.text(), "")
+        self.assertEqual(group.stored_key(), "demo-key")
+        group.providerBox.setCurrentIndex(group.ids.index("laya"))
+        self.assertEqual(group.baseEdit.text(), "http://127.0.0.1:18001")
+        self.assertEqual(group.stored_key(), "")
+
+    def test_laya_presets_are_offline_and_do_not_report_connection_success(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("laya"))
+        with patch.object(overlay.threading, "Thread") as thread, \
+                patch.object(overlay.jev_client, "_check_openrouter_key") as auth:
+            self.overlay._fetch_models(group)
+        thread.assert_not_called()
+        auth.assert_not_called()
+        self.assertEqual(group.modelBox.count(), 3)
+        self.assertIn("内置模型预设", group.status.text())
+        self.assertNotIn("已通过验证", group.status.text())
+
+    def test_laya_requires_address_for_saving_and_testing(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        group.providerBox.setCurrentIndex(group.ids.index("laya"))
+        group.baseEdit.clear()
+        with patch.object(settings, "save") as save, patch.object(overlay.threading, "Thread") as thread:
+            self.overlay._save()
+            self.overlay._test_jev()
+        save.assert_not_called()
+        thread.assert_not_called()
+        self.assertIn("Laya 服务地址", group.status.text())
 
     def test_decisions_controls_switch_load_and_save_custom_configuration(self):
         group = self.overlay.jev

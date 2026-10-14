@@ -102,6 +102,58 @@ class ModelSettingsTests(unittest.TestCase):
             settings.save(jev_base_url_text="")
             self.assertEqual(dump.call_args.args[0]["jev_base_url"], "")
 
+    def test_laya_defaults_and_readiness_do_not_require_official_key(self):
+        config = self._config(jev_provider="laya", judge_mode="jev_only")
+        keys = {LLM_ENV: "draft-key"}
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", side_effect=lambda name: keys.get(name, "")):
+            self.assertEqual(settings.jev_provider(), "laya")
+            self.assertEqual(settings.jev_model(), "multilingual")
+            self.assertEqual(settings.jev_base_url(), "http://127.0.0.1:8000")
+            self.assertTrue(settings.models_ready())
+            config.update(laya_model="english", laya_base_url=" http://127.0.0.1:18001 ")
+            self.assertEqual(settings.jev_model(), "english")
+            self.assertEqual(settings.jev_base_url(), "http://127.0.0.1:18001")
+            keys[LLM_ENV] = ""
+            self.assertFalse(settings.models_ready())
+
+    def test_laya_save_preserves_remote_configuration_and_separates_secrets(self):
+        config = self._config(jev_provider="openai_decisions", jev_model="remote-model",
+                              jev_base_url="https://quick-pivot.com/v1")
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch.object(settings, "_set_key") as set_key, \
+                patch.object(settings, "_notify_env"), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(jev_provider_text="laya", jev_model_text="multilingual",
+                          jev_base_url_text=" http://127.0.0.1:18001 ", jev_key_text="local-secret")
+        data = dump.call_args.args[0]
+        self.assertEqual(data["jev_provider"], "laya")
+        self.assertEqual(data["laya_model"], "multilingual")
+        self.assertEqual(data["laya_base_url"], "http://127.0.0.1:18001")
+        self.assertEqual(data["jev_model"], "remote-model")
+        self.assertEqual(data["jev_base_url"], "https://quick-pivot.com/v1")
+        self.assertNotIn("local-secret", str(data))
+        set_key.assert_any_call("LAYA_API_KEY", "local-secret")
+        self.assertNotIn(unittest.mock.call(JEV_ENV, "local-secret"), set_key.call_args_list)
+
+    def test_remote_save_and_unrelated_save_preserve_local_configuration(self):
+        config = self._config(laya_model="multilingual", laya_base_url="http://127.0.0.1:18001")
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(jev_provider_text="openai_decisions", jev_model_text="remote-model",
+                          jev_base_url_text="https://quick-pivot.com/v1")
+            self.assertEqual(dump.call_args.args[0]["laya_model"], "multilingual")
+            self.assertEqual(dump.call_args.args[0]["laya_base_url"], "http://127.0.0.1:18001")
+            settings.save(logging_level_text="DEBUG")
+            self.assertEqual(dump.call_args.args[0]["laya_base_url"], "http://127.0.0.1:18001")
+
+    def test_local_key_does_not_fall_back_to_official_and_is_redacted(self):
+        with patch.object(settings, "_read_env", side_effect=lambda name: "official-secret" if name == JEV_ENV else ""):
+            self.assertEqual(settings.laya_key(), "")
+        with patch.dict(jev_client.os.environ, {"LAYA_API_KEY": "local-secret"}):
+            self.assertEqual(jev_client.redact_secrets("key=local-secret"), "key=[REDACTED]")
+
     def test_logging_defaults_and_invalid_values(self):
         with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
             self.assertTrue(settings.logging_enabled())
