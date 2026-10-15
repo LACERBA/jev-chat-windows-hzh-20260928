@@ -10,14 +10,14 @@ try:
     from .diagnostics import log_event, log_step
     from .jev_client import JevError, ask as ask_jev
     from .llm_judge import ask as ask_llm_judge, select_best, validate_answers
-    from .providers import JEV_FRACTIONAL_SCORE
+    from .providers import JEV_FRACTIONAL_SCORE, LAYA_TIMEOUT_DEFAULT, normalize_laya_timeout
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
     from draft import draft_candidates
     from diagnostics import log_event, log_step
     from jev_client import JevError, ask as ask_jev
     from llm_judge import ask as ask_llm_judge, select_best, validate_answers
-    from providers import JEV_FRACTIONAL_SCORE
+    from providers import JEV_FRACTIONAL_SCORE, LAYA_TIMEOUT_DEFAULT, normalize_laya_timeout
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
@@ -43,7 +43,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             jev_model: str | None = None, judge_mode: str = "jev_fallback",
             llm_judge_provider: str = "deepseek", llm_judge_model: str | None = None,
             llm_judge_base_url: str | None = None, llm_judge_api_key: str = "",
-            jev_base_url: str | None = None) -> dict:
+            jev_base_url: str | None = None, laya_timeout: float = LAYA_TIMEOUT_DEFAULT) -> dict:
     """按配置用 Jev 或普通模型判断，再起草候选并完成有效排序。"""
     state = build_state(messages, relationship, keep=context, reply_to=reply_to)
     usage: dict = {}
@@ -62,8 +62,9 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 
     def jev(questions):
         step = "ranking.jev" if "best_reply" in questions else "judgment.jev"
-        with log_step(step, provider=jev_provider, model=jev_model, timeout=timeout):
-            return ask_jev(state, questions, timeout=timeout, provider=jev_provider, model=jev_model,
+        request_timeout = normalize_laya_timeout(laya_timeout) if jev_provider == "laya" else timeout
+        with log_step(step, provider=jev_provider, model=jev_model, timeout=request_timeout):
+            return ask_jev(state, questions, timeout=request_timeout, provider=jev_provider, model=jev_model,
                            base_url=jev_base_url,
                            max_retries=1 if judge_mode == "jev_fallback" else None)  # 有兜底模型时 Jev 快速失败，否则用统一的 5 次
 

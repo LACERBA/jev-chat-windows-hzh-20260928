@@ -31,6 +31,19 @@ LAYA_ENV = "LAYA_API_KEY"
 LAYA_MODELS = ("multilingual", "english", "typed-decisions")
 JEV_CUSTOM = ("openai_decisions", "laya")
 JEV_FRACTIONAL_SCORE = ("openai_decisions", "laya")
+LAYA_TIMEOUT_DEFAULT = 120
+LAYA_TIMEOUT_MIN = 60
+LAYA_TIMEOUT_MAX = 120
+
+
+def normalize_laya_timeout(value: object = None) -> int:
+    """本地推理超时统一限制为 60–120 秒，无效配置回退到 120 秒。"""
+    try:
+        seconds = LAYA_TIMEOUT_DEFAULT if isinstance(value, bool) else int(value)
+    except (TypeError, ValueError, OverflowError):
+        return LAYA_TIMEOUT_DEFAULT
+    return max(LAYA_TIMEOUT_MIN, min(LAYA_TIMEOUT_MAX, seconds))
+
 
 _Jev = namedtuple("_Jev", "name default base", defaults=("",))
 JEV_PROVIDERS = {

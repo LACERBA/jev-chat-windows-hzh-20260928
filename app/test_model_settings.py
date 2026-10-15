@@ -154,6 +154,27 @@ class ModelSettingsTests(unittest.TestCase):
         with patch.dict(jev_client.os.environ, {"LAYA_API_KEY": "local-secret"}):
             self.assertEqual(jev_client.redact_secrets("key=local-secret"), "key=[REDACTED]")
 
+    def test_laya_timeout_defaults_bounds_and_invalid_values(self):
+        for value, expected in ((None, 120), (60, 60), (90, 90), (120, 120), (30, 60),
+                                (300, 120), ("75", 75), ("invalid", 120), (True, 120),
+                                (float("nan"), 120), (float("inf"), 120)):
+            config = self._config(laya_timeout_seconds=value)
+            with self.subTest(value=value), patch.object(settings, "_read", side_effect=lambda name, default=None:
+                                                         config.get(name, default)):
+                self.assertEqual(settings.laya_timeout(), expected)
+
+    def test_laya_timeout_save_and_unrelated_changes_preserve_it(self):
+        config = self._config(laya_timeout_seconds=90)
+        with patch.object(settings, "_read", side_effect=lambda name, default=None: config.get(name, default)), \
+                patch.object(settings, "_read_env", return_value=""), patch("builtins.open", mock_open()), \
+                patch.object(settings.json, "dump") as dump:
+            settings.save(jev_provider_text="laya", laya_timeout_seconds=75)
+            self.assertEqual(dump.call_args.args[0]["laya_timeout_seconds"], 75)
+            settings.save(logging_level_text="DEBUG")
+            self.assertEqual(dump.call_args.args[0]["laya_timeout_seconds"], 90)
+            settings.save(laya_timeout_seconds=10)
+            self.assertEqual(dump.call_args.args[0]["laya_timeout_seconds"], 60)
+
     def test_logging_defaults_and_invalid_values(self):
         with patch.object(settings, "_read", side_effect=lambda name, default=None: default):
             self.assertTrue(settings.logging_enabled())

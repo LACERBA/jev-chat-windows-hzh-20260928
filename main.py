@@ -991,6 +991,7 @@ def analyze_bg(msgs, title, revision, reply_to=None, message_id=None):
                                  jev_provider=settings.jev_provider(),
                                  jev_model=settings.jev_model() or None,
                                  jev_base_url=settings.jev_base_url() or None,
+                                 laya_timeout=settings.laya_timeout(),
                                  judge_mode=settings.judge_mode(),
                                  llm_judge_provider=judge["provider"],
                                  llm_judge_model=judge["model"] or None,

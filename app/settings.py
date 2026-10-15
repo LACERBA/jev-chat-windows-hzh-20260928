@@ -14,7 +14,8 @@ import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目�
 
 from core.diagnostics import LOG_LEVELS
 from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, JUDGE_ENV,
-                            LAYA_ENV, LEGACY, LLM_ENV, VISION_ENV, VISION_PROVIDERS)
+                            LAYA_ENV, LEGACY, LLM_ENV, VISION_ENV, VISION_PROVIDERS,
+                            normalize_laya_timeout)
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -69,6 +70,9 @@ def jev_base_url(provider: str | None = None) -> str:
     if provider == "laya":
         return str(_read("laya_base_url") or JEV_PROVIDERS[provider].base).strip()
     return str(_read("jev_base_url") or "").strip()
+
+def laya_timeout() -> int:
+    return normalize_laya_timeout(_read("laya_timeout_seconds"))
 
 def judge_mode() -> str:
     value = str(_read("judge_mode") or _DEFAULT_JUDGE_MODE)
@@ -323,7 +327,7 @@ has_key = models_ready
 def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
          jev_model_text: str | None = None, jev_base_url_text: str | None = None,
-         judge_mode_text: str | None = None,
+         laya_timeout_seconds: int | None = None, judge_mode_text: str | None = None,
          judge_reuse_draft_on: bool | None = None, judge_provider_text: str | None = None,
          judge_key_text: str | None = None, judge_model_text: str | None = None,
          judge_base_url_text: str | None = None, draft_provider_text: str | None = None,
@@ -372,6 +376,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "jev_base_url": keep(jev_base_url_text if jev != "laya" else None, "jev_base_url"),
         "laya_model": keep(jev_model_text if jev == "laya" else None, "laya_model"),
         "laya_base_url": keep(jev_base_url_text if jev == "laya" else None, "laya_base_url"),
+        "laya_timeout_seconds": (laya_timeout() if laya_timeout_seconds is None
+                                 else normalize_laya_timeout(laya_timeout_seconds)),
         "judge_mode": (judge_mode_text if judge_mode_text in _JUDGE_MODES else judge_mode()),
         "judge_reuse_draft": flag(judge_reuse_draft_on, judge_reuse_draft),
         "judge_provider": judge, "judge_model": keep(judge_model_text, "judge_model"),

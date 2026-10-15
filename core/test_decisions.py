@@ -349,12 +349,42 @@ class LayaTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data), {"model": "multilingual", "state": self.state,
                                                   "questions": self.questions})
         self.assertEqual(self.questions, before)
-        self.assertEqual(timeout, 17)
+        self.assertEqual(timeout, 60)
         self.assertEqual(result["answers"]["danger_level"]["score"], 1.1)
         self.assertEqual(result["answers"]["danger_level"]["confidence"], 0.65)
         self.assertEqual(result["usage"]["input_tokens"], 10)
         self.assertTrue(any(isinstance(arg, jev_client.urllib.request.ProxyHandler) and arg.proxies == {}
                             for arg in factory.call_args.args))
+
+    def test_local_timeout_defaults_and_bounds_apply_to_direct_requests(self):
+        for value, expected in ((None, 120), (60, 60), (90, 90), (120, 120), (15, 60), (300, 120)):
+            with self.subTest(value=value), self._transport():
+                self._ask(**({} if value is None else {"timeout": value}))
+            self.assertEqual(self.requests[-1][1], expected)
+
+    def test_local_engine_uses_independent_timeout_for_judgment_and_ranking(self):
+        def handler(request):
+            return self._response(json.loads(request.data)["questions"])
+
+        for seconds in (60, 90, 120):
+            self.requests.clear()
+            with self.subTest(seconds=seconds), self._transport(handler), \
+                    patch.object(engine, "draft_candidates", return_value=["候选甲", "候选乙"]) as draft:
+                result = engine.analyze([("her", "你好")], "friends", jev_provider="laya", judge_mode="jev_only",
+                                        timeout=25, laya_timeout=seconds)
+            self.assertTrue(result["ranking_valid"])
+            self.assertEqual([seconds_sent for _, seconds_sent in self.requests], [seconds, seconds])
+            self.assertEqual(draft.call_args.kwargs["timeout"], 25)
+
+    def test_remote_judgment_timeout_is_not_changed_by_local_setting(self):
+        def answer(state, questions, **kwargs):
+            return self._response(questions)
+
+        with patch.object(engine, "ask_jev", side_effect=answer) as ask, \
+                patch.object(engine, "draft_candidates", return_value=["候选甲", "候选乙"]):
+            engine.analyze([("her", "你好")], "friends", jev_provider="openai_decisions", judge_mode="jev_only",
+                           timeout=25, laya_timeout=120)
+        self.assertEqual([call.kwargs["timeout"] for call in ask.call_args_list], [25, 25])
 
     def test_default_endpoint_and_separate_saved_or_explicit_bearer_key(self):
         with self._transport(), patch.object(jev_client, "_api_key", side_effect=AssertionError("official key")):

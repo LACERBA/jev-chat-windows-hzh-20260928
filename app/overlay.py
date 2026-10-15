@@ -821,6 +821,16 @@ class Overlay:
         group.baseEdit.setAccessibleName(f"{title}自定义来源 Base URL")
         group.baseLabel.setBuddy(group.baseEdit)
         box.addWidget(group.baseEdit)
+        if kind == "jev":
+            group.timeoutLabel = _label("Laya 推理超时（60–120 秒）", 13)
+            box.addWidget(group.timeoutLabel)
+            group.timeoutBox = SpinBox()
+            group.timeoutBox.setRange(providers.LAYA_TIMEOUT_MIN, providers.LAYA_TIMEOUT_MAX)
+            group.timeoutBox.setSuffix(" 秒")
+            group.timeoutBox.setValue(settings.laya_timeout())
+            group.timeoutBox.setAccessibleName("Laya 本地推理超时秒数")
+            group.timeoutLabel.setBuddy(group.timeoutBox)
+            box.addWidget(group.timeoutBox)
         key_label = _label("密钥", 13)
         group.keyLabel = key_label
         box.addWidget(key_label)
@@ -851,6 +861,8 @@ class Overlay:
         box.addWidget(group.status)
         group.providerBox.currentIndexChanged.connect(lambda _: self._provider_changed(group))
         group.widgets = [group.providerBox, group.keyEdit, group.modelBox, group.fetchButton]
+        if kind == "jev":
+            group.widgets.append(group.timeoutBox)
         if group.baseEdit:
             group.widgets.append(group.baseEdit)
         return group
@@ -915,6 +927,8 @@ class Overlay:
                 custom = active[group.kind] and (provider in providers.CUSTOM
                                                   or group.kind == "jev" and provider in providers.JEV_CUSTOM)
                 if group.kind == "jev":
+                    group.timeoutLabel.setVisible(active["jev"] and local)
+                    group.timeoutBox.setVisible(active["jev"] and local)
                     group.baseLabel.setText("服务地址（不含 /v1/systemone）" if local
                                             else "Base URL（留空使用 OpenAI 官方）")
                     group.baseEdit.setPlaceholderText("http://127.0.0.1:8000" if local else "https://你的服务/v1")
@@ -963,9 +977,12 @@ class Overlay:
 
     def _jev_test_config(self):
         provider = self._provider_of(self.jev)
-        return {"provider": provider, "model": self.jev.modelBox.text().strip(),
-                "base_url": self.jev.baseEdit.text().strip() if provider in providers.JEV_CUSTOM else "",
-                "api_key": self.jev.keyEdit.text().strip() or self.jev.stored_key()}
+        config = {"provider": provider, "model": self.jev.modelBox.text().strip(),
+                  "base_url": self.jev.baseEdit.text().strip() if provider in providers.JEV_CUSTOM else "",
+                  "api_key": self.jev.keyEdit.text().strip() or self.jev.stored_key()}
+        if provider == "laya":
+            config["timeout"] = self.jev.timeoutBox.value()
+        return config
 
     def _test_jev(self):
         if self._jev_testing or not self.jevTestButton.isEnabled():
@@ -997,7 +1014,7 @@ class Overlay:
         try:
             result = jev_client.ask(state, questions, provider=config["provider"], model=config["model"],
                                     base_url=config["base_url"] or None, api_key=config["api_key"],
-                                    timeout=20, max_retries=1)
+                                    timeout=config.get("timeout", 20), max_retries=1)
             answers = validate_answers(result.get("answers"), questions,
                                        allow_fractional_score=config["provider"] in providers.JEV_FRACTIONAL_SCORE)
             message = (f"判断接口已通过验证：字面概率 {answers['literal_question']['noul']:.0%}，"
@@ -1092,6 +1109,7 @@ class Overlay:
                              for provider in providers.JEV_CUSTOM}
         self.jev.baseProvider = settings.jev_provider() if settings.jev_provider() in providers.JEV_CUSTOM else None
         self.jev.baseEdit.setText(settings.jev_base_url())
+        self.jev.timeoutBox.setValue(settings.laya_timeout())
         self._set_group(self.judge, settings.judge_provider(), settings.judge_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.judge.baseEdit.setText(settings.judge_base_url())
@@ -1168,6 +1186,7 @@ class Overlay:
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
                           jev_model_text=self.jev.modelBox.text().strip(),
                           jev_base_url_text=self.jev.baseEdit.text().strip(),
+                          laya_timeout_seconds=self.jev.timeoutBox.value(),
                           judge_mode_text=mode,
                           judge_reuse_draft_on=reuse,
                           judge_provider_text=judge_provider,

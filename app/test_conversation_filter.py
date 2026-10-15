@@ -332,6 +332,19 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertEqual(kind, "warning")
         self.assertNotIn("自动处理未完成", text)
 
+    def test_analysis_passes_configured_local_timeout_to_engine(self):
+        import queue
+
+        main.chat_of("月仔")["rev"] = 4
+        with patch.object(main, "results", queue.Queue()), \
+                patch.object(main, "analyze", return_value={"candidates": []}) as analyze, \
+                patch.object(settings, "laya_timeout", return_value=90), \
+                patch.object(settings, "general_judge_config", return_value={
+                    "provider": "deepseek", "model": "", "base_url": "", "api_key": "k"}):
+            main.analyze_bg([("her", "你好", None)], "月仔", 4)
+            self.assertEqual(main.results.get_nowait()[0], "ok")
+        self.assertEqual(analyze.call_args.kwargs["laya_timeout"], 90)
+
     def test_analysis_retry_is_reported_to_ui_queue(self):
         from core import retry
         from core.jev_client import JevError
@@ -1355,6 +1368,34 @@ class OverlayFilterTests(unittest.TestCase):
         self.overlay._load_settings()
         self.assertEqual(group.baseEdit.text(), "http://127.0.0.1:18001")
         self.assertEqual(group.modelBox.text(), "english")
+
+    def test_laya_timeout_control_load_save_visibility_and_unsaved_test(self):
+        from app import overlay
+
+        group = self.overlay.jev
+        self.assertTrue(group.timeoutBox.isHidden())
+        group.providerBox.setCurrentIndex(group.ids.index("laya"))
+        self.assertFalse(group.timeoutBox.isHidden())
+        self.assertEqual(group.timeoutBox.minimum(), 60)
+        self.assertEqual(group.timeoutBox.maximum(), 120)
+        self.assertEqual(group.timeoutBox.value(), 120)
+        group.timeoutBox.setValue(90)
+        with patch.object(overlay.threading, "Thread") as thread:
+            self.overlay._test_jev()
+            config = thread.call_args.kwargs["args"][0]
+        self.assertEqual(config["timeout"], 90)
+        with patch.object(overlay.jev_client, "ask", return_value=self._jev_test_result()) as ask:
+            self.overlay._test_jev_bg(config)
+        self.assertEqual(ask.call_args.kwargs["timeout"], 90)
+        with patch.object(settings, "save") as save:
+            self.overlay._save()
+        self.assertEqual(save.call_args.kwargs["laya_timeout_seconds"], 90)
+        self.config.update(jev_provider="laya", laya_timeout_seconds=75)
+        self.overlay._load_settings()
+        self.assertEqual(group.timeoutBox.value(), 75)
+        self.overlay.judgeModeBox.setCurrentIndex(2)
+        self.assertTrue(group.timeoutBox.isHidden())
+        self.assertFalse(group.timeoutBox.isEnabled())
 
     def test_laya_switch_preserves_separate_addresses_and_clears_unsaved_keys(self):
         group = self.overlay.jev

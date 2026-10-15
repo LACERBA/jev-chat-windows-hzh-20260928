@@ -21,11 +21,11 @@ from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LAYA_ENV, LAYA_MODELS, LEGACY,
-                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE, normalize_laya_timeout)
     from .retry import MAX_RETRIES, call_with_retry
 except ImportError:
     from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LAYA_ENV, LAYA_MODELS, LEGACY,
-                           OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+                           OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE, normalize_laya_timeout)
     from retry import MAX_RETRIES, call_with_retry
 
 
@@ -138,7 +138,7 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
     return redact_secrets(raw)[:800]
 
 
-def ask(state: dict, questions: dict, timeout: float = 20,
+def ask(state: dict, questions: dict, timeout: float | None = None,
         provider: str = "openrouter", model: str | None = None,
         max_retries: int = MAX_RETRIES, base_url: str | None = None, api_key: str = "") -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
@@ -149,10 +149,12 @@ def ask(state: dict, questions: dict, timeout: float = 20,
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
     if provider == "laya":
+        timeout = normalize_laya_timeout(timeout)
         key = api_key.strip() or (os.environ.get(LAYA_ENV) or "").strip()
         return call_with_retry(
             lambda: _ask_laya(state, questions, key, model or spec.default, timeout, base_url or spec.base),
             what="Laya 判断", max_retries=max_retries)
+    timeout = 20 if timeout is None else timeout
     key = api_key.strip() or _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     model = model or spec.default
     if provider == "openai_decisions":
@@ -194,7 +196,7 @@ def _ask_laya(state: dict, questions: dict, key: str, model: str, timeout: float
     except urllib.error.HTTPError as exc:
         _fail(exc, "Laya 判断", api_key=key, include_detail=False)
     except (TimeoutError, socket.timeout):
-        raise JevError(f"Laya 请求超时（{timeout}s），请检查模型是否加载完成", retryable=True) from None
+        raise JevError(f"Laya 请求超时（{timeout}s），请检查推理耗时、排队和计算设备", retryable=True) from None
     except (urllib.error.URLError, ConnectionError):
         raise JevError("Laya 连接失败，请检查服务地址和服务是否启动", retryable=True) from None
     try:
