@@ -233,9 +233,8 @@ class UnreadTracker:
                      badges=[(item["base"], item["box"], item["x"], item["y"]) for item in badges])
         self.names = {key: name for key, name in self.names.items() if key in current}
         self.deferred = {key: event for key, event in self.deferred.items() if key in current}
-        if not self.armed:
-            self.armed, self.previous = True, current
-            return badges, []
+        # 首次扫描的已有未读也要入队，后续稳定红点仍由 previous 去重。
+        self.armed = True
         added = [badge for badge in badges if badge["base"] not in self.previous]
         self.previous = current
         snapshot_at = time.monotonic()

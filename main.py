@@ -115,6 +115,8 @@ class ConversationController:
         if len(self.pending) > 50:
             oldest = min(self.pending, key=lambda key: self.pending[key]["at"])
             self.pending.pop(oldest, None)
+        log_event("conversation.queued", chat=event["name"], event_id=event["id"],
+                  phase=self.phase, pending_count=len(self.pending))
 
     def on_chat(self, title, raw_title):
         switch_debug("chat_changed", title=title, raw_title=raw_title, phase=self.phase,
@@ -340,6 +342,8 @@ class ConversationController:
         switch_debug("switch_selected", event_id=event["id"], name=target.get("name"),
                      point=(target["x"], target["y"]), current=state["raw_chat"],
                      age=round(time.monotonic() - event["at"], 3))
+        log_event("conversation.switch_requested", chat=target.get("name"), event_id=event["id"],
+                  previous_chat=state["raw_chat"], pending_count=len(self.pending))
         self.active = {**event, "previous_title": state["chat"], "previous_raw": state["raw_chat"]}
         self.phase = "switching"
         self.deadline = time.monotonic() + 3.5
@@ -350,7 +354,7 @@ class ConversationController:
             ov.log(f"[自动切换失败] {type(e).__name__}: {e}")
             self.release("自动切换会话失败，继续监听新消息", "warning")
             return
-        ov.set_status("检测到新消息，正在切换会话", "busy")
+        ov.set_status("检测到未读消息，正在切换会话", "busy")
 
     def tick(self):
         if self.phase in ("settling", "waiting_lines") and time.monotonic() - self.last_read_request >= 1.0:

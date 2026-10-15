@@ -470,6 +470,29 @@ class ConversationFilterTests(unittest.TestCase):
                                    "name": "公众号"})
         self.assertFalse(self.controller.pending)
 
+    def test_existing_unread_switches_after_current_reply_without_new_messages(self):
+        tracker = UnreadTracker(read_name=Mock(return_value="其他人"))
+        badge = {"base": "other", "box": (70, 80, 84, 94), "x": 120, "y": 90}
+        self.controller.phase = "verifying"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
+        self.controller.expected_text = "收到"
+        with patch("app.capture.unread_badges", return_value=[badge]), \
+                patch.object(main, "click") as click:
+            badges, events = tracker.update(None, None)
+            self.controller.on_unread_state(badges)
+            for event in events:
+                self.controller.on_unread(event)
+            self.controller.advance()
+            click.assert_not_called()
+            badges, repeated = tracker.update(None, None)
+            self.assertEqual(repeated, [])
+            self.controller.on_unread_state(badges)
+            self.assertTrue(self.controller.observe("月仔", [("me", None, "收到")]))
+            self.controller.tick()
+        click.assert_called_once_with(1, 120, 90)
+        self.assertEqual(self.controller.phase, "switching")
+        self.assertEqual(self.controller.active["name"], "其他人")
+
     def test_switch_skips_blocked_target_and_uses_next_valid_candidate(self):
         import time
 
@@ -607,7 +630,7 @@ class ConversationFilterTests(unittest.TestCase):
         self.assertEqual(self.controller.phase, "switching")
         self.assertEqual(self.controller.active["name"], "其他人")
         self.assertNotIn(event["id"], self.controller.pending)
-        self.overlay.set_status.assert_called_with("检测到新消息，正在切换会话", "busy")
+        self.overlay.set_status.assert_called_with("检测到未读消息，正在切换会话", "busy")
 
     def test_pending_other_chat_never_switches_during_active_reply_phases(self):
         event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
@@ -1168,13 +1191,17 @@ class UnreadNameTests(unittest.TestCase):
         self.frame = np.zeros((300, 400, 3), dtype=np.uint8)
         self.area = (200, 60, 400, 280, np.array([0, 0, 0]), 20)
 
-    def test_baseline_unread_is_not_emitted_or_ocr_read(self):
-        read_name = Mock(return_value="公众号")
+    def test_existing_unread_is_named_and_emitted_once_without_changes(self):
+        read_name = Mock(return_value="月仔")
         tracker = UnreadTracker(read_name=read_name)
         with patch("app.capture.unread_badges", return_value=[dict(self.badge)]):
-            _, events = tracker.update(self.frame, self.area)
-        self.assertEqual(events, [])
-        read_name.assert_not_called()
+            badges, events = tracker.update(self.frame, self.area)
+            _, repeated = tracker.update(self.frame, self.area)
+        self.assertEqual(badges[0]["name"], "月仔")
+        self.assertEqual(events[0]["name"], "月仔")
+        self.assertEqual(events[0]["id"], "new:1")
+        self.assertEqual(repeated, [])
+        read_name.assert_called_once()
 
     def test_new_unread_is_named_and_cached(self):
         read_name = Mock(return_value="月仔")
@@ -1189,11 +1216,10 @@ class UnreadNameTests(unittest.TestCase):
         self.assertEqual(repeated, [])
         read_name.assert_called_once()
 
-    def test_unknown_name_is_deferred_until_identified(self):
+    def test_existing_unread_name_is_retried_without_new_badge(self):
         read_name = Mock(side_effect=["", "月仔"])
         tracker = UnreadTracker(read_name=read_name)
-        with patch("app.capture.unread_badges", side_effect=[[], [dict(self.badge)], [dict(self.badge)]]):
-            tracker.update(self.frame, self.area)
+        with patch("app.capture.unread_badges", return_value=[dict(self.badge)]):
             _, unknown = tracker.update(self.frame, self.area)
             _, identified = tracker.update(self.frame, self.area)
         self.assertEqual(unknown, [])
