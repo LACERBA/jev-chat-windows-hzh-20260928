@@ -49,6 +49,7 @@ def set_clipboard(text):
 def click(hwnd, x, y):
     from app.capture import switch_debug, unminimize
 
+    switch_debug("click_started", target_hwnd=hwnd, local=(x, y))
     r = w.RECT()
     if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
         u32.GetWindowRect(hwnd, ctypes.byref(r))
@@ -62,6 +63,8 @@ def click(hwnd, x, y):
         activated = u32.SetForegroundWindow(hwnd)
         if fg_tid:
             u32.AttachThreadInput(our_tid, fg_tid, False)
+        switch_debug("click_activation", target_hwnd=hwnd, previous_foreground=fg,
+                     activated=bool(activated))
         if not activated:
             raise RuntimeError("无法激活聊天窗口")
         time.sleep(0.15)
@@ -79,7 +82,8 @@ def click(hwnd, x, y):
         u32.GetPhysicalCursorPos(ctypes.byref(actual))
         switch_debug("click_physical_position", position=(actual.x, actual.y))
         if (actual.x, actual.y) != (r.left + int(x), r.top + int(y)):
-            raise RuntimeError("鼠标位置与目标不符，已取消点击")
+            raise RuntimeError(f"鼠标位置与目标不符，已取消点击："
+                               f"目标 {(r.left + int(x), r.top + int(y))}，实际 {(actual.x, actual.y)}")
         u32.mouse_event(0x2, 0, 0, 0, 0)
         u32.mouse_event(0x4, 0, 0, 0, 0)
         time.sleep(0.05)

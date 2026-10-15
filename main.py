@@ -95,8 +95,13 @@ class ConversationController:
     def on_unread_state(self, badges):
         self.badges = {item["base"]: item for item in badges}
         now = time.monotonic()
+        previous_pending = self.pending
         self.pending = {key: event for key, event in self.pending.items()
                         if now - event["at"] < 600 and event["base"] in self.badges}
+        for event_id in previous_pending.keys() - self.pending.keys():
+            event = previous_pending[event_id]
+            switch_debug("pending_pruned", event_id=event_id, name=event.get("name"),
+                         reason="expired" if now - event["at"] >= 600 else "badge_disappeared")
         self._confirm_switch()
 
     def on_unread(self, event):
@@ -104,6 +109,8 @@ class ConversationController:
                      point=(event.get("x"), event.get("y")), phase=self.phase,
                      enabled=self.mode_enabled(), age=round(time.monotonic() - event["at"], 3))
         if not self.mode_enabled() or event["id"] in self.processed_set:
+            switch_debug("event_skipped", event_id=event["id"],
+                         reason="mode_disabled" if not self.mode_enabled() else "already_processed")
             return
         if not event.get("name") or chat_is_ignored(event["name"]):
             switch_debug("event_ignored", event_id=event["id"], name=event.get("name"))
@@ -330,6 +337,8 @@ class ConversationController:
                     or settings.normalize_chat_title(name) != settings.normalize_chat_title(event.get("name", ""))):
                 self.pending.pop(event_id, None)
                 self._remember(event_id)
+                switch_debug("pending_target_skipped", event_id=event_id, name=event.get("name"),
+                             detected_name=name, reason="target_unknown_ignored_or_changed")
                 continue
             candidates.append(event)
         if not candidates:
@@ -350,9 +359,11 @@ class ConversationController:
         try:
             click(state["hwnd"], target["x"], target["y"])
         except Exception as e:
-            switch_debug("switch_failed", name=target.get("name"), error=f"{type(e).__name__}: {e}")
-            ov.log(f"[自动切换失败] {type(e).__name__}: {e}")
-            self.release("自动切换会话失败，继续监听新消息", "warning")
+            reason = redact_text(f"{type(e).__name__}: {e}")
+            log_event("conversation.switch_failed", level="warning", exc_info=True,
+                      chat=target.get("name"), event_id=event["id"], reason=reason)
+            ov.log(f"[自动切换失败] {reason}")
+            self.release(f"自动切换会话失败：{reason}；继续监听新消息", "warning")
             return
         ov.set_status("检测到未读消息，正在切换会话", "busy")
 

@@ -472,26 +472,44 @@ class ConversationFilterTests(unittest.TestCase):
 
     def test_existing_unread_switches_after_current_reply_without_new_messages(self):
         tracker = UnreadTracker(read_name=Mock(return_value="其他人"))
-        badge = {"base": "other", "box": (70, 80, 84, 94), "x": 120, "y": 90}
+        frame = np.full((400, 600, 3), 245, dtype=np.uint8)
+        frame[:, :80] = 215
+        frame[:, 80:300] = 235
+        ys, xs = np.ogrid[:400, :600]
+        frame[(xs - 130) ** 2 + (ys - 180) ** 2 <= 7 ** 2] = (231, 100, 94)
+        area = (300, 80, 600, 380, np.array([245, 245, 245]), 20)
         self.controller.phase = "verifying"
         self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
         self.controller.expected_text = "收到"
-        with patch("app.capture.unread_badges", return_value=[badge]), \
-                patch.object(main, "click") as click:
-            badges, events = tracker.update(None, None)
+        with patch.object(main, "click") as click:
+            badges, events = tracker.update(frame, area)
             self.controller.on_unread_state(badges)
             for event in events:
                 self.controller.on_unread(event)
             self.controller.advance()
             click.assert_not_called()
-            badges, repeated = tracker.update(None, None)
+            badges, repeated = tracker.update(frame, area)
             self.assertEqual(repeated, [])
             self.controller.on_unread_state(badges)
             self.assertTrue(self.controller.observe("月仔", [("me", None, "收到")]))
             self.controller.tick()
-        click.assert_called_once_with(1, 120, 90)
+        click.assert_called_once_with(1, 216, 180)
         self.assertEqual(self.controller.phase, "switching")
         self.assertEqual(self.controller.active["name"], "其他人")
+
+    def test_switch_failure_records_exception_and_releases_session(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")), \
+                patch.object(main, "log_event") as log:
+            self.controller.advance()
+        log.assert_any_call("conversation.switch_failed", level="warning", exc_info=True,
+                            chat="其他人", event_id="other:1", reason="RuntimeError: 无法激活聊天窗口")
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertIsNone(self.controller.active)
+        self.overlay.set_status.assert_called_with(
+            "自动切换会话失败：RuntimeError: 无法激活聊天窗口；继续监听新消息", "warning")
 
     def test_switch_skips_blocked_target_and_uses_next_valid_candidate(self):
         import time
@@ -1203,6 +1221,15 @@ class UnreadNameTests(unittest.TestCase):
         self.assertEqual(repeated, [])
         read_name.assert_called_once()
 
+    def test_unchanged_unread_state_does_not_repeat_info_logs(self):
+        tracker = UnreadTracker(read_name=Mock(return_value="月仔"))
+        with patch("app.capture.unread_badges", return_value=[dict(self.badge)]), \
+                patch("app.capture.switch_debug"), patch("app.capture.log_event") as log:
+            tracker.update(self.frame, self.area)
+            tracker.update(self.frame, self.area)
+        log.assert_called_once_with("conversation.unread_state", badge_count=1, named_count=1,
+                                    unresolved_count=0, event_count=1, scale=1.0)
+
     def test_new_unread_is_named_and_cached(self):
         read_name = Mock(return_value="月仔")
         tracker = UnreadTracker(read_name=read_name)
@@ -1243,9 +1270,27 @@ class UnreadGeometryTests(unittest.TestCase):
         frame[:, 80:300] = 235
         return frame
 
-    def _badge(self, frame, x, y):
+    def _badge(self, frame, x, y, color=(255, 80, 80)):
         ys, xs = np.ogrid[:frame.shape[0], :frame.shape[1]]
-        frame[(xs - x) ** 2 + (ys - y) ** 2 <= 7 ** 2] = (255, 80, 80)
+        frame[(xs - x) ** 2 + (ys - y) ** 2 <= 7 ** 2] = color
+
+    def test_muted_red_unread_badge_is_detected(self):
+        from app.capture import unread_badges
+
+        frame = self._frame()
+        self._badge(frame, 130, 180, color=(231, 100, 94))
+        area = (300, 80, 600, 380, np.array([245, 245, 245]), 20)
+        badges = unread_badges(frame, area)
+        self.assertEqual(len(badges), 1)
+        self.assertEqual(badges[0]["y"], 180)
+
+    def test_brown_avatar_colors_are_not_accepted_as_unread_badges(self):
+        from app.capture import unread_badges
+
+        frame = self._frame()
+        self._badge(frame, 130, 180, color=(218, 110, 100))
+        area = (300, 80, 600, 380, np.array([245, 245, 245]), 20)
+        self.assertEqual(unread_badges(frame, area), [])
 
     def test_numeric_unread_badge_at_200_percent_dpi_is_detected(self):
         from app.capture import unread_badges

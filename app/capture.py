@@ -187,8 +187,12 @@ def unread_badges(full, area, scale=1.0):
             continue
         colors = reg[ys, xs].astype(float)
         mean = colors.mean(axis=0)
-        if (colors.std(axis=0).max() > 35 or mean[0] < 235 or not 45 <= mean[1] <= 120
+        # 实际截图中的未读红点会偏暗，降低亮度门槛但保留色差和均匀度限制。
+        if (colors.std(axis=0).max() > 35 or mean[0] < 225 or not 45 <= mean[1] <= 120
                 or not 45 <= mean[2] <= 120 or abs(mean[1] - mean[2]) > 24):
+            switch_debug("red_component_rejected", reason="color",
+                         mean=mean.round(1).tolist(), deviation=colors.std(axis=0).round(1).tolist(),
+                         box=(left + int(bx0), top + int(y0), left + int(bx1), top + int(y1)))
             continue
         box = (left + int(bx0), top + int(y0), left + int(bx1), top + int(y1))
         cy = (box[1] + box[3]) // 2
@@ -225,6 +229,7 @@ class UnreadTracker:
         self.read_name = read_name
         self.names = {}
         self.deferred = {}
+        self.last_unread_state = None
 
     def update(self, full, area):
         badges = unread_badges(full, area, scale=self.scale)
@@ -256,6 +261,12 @@ class UnreadTracker:
             # 名称暂未识别时保留事件，等下一次稳定画面再读，绝不盲点未知会话。
             if base in self.deferred and (badge["name"] or self.read_name is None):
                 events.append({**badge, **self.deferred.pop(base)})
+        unread_state = tuple((badge["base"], badge["name"]) for badge in badges)
+        if unread_state != self.last_unread_state:
+            self.last_unread_state = unread_state
+            log_event("conversation.unread_state", badge_count=len(badges),
+                      named_count=sum(bool(badge["name"]) for badge in badges),
+                      unresolved_count=len(self.deferred), event_count=len(events), scale=self.scale)
         return badges, events
 
 
