@@ -49,6 +49,8 @@ _AUTO_REPLY_ECHO_WINDOW = 12.0
 _AUTO_REPLY_SEND_DELAY_MS = 1200
 _MEDIA_REPLY_WAIT = 5.0
 _CONVERSATION_SETTLE_DELAY = 3.0
+_CONVERSATION_SWITCH_MAX_ATTEMPTS = 3
+_CONVERSATION_SWITCH_RETRY_DELAY = 2.0
 read_requested = None
 logging_queue = None
 logging_control = None
@@ -116,7 +118,7 @@ class ConversationController:
             switch_debug("event_ignored", event_id=event["id"], name=event.get("name"))
             self._remember(event["id"])
             return
-        if self.active and self.active.get("id") == event["id"]:
+        if event["id"] in self.pending or self.active and self.active.get("id") == event["id"]:
             return
         self.pending[event["id"]] = event
         if len(self.pending) > 50:
@@ -340,7 +342,8 @@ class ConversationController:
                 switch_debug("pending_target_skipped", event_id=event_id, name=event.get("name"),
                              detected_name=name, reason="target_unknown_ignored_or_changed")
                 continue
-            candidates.append(event)
+            if time.monotonic() >= event.get("retry_at", 0.0):
+                candidates.append(event)
         if not candidates:
             if skipped_current:
                 ov.set_status("新消息已在当前会话，无需切换", "idle")
@@ -353,7 +356,8 @@ class ConversationController:
                      age=round(time.monotonic() - event["at"], 3))
         log_event("conversation.switch_requested", chat=target.get("name"), event_id=event["id"],
                   previous_chat=state["raw_chat"], pending_count=len(self.pending))
-        self.active = {**event, "previous_title": state["chat"], "previous_raw": state["raw_chat"]}
+        self.active = {**event, "previous_title": state["chat"], "previous_raw": state["raw_chat"],
+                       "switch_attempts": event.get("switch_attempts", 0) + 1}
         self.phase = "switching"
         self.deadline = time.monotonic() + 3.5
         try:
@@ -363,7 +367,18 @@ class ConversationController:
             log_event("conversation.switch_failed", level="warning", exc_info=True,
                       chat=target.get("name"), event_id=event["id"], reason=reason)
             ov.log(f"[自动切换失败] {reason}")
-            self.release(f"自动切换会话失败：{reason}；继续监听新消息", "warning")
+            attempts = self.active["switch_attempts"]
+            retry = attempts < _CONVERSATION_SWITCH_MAX_ATTEMPTS
+            if retry:
+                # 未点击成功不能记成已处理；退回队列并等待新坐标，限制重试次数以免反复抢焦点。
+                self.pending[event["id"]] = {**event, "switch_attempts": attempts,
+                                            "retry_at": time.monotonic() + _CONVERSATION_SWITCH_RETRY_DELAY}
+                log_event("conversation.switch_retry_scheduled", chat=target.get("name"),
+                          event_id=event["id"], attempt=attempts,
+                          retry_after_seconds=_CONVERSATION_SWITCH_RETRY_DELAY)
+                request_read()
+            next_step = "2 秒后重试" if retry else "继续监听新消息"
+            self.release(f"自动切换会话失败：{reason}；{next_step}", "warning", remember=not retry)
             return
         ov.set_status("检测到未读消息，正在切换会话", "busy")
 
@@ -415,9 +430,9 @@ class ConversationController:
         self.current_chat = (state.get("chat", ""), state.get("raw_chat", ""))
         cancel_chat_analysis(self.current_chat[0])
 
-    def release(self, text=None, kind="idle"):
+    def release(self, text=None, kind="idle", *, remember=True):
         log_event("conversation.released", phase=self.phase, active=self.active, reason=text, status=kind)
-        if self.active:
+        if self.active and remember:
             self._remember(self.active.get("id"))
         self.phase = "listening"
         self.active = None

@@ -81,7 +81,8 @@ def click(hwnd, x, y):
         actual = w.POINT()
         u32.GetPhysicalCursorPos(ctypes.byref(actual))
         switch_debug("click_physical_position", position=(actual.x, actual.y))
-        if (actual.x, actual.y) != (r.left + int(x), r.top + int(y)):
+        # 高 DPI 下物理坐标往返可能舍入 1~2 像素；明显偏移仍取消，避免误点其他会话。
+        if max(abs(actual.x - (r.left + int(x))), abs(actual.y - (r.top + int(y)))) > 2:
             raise RuntimeError(f"鼠标位置与目标不符，已取消点击："
                                f"目标 {(r.left + int(x), r.top + int(y))}，实际 {(actual.x, actual.y)}")
         u32.mouse_event(0x2, 0, 0, 0, 0)

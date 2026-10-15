@@ -59,15 +59,30 @@ class ClickDiagnosticsTests(unittest.TestCase):
         self.user32.SetPhysicalCursorPos.assert_not_called()
         self.user32.mouse_event.assert_not_called()
 
+    def test_dpi_rounding_within_two_pixels_still_clicks_and_restores_cursor(self):
+        for dx, dy in ((-1, -1), (1, 1), (-2, 2), (2, -2)):
+            with self.subTest(offset=(dx, dy)):
+                self.user32.mouse_event.reset_mock()
+
+                def read_cursor(pointer):
+                    point = (900, 800) if self.cursor == (900, 800) else (220 + dx, 140 + dy)
+                    pointer._obj.x, pointer._obj.y = point
+                    return 1
+
+                self.user32.GetPhysicalCursorPos.side_effect = read_cursor
+                fill.click(1, 120, 90)
+                self.assertEqual(self.user32.mouse_event.call_count, 2)
+                self.user32.SetPhysicalCursorPos.assert_called_with(900, 800)
+
     def test_position_mismatch_reports_coordinates_and_does_not_click(self):
         def read_cursor(pointer):
-            point = (900, 800) if self.cursor == (900, 800) else (221, 140)
+            point = (900, 800) if self.cursor == (900, 800) else (223, 140)
             pointer._obj.x, pointer._obj.y = point
             return 1
 
         self.user32.GetPhysicalCursorPos.side_effect = read_cursor
         with self.assertRaises(RuntimeError) as error:
             fill.click(1, 120, 90)
-        self.assertIn("目标 (220, 140)，实际 (221, 140)", str(error.exception))
+        self.assertIn("目标 (220, 140)，实际 (223, 140)", str(error.exception))
         self.user32.mouse_event.assert_not_called()
         self.user32.SetPhysicalCursorPos.assert_called_with(900, 800)

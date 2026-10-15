@@ -501,15 +501,91 @@ class ConversationFilterTests(unittest.TestCase):
         event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
         self.controller.pending = {event["id"]: event}
         self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
-        with patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")), \
+        with patch.object(main.time, "monotonic", return_value=2), \
+                patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")), \
                 patch.object(main, "log_event") as log:
             self.controller.advance()
         log.assert_any_call("conversation.switch_failed", level="warning", exc_info=True,
                             chat="其他人", event_id="other:1", reason="RuntimeError: 无法激活聊天窗口")
         self.assertEqual(self.controller.phase, "listening")
         self.assertIsNone(self.controller.active)
+        self.assertNotIn(event["id"], self.controller.processed_set)
+        self.assertEqual(self.controller.pending[event["id"]]["switch_attempts"], 1)
+        self.assertEqual(self.controller.pending[event["id"]]["retry_at"], 4)
+        self.overlay.set_status.assert_called_with(
+            "自动切换会话失败：RuntimeError: 无法激活聊天窗口；2 秒后重试", "warning")
+
+    def test_failed_switch_retries_with_latest_badge_coordinates_after_delay(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main.time, "monotonic", return_value=2), \
+                patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")):
+            self.controller.advance()
+        with patch.object(main.time, "monotonic", return_value=3), \
+                patch.object(main, "click") as click:
+            # 采集器重建后重复上报同一事件，不能清掉重试间隔和次数。
+            self.controller.on_unread(event)
+            self.controller.on_unread_state([{**event, "x": 150, "y": 180}])
+            self.controller.tick()
+            click.assert_not_called()
+        with patch.object(main.time, "monotonic", return_value=4), \
+                patch.object(main, "click") as click:
+            self.controller.tick()
+        click.assert_called_once_with(1, 150, 180)
+        self.assertEqual(self.controller.phase, "switching")
+        self.assertEqual(self.controller.active["switch_attempts"], 2)
+        self.assertNotIn(event["id"], self.controller.pending)
+
+    def test_switch_retries_stop_after_three_failed_attempts(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")) as click:
+            for now in (2, 4, 6):
+                with patch.object(main.time, "monotonic", return_value=now):
+                    self.controller.tick()
+            with patch.object(main.time, "monotonic", return_value=8):
+                self.controller.on_unread(event)
+                self.controller.tick()
+        self.assertEqual(click.call_count, 3)
+        self.assertFalse(self.controller.pending)
+        self.assertIsNone(self.controller.active)
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertIn(event["id"], self.controller.processed_set)
         self.overlay.set_status.assert_called_with(
             "自动切换会话失败：RuntimeError: 无法激活聊天窗口；继续监听新消息", "warning")
+
+    def test_failed_switch_is_not_retried_after_badge_disappears(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main.time, "monotonic", return_value=2), \
+                patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")):
+            self.controller.advance()
+        with patch.object(main.time, "monotonic", return_value=4), \
+                patch.object(main, "click") as click:
+            self.controller.on_unread_state([])
+            self.controller.tick()
+        click.assert_not_called()
+        self.assertFalse(self.controller.pending)
+
+    def test_switch_retry_delay_does_not_block_other_unread_conversations(self):
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
+        self.controller.pending = {event["id"]: event}
+        self.controller.badges = {"other": {**event, "x": 120, "y": 90}}
+        with patch.object(main.time, "monotonic", return_value=2), \
+                patch.object(main, "click", side_effect=RuntimeError("无法激活聊天窗口")):
+            self.controller.advance()
+        next_event = {"base": "next", "id": "next:1", "name": "第三人", "at": 0.5}
+        self.controller.pending[next_event["id"]] = next_event
+        self.controller.badges["next"] = {**next_event, "x": 120, "y": 180}
+        with patch.object(main.time, "monotonic", return_value=3), \
+                patch.object(main, "click") as click:
+            self.controller.tick()
+        click.assert_called_once_with(1, 120, 180)
+        self.assertEqual(self.controller.active["name"], "第三人")
+        self.assertIn(event["id"], self.controller.pending)
 
     def test_switch_skips_blocked_target_and_uses_next_valid_candidate(self):
         import time
