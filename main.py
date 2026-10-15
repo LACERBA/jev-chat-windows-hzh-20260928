@@ -19,7 +19,7 @@ from math import isfinite
 from app import settings, update, worker
 from app.capture import find_chat_hwnd, switch_debug
 from app.fill import click, fill, fill_and_send
-from app.ocr import similar
+from app.ocr import normalize_ocr_title, similar
 from app.message_store import MessageStore, align_messages
 from app.media import describe_media, media_token
 from app.overlay import Overlay
@@ -192,6 +192,13 @@ class ConversationController:
             if self._matches(title, raw_title):
                 self.early_lines = (title, raw_title, revision, initial, latest_who)
             return "skip"
+        if (latest_who == "me" and self.phase in ("listening", "analyzing", "waiting_send", "send_failed")
+                and (self.active is None or self._matches(title, raw_title))):
+            # 自己已回复就结束本轮，避免空挂在分析中；自动发送的气泡仍由 verifying 核验。
+            cancel_chat_analysis(title, reason="检测到自己已回复，取消待处理建议")
+            self.pending_current = None
+            self.release("你已回复，等待对方的新消息", "idle")
+            return "skip"
         if self.phase == "send_failed":
             if (self._matches(title, raw_title) and latest_who == "her"
                     and revision > self.active.get("revision", -1)):
@@ -324,19 +331,19 @@ class ConversationController:
                 return
         candidates = []
         skipped_current = False
-        current_names = {settings.normalize_chat_title(value) for value in
+        current_names = {normalize_ocr_title(value) for value in
                          (state.get("chat", ""), state.get("raw_chat", "")) if value}
         for event_id, event in list(self.pending.items()):
             target = self.badges.get(event["base"])
             name = target.get("name", "") if target else ""
-            if name and settings.normalize_chat_title(name) in current_names:
+            if name and normalize_ocr_title(name) in current_names:
                 self.pending.pop(event_id, None)
                 self._remember(event_id)
                 skipped_current = True
                 switch_debug("current_chat_unread_skipped", name=name, event_id=event_id)
                 continue
             if (not name or chat_is_ignored(name) or chat_is_ignored(event.get("name", ""))
-                    or settings.normalize_chat_title(name) != settings.normalize_chat_title(event.get("name", ""))):
+                    or normalize_ocr_title(name) != normalize_ocr_title(event.get("name", ""))):
                 self.pending.pop(event_id, None)
                 self._remember(event_id)
                 switch_debug("pending_target_skipped", event_id=event_id, name=event.get("name"),
@@ -503,8 +510,8 @@ class ConversationController:
     def _matches_switch_target(self, title, raw_title):
         if not self.active or not self.active.get("name"):
             return False
-        expected = settings.normalize_chat_title(self.active["name"])
-        return (settings.normalize_chat_title(raw_title) == expected
+        expected = normalize_ocr_title(self.active["name"])
+        return (normalize_ocr_title(raw_title) == expected
                 and not chat_is_ignored(title, raw_title))
 
     def _matches(self, title, raw_title):
@@ -535,10 +542,10 @@ def chat_of(title):
                                     "manual_only": False})  # 画面刚重新定位（跳转/滚动浏览）：只出建议，不自动发送
 
 
-def cancel_chat_analysis(title):
+def cancel_chat_analysis(title, reason="当前会话已切换或采集已暂停"):
     chat = chats.get(title)
     if chat is not None:
-        log_event("analysis.cancelled", chat=title, revision=chat["rev"], reason="当前会话已切换或采集已暂停")
+        log_event("analysis.cancelled", chat=title, revision=chat["rev"], reason=reason)
         chat["rev"] += 1
         chat["result"] = None
         chat["analysis_requested_rev"] = -1

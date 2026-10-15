@@ -95,6 +95,68 @@ class ConversationFilterTests(unittest.TestCase):
             main.auto_send_and_track("月仔", {"candidates": ["旧回复"]}, 4)
         send.assert_not_called()
 
+    def test_outgoing_snapshot_does_not_lock_unread_switch_queue(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        outgoing = [("me", None, "你是？")]
+        event = {"base": "other", "id": "other:1", "name": "其他人", "at": 100,
+                 "x": 120, "y": 90}
+        with patch.object(main, "start_analyze") as analyze, \
+                patch.object(main.time, "monotonic", return_value=101), patch.object(main, "click") as click:
+            self._drain_packets([("snapshot", self._snapshot(new=outgoing, visible=outgoing,
+                                                             history=outgoing))])
+            self.assertEqual(self.controller.phase, "listening")
+            self.assertIsNone(self.controller.active)
+            self.controller.on_unread_state([event])
+            self.controller.on_unread(event)
+            self.controller.tick()
+        analyze.assert_not_called()
+        click.assert_called_once_with(1, 120, 90)
+        self.assertEqual(self.controller.active["name"], "其他人")
+
+    def test_manual_reply_releases_processing_and_cancels_stale_sends(self):
+        self.config["auto_reply_chats"] = {"wechat:月仔": {"enabled": True}}
+        outgoing = [("me", None, "我已经回复了")]
+        for phase in ("analyzing", "waiting_send", "send_failed"):
+            with self.subTest(phase=phase):
+                self.controller.phase = phase
+                self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
+                self.controller.pending_current = ("月仔", "月仔", 0)
+                self.controller.send_revision = 0
+                chat = main.chat_of("月仔")
+                chat.update(rev=0, result={"candidates": ["旧建议"]}, media_waiting=True,
+                            media_wait_started=100, auto_retry_rev=0)
+                self.state.update(busy=phase == "analyzing", analysis_task=("月仔", 0),
+                                  rerun=("月仔", []))
+                with patch.object(main, "start_analyze") as analyze, patch.object(main, "auto_send_reply") as send:
+                    self._drain_packets([("snapshot", self._snapshot(new=outgoing, visible=outgoing,
+                                                                     history=outgoing))])
+                    main.auto_send_and_track("月仔", {}, 0)
+                analyze.assert_not_called()
+                send.assert_not_called()
+                self.assertEqual(self.controller.phase, "listening")
+                self.assertIsNone(self.controller.active)
+                self.assertIsNone(self.controller.pending_current)
+                self.assertIsNone(self.controller.send_revision)
+                self.assertFalse(self.state["busy"])
+                self.assertIsNone(self.state["analysis_task"])
+                self.assertIsNone(chat["result"])
+                self.assertFalse(chat["media_waiting"])
+                self.assertIsNone(chat["auto_retry_rev"])
+
+    def test_outgoing_snapshot_preserves_auto_send_verification(self):
+        outgoing = [("me", None, "已经发送的自动回复")]
+        self.controller.phase = "verifying"
+        self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔"}
+        self.controller.send_revision = 0
+        self.controller.expected_text = "已经发送的自动回复"
+        with patch.object(main, "cancel_chat_analysis") as cancel, patch.object(main, "log_event") as log:
+            self._drain_packets([("snapshot", self._snapshot(new=outgoing, visible=outgoing,
+                                                             history=outgoing))])
+        cancel.assert_not_called()
+        self.assertTrue(any(call.args[0] == "send.confirmed" for call in log.call_args_list))
+        self.assertEqual(self.controller.phase, "listening")
+        self.assertIsNone(self.controller.active)
+
     def test_cancelled_results_do_not_unlock_or_overwrite_new_analysis(self):
         import queue
 
@@ -469,6 +531,37 @@ class ConversationFilterTests(unittest.TestCase):
         self.controller.on_unread({"base": "public", "id": "public:1", "at": 1,
                                    "name": "公众号"})
         self.assertFalse(self.controller.pending)
+
+    def test_symbol_name_switch_confirms_width_and_spacing_variants(self):
+        event = {"base": "person", "id": "person:1", "name": "发仔& ?", "at": 100,
+                 "x": 120, "y": 90}
+        with patch.object(main.time, "monotonic", return_value=101), patch.object(main, "click") as click:
+            self.controller.on_unread_state([event])
+            self.controller.on_unread(event)
+            self.controller.advance()
+            click.assert_called_once_with(1, 120, 90)
+            self.state.update(chat="发仔＆?", raw_chat="发仔＆?")
+            self.controller.on_chat("发仔＆?", "发仔＆?")
+        self.assertEqual(self.controller.phase, "settling")
+        self.assertEqual(self.controller.active["id"], event["id"])
+        self.assertEqual(self.controller.active["raw"], "发仔＆?")
+
+    def test_symbol_variants_of_current_chat_do_not_trigger_clicks(self):
+        event = {"base": "person", "id": "person:1", "name": "发仔& ?", "at": 100,
+                 "x": 120, "y": 90}
+        self.state.update(chat="发仔＆?", raw_chat="发仔＆?")
+        with patch.object(main.time, "monotonic", return_value=101), patch.object(main, "click") as click:
+            self.controller.on_unread_state([event])
+            self.controller.on_unread(event)
+            self.controller.advance()
+        click.assert_not_called()
+        self.assertFalse(self.controller.pending)
+
+    def test_different_symbols_do_not_confirm_switch_target(self):
+        self.controller.active = {"name": "发仔®"}
+        for title in ("发仔?", "发仔", "发仔™", "发哥®"):
+            with self.subTest(title=title):
+                self.assertFalse(self.controller._matches_switch_target(title, title))
 
     def test_existing_unread_switches_after_current_reply_without_new_messages(self):
         tracker = UnreadTracker(read_name=Mock(return_value="其他人"))
@@ -1419,6 +1512,71 @@ class SessionNameOcrTests(unittest.TestCase):
         with patch.object(ocr, "_engine", return_value=engine):
             self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "公众号")
         self.assertLess(engine.call_args.args[0].shape[1], self.area[0])
+
+    def test_ocr_title_comparison_preserves_symbols_and_word_spaces(self):
+        self.assertEqual(ocr.normalize_ocr_title(" 发仔＆ ? "), "发仔&?")
+        self.assertEqual(ocr.normalize_ocr_title("团队：研发"), "团队:研发")
+        self.assertEqual(ocr.normalize_ocr_title("Ann  a"), "Ann a")
+        for title in ("发仔®", "发仔™", "发仔😀", "发仔?", "发仔", "发仔TM"):
+            with self.subTest(title=title):
+                self.assertEqual(ocr.normalize_ocr_title(title), title)
+        self.assertNotEqual(ocr.normalize_ocr_title("Ann a"), ocr.normalize_ocr_title("Anna"))
+
+    def test_high_confidence_symbol_name_is_preserved_without_retry(self):
+        engine = Mock(return_value=([self._item("发仔＆ ®")], None))
+        with patch.object(ocr, "_engine", return_value=engine):
+            self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "发仔＆ ®")
+        engine.assert_called_once()
+
+    def test_low_confidence_symbol_name_is_recovered_from_matching_line(self):
+        engine = Mock(side_effect=[([self._item("发仔＆ ?", score=0.73)], None),
+                                   ([self._item("发仔&?", score=0.91)], None)])
+        with patch.object(ocr, "_engine", return_value=engine), patch.object(ocr, "log_event") as log:
+            self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "发仔&?")
+        self.assertEqual(engine.call_count, 2)
+        original, isolated = [call.args[0] for call in engine.call_args_list]
+        self.assertLess(isolated.shape[0], original.shape[0])
+        self.assertLess(isolated.shape[1], original.shape[1])
+        log.assert_called_once_with("conversation.session_name_recovered", level="debug",
+                                    confidence=0.73, retry_confidence=0.91, badge_box=self.badge["box"])
+
+    def test_line_retry_cannot_accept_different_name_or_symbols(self):
+        for title in ("发哥&?", "发仔&", "发仔&®"):
+            engine = Mock(side_effect=[([self._item("发仔&?", score=0.73)], None),
+                                       ([self._item(title, score=0.95)], None)])
+            with self.subTest(title=title), patch.object(ocr, "_engine", return_value=engine):
+                self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "")
+
+    def test_line_retry_preserves_registered_symbols_and_emoji(self):
+        for title in ("发仔®", "发仔™", "发仔😀"):
+            engine = Mock(side_effect=[([self._item(title, score=0.73)], None),
+                                       ([self._item(title, score=0.91)], None)])
+            with self.subTest(title=title), patch.object(ocr, "_engine", return_value=engine):
+                self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), title)
+
+    def test_line_retry_still_requires_original_confidence_threshold(self):
+        engine = Mock(side_effect=[([self._item("发仔&?", score=0.73)], None),
+                                   ([self._item("发仔&?", score=0.79)], None)])
+        with patch.object(ocr, "_engine", return_value=engine), patch.object(ocr, "log_event") as log:
+            self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "")
+        self.assertEqual(log.call_args.kwargs["reason"], "low_confidence")
+        self.assertEqual(log.call_args.kwargs["confidence"], 0.79)
+        self.assertNotIn("发仔", str(log.call_args))
+
+    def test_unresolved_or_split_line_retry_is_not_accepted(self):
+        for retry in ([], [self._item("发仔"), self._item("&?", x=45)]):
+            engine = Mock(side_effect=[([self._item("发仔&?", score=0.73)], None), (retry, None)])
+            with self.subTest(retry=retry), patch.object(ocr, "_engine", return_value=engine):
+                self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "")
+            self.assertEqual(engine.call_count, 2)
+
+    def test_preview_and_truncated_names_are_rejected_without_retry(self):
+        for item in (self._item("发仔&?", y=33, score=0.73), self._item("发仔…", score=0.73),
+                     self._item("发仔&?", y=35, score=0.73)):
+            engine = Mock(return_value=([item], None))
+            with self.subTest(item=item), patch.object(ocr, "_engine", return_value=engine):
+                self.assertEqual(ocr.read_session_name(self.frame, self.area, self.badge), "")
+            engine.assert_called_once()
 
     def test_rejects_unknown_low_confidence_or_truncated_names(self):
         for result in ([], [self._item("公众号", score=0.7)], [self._item("营销群…")],

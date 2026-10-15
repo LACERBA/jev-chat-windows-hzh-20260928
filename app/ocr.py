@@ -10,6 +10,7 @@ from rapidocr_onnxruntime import RapidOCR
 from app.chatapps import DEFAULT, ChatApp
 from app.message_store import new_messages
 from app.media import MediaReader
+from core.diagnostics import log_event
 
 _ENGINE: dict = {}
 _FELL_BACK = set()
@@ -36,6 +37,13 @@ def _engine(app: ChatApp = DEFAULT):
     return _ENGINE[want]
 
 
+def normalize_ocr_title(text: str) -> str:
+    """仅用于 OCR 名称比对：统一全半角 ASCII 和符号两侧空白，不删除特殊符号。"""
+    text = "".join(chr(ord(char) - 0xFEE0) if 0xFF01 <= ord(char) <= 0xFF5E else char
+                   for char in text)
+    return re.sub(r"\s*([^\w\s])\s*", r"\1", " ".join(text.split()))
+
+
 def read_title(header, app: ChatApp = DEFAULT):
     """面板头部那一条截图 → 会话名（numpy RGB）。取最靠上的一行，同一行里取最左的
     （右边是图标按钮，OCR 不出字；下面那行是公告）。群聊的成员数「(422)」去掉，只留名字当 key。
@@ -50,17 +58,24 @@ def read_title(header, app: ChatApp = DEFAULT):
 
 
 def read_session_name(full, area, badge, app: ChatApp = DEFAULT):
-    """只读新未读所在行的名称；低置信度或被省略的名称不用于自动点击。"""
+    """只读未读行的名称；低置信度时局部复识别，名称一致且达标才用于自动点击。"""
     left, top, right, bottom = badge["box"]
     height = max(12, bottom - top)
     crop_top = max(area[5], top - height // 2)
     crop = full[crop_top:min(full.shape[0], bottom + height * 2), right + 1:area[0] - 8]
-    if crop.shape[0] < 8 or crop.shape[1] < 20:
+
+    def reject(reason, confidence=None):
+        log_event("conversation.session_name_rejected", level="debug", reason=reason,
+                  confidence=round(float(confidence), 3) if confidence is not None else None,
+                  badge_box=badge["box"], crop_shape=crop.shape)
         return ""
+
+    if crop.shape[0] < 8 or crop.shape[1] < 20:
+        return reject("invalid_crop")
     res, _ = _engine(app)(crop, use_cls=False)
     res = [item for item in res or [] if item[0][0][0] < crop.shape[1] * 0.7]
     if not res:
-        return ""
+        return reject("no_text")
     first = min(res, key=lambda item: item[0][0][1])
     row = first[0][2][1]
     box, text, confidence = min((item for item in res if item[0][0][1] < row),
@@ -69,9 +84,29 @@ def read_session_name(full, area, badge, app: ChatApp = DEFAULT):
     text_top, text_bottom = min(point[1] for point in box), max(point[1] for point in box)
     clipped = text_bottom >= crop.shape[0] - 1
     preview = crop_top + (text_top + text_bottom) / 2 > (top + bottom) / 2 + height * 1.75
-    if (confidence < 0.8 or not text or "…" in text or "..." in text
-            or clipped or preview):
-        return ""
+    if not text or "…" in text or "..." in text or clipped or preview:
+        reason = "empty" if not text else ("truncated" if "…" in text or "..." in text
+                                         else "clipped" if clipped else "preview")
+        return reject(reason, confidence)
+    if confidence < 0.8:
+        # 符号会拉低整行分数；只复读名称框并留两像素边距，不把时间或消息预览混进来。
+        x0 = max(0, int(min(point[0] for point in box)) - 2)
+        x1 = min(crop.shape[1], int(np.ceil(max(point[0] for point in box))) + 2)
+        y0 = max(0, int(text_top) - 2)
+        y1 = min(crop.shape[0], int(np.ceil(text_bottom)) + 2)
+        line = crop[y0:y1, x0:x1]
+        retry, _ = _engine(app)(line, use_cls=False)
+        if len(retry or []) != 1:
+            return reject("retry_unresolved", confidence)
+        _, retry_text, retry_confidence = retry[0]
+        if normalize_ocr_title(retry_text) != normalize_ocr_title(text):
+            return reject("retry_mismatch", retry_confidence)
+        if retry_confidence < 0.8:
+            return reject("low_confidence", retry_confidence)
+        log_event("conversation.session_name_recovered", level="debug",
+                  confidence=round(float(confidence), 3),
+                  retry_confidence=round(float(retry_confidence), 3), badge_box=badge["box"])
+        text = retry_text.strip()
     return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text)
 
 
