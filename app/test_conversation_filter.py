@@ -592,7 +592,7 @@ class ConversationFilterTests(unittest.TestCase):
             self.controller.advance()
         click.assert_called_once_with(1, 120, 90)
 
-    def test_verification_timeout_keeps_next_chat_pending_until_confirmation_or_manual_switch(self):
+    def test_verification_timeout_releases_and_switches_to_next_chat(self):
         event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
         self.controller.phase = "verifying"
         self.controller.active = {"id": "current:1", "title": "月仔", "raw": "月仔",
@@ -603,11 +603,11 @@ class ConversationFilterTests(unittest.TestCase):
         with patch.object(main.time, "monotonic", return_value=2), \
                 patch.object(main, "click") as click:
             self.controller.tick()
-            click.assert_not_called()
-        self.assertEqual(self.controller.phase, "verifying")
-        self.assertIn(event["id"], self.controller.pending)
-        self.overlay.set_status.assert_called_with(
-            "发送已执行但未确认，暂停切换；请检查当前会话后再切换", "warning")
+            click.assert_called_once_with(1, 120, 90)
+        self.assertEqual(self.controller.phase, "switching")
+        self.assertEqual(self.controller.active["name"], "其他人")
+        self.assertNotIn(event["id"], self.controller.pending)
+        self.overlay.set_status.assert_called_with("检测到新消息，正在切换会话", "busy")
 
     def test_pending_other_chat_never_switches_during_active_reply_phases(self):
         event = {"base": "other", "id": "other:1", "name": "其他人", "at": 1}
@@ -715,7 +715,7 @@ class ConversationFilterTests(unittest.TestCase):
             "switching": "微信会话切换确认超时，继续监听新消息",
             "waiting_lines": "会话已切换，但 OCR 尚未确认可见文本消息，继续监听",
             "waiting_send": "自动回复仍在等待发送，暂不切换其他会话",
-            "verifying": "发送已执行但未确认，暂停切换；请检查当前会话后再切换",
+            "verifying": "发送已执行但未确认，继续处理其他会话",
         }
         for phase, expected in phases.items():
             with self.subTest(phase=phase):
@@ -725,7 +725,7 @@ class ConversationFilterTests(unittest.TestCase):
                 with patch.object(main.time, "monotonic", return_value=2):
                     self.controller.tick()
                 self.overlay.set_status.assert_called_with(expected, "warning")
-                expected_phase = phase if phase in ("waiting_send", "verifying") else "listening"
+                expected_phase = "waiting_send" if phase == "waiting_send" else "listening"
                 self.assertEqual(self.controller.phase, expected_phase)
 
     def test_switch_confirmation_follows_manual_chat_without_target_mismatch_warning(self):

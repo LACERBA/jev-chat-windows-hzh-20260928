@@ -365,11 +365,12 @@ class ConversationController:
                 switch_debug("conversation_timeout", phase=self.phase,
                              title=self.active.get("title") if self.active else None,
                              expected=self.active.get("name") if self.active else None)
-                if self.phase in ("waiting_send", "verifying"):
+                if self.phase == "waiting_send":
                     self.deadline = 0.0
-                    text = ("自动回复仍在等待发送，暂不切换其他会话" if self.phase == "waiting_send"
-                            else "发送已执行但未确认，暂停切换；请检查当前会话后再切换")
-                    ov.set_status(text, "warning")
+                    ov.set_status("自动回复仍在等待发送，暂不切换其他会话", "warning")
+                elif self.phase == "verifying":
+                    # 确认超时后不重试发送，释放会话锁以继续处理队列。
+                    self.release("发送已执行但未确认，继续处理其他会话", "warning")
                 else:
                     text = ("微信会话切换确认超时，继续监听新消息" if self.phase == "switching"
                             else "会话已切换，但 OCR 尚未确认可见文本消息，继续监听")
